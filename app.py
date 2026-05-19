@@ -2800,6 +2800,100 @@ async def analyze_logs_all_agents(request):
             "total_logs_analyzed": 0
         }, status=500)
 
+
+async def _push_recent_alerts_to_defensive(agent: str, limit: int = 25) -> dict:
+    """Fetch the most-recent events_alert rows for an agent and queue each one
+    on the AI_SOAR (defensive) RabbitMQ queue. This is the single mechanism
+    behind both the manual `/analyze-defensive/<agent>` endpoint and the
+    periodic auto-sweep, so they behave identically.
+    """
+    rows = await asyncio.to_thread(fetch_events_alert_data, agent, limit)
+    if not rows:
+        return {"queued": 0, "reason": "no events_alert rows"}
+
+    try:
+        key_b64 = getattr(app.ctx, "fernet_key", None)
+        if not key_b64:
+            key_b64 = await asyncio.to_thread(bootstrap_client.get_fernet_key)
+        fernet_obj = Fernet(key_b64.encode("utf-8") if isinstance(key_b64, str) else key_b64)
+    except Exception:
+        fernet_obj = None
+
+    pushed = 0
+    for row in rows:
+        try:
+            payload = decrypt_row_fields(row, ENCRYPTED_FIELDS_MAP.get("events_alert", []), fernet_obj) if fernet_obj else dict(row)
+        except Exception:
+            payload = dict(row)
+        try:
+            ok = await mq_utils.publish_to_queue(mq_utils.AI_SOAR, agent, "events_alert", payload)
+            if ok:
+                pushed += 1
+        except Exception as e:
+            print(f"[!] defensive push failed agent={agent}: {e}", flush=True)
+    return {"queued": pushed, "total_rows": len(rows)}
+
+
+@require_permission("analyze_logs")
+@app.route("/analyze-defensive/<agent>", methods=["POST"])
+async def trigger_defensive_scan(request, agent):
+    """Manually push the latest events_alert rows for an agent through the
+    defensive AI worker. Returns immediately; results land in
+    ai_analysis_results once the worker finishes (visible in AI Analysis UI).
+    """
+    data = request.json or {}
+    try:
+        limit = max(1, min(int(data.get("limit", 25)), 200))
+    except Exception:
+        limit = 25
+    try:
+        result = await _push_recent_alerts_to_defensive(agent, limit)
+        return sanic_json({"success": True, "agent": agent, **result})
+    except Exception as e:
+        return sanic_json({"success": False, "error": str(e)}, status=500)
+
+
+DEFENSIVE_SWEEP_INTERVAL = int(os.getenv("AI_DEFENSIVE_SWEEP_SEC", "300"))
+DEFENSIVE_SWEEP_BATCH = int(os.getenv("AI_DEFENSIVE_SWEEP_BATCH", "10"))
+
+
+async def _defensive_auto_sweep():
+    """Background loop: every DEFENSIVE_SWEEP_INTERVAL seconds pull a small
+    batch of the latest alerts per agent into the defensive AI queue so the
+    LLM keeps producing visible commentary even when nothing fresh is
+    streaming through ingest.
+    """
+    await asyncio.sleep(30)
+    while True:
+        try:
+            def _list_agents():
+                with sync_mysql_conn() as conn:
+                    cursor = conn.cursor()
+                    try:
+                        cursor.execute("SHOW DATABASES")
+                        return [r[0].replace('_db', '') for r in cursor.fetchall() if r[0].endswith('_db')]
+                    finally:
+                        cursor.close()
+
+            agents = await asyncio.to_thread(_list_agents)
+            for ag in agents:
+                try:
+                    res = await _push_recent_alerts_to_defensive(ag, DEFENSIVE_SWEEP_BATCH)
+                    if res.get("queued"):
+                        print(f"[AI-Sweep] defensive pushed {res['queued']} alerts for {ag}", flush=True)
+                except Exception as e:
+                    print(f"[!] defensive sweep agent={ag}: {e}", flush=True)
+        except Exception as e:
+            print(f"[!] defensive sweep loop error: {e}", flush=True)
+        await asyncio.sleep(DEFENSIVE_SWEEP_INTERVAL)
+
+
+@app.before_server_start
+async def start_defensive_sweep(app):
+    if os.getenv("AI_DEFENSIVE_SWEEP_ENABLED", "1") == "1":
+        app.add_task(_defensive_auto_sweep())
+        print(f"[*] Defensive AI auto-sweep enabled (every {DEFENSIVE_SWEEP_INTERVAL}s, batch={DEFENSIVE_SWEEP_BATCH})", flush=True)
+
 @require_permission("analyze_logs")
 @app.route("/analyze-logs/<agent>", methods=["POST"])
 async def analyze_logs_single_agent(request, agent):

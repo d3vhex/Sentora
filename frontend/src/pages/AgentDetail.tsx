@@ -305,6 +305,13 @@ const AgentDetail: React.FC = () => {
           <TableTab
             title="SIEM Events"
             columns={['Timestamp', 'Severity', 'Event Type', 'Source', 'Message']}
+            columnConfig={[
+              { width: '160px', nowrap: true },
+              { width: '110px', nowrap: true, align: 'center' },
+              { width: '180px', nowrap: true },
+              { width: '240px', nowrap: true },
+              { minWidth: '320px' },
+            ]}
             data={data.siem.map((r: any) => {
               const p = parseSiemRow(r);
               return [p.timestamp, p.severity, p.event_type, p.source, p.message];
@@ -315,9 +322,44 @@ const AgentDetail: React.FC = () => {
           <AlertsTab rows={data.alerts.map((r: any) => parseSiemRow(r))} />
         )}
         {activeTab === 'vulnerabilities' && <VulnsTab agentName={agentName!} data={data.vulnerabilities} onRefresh={() => fetchAgentData(false)} />}
-        {activeTab === 'packages' && <TableTab title="Installed Packages" columns={['Package Name', 'Version']} data={data.packages.map((r: any) => [r.package, r.version])} />}
-        {activeTab === 'portscan' && <TableTab title="Open Ports & Services" columns={['Port', 'Protocol', 'Service', 'State']} data={data.portscans.map((r: any) => [r.port, r.protocol, r.service, r.state])} />}
-        {activeTab === 'files' && <TableTab title="Critical File Monitor" columns={['Path', 'Owner', 'Group', 'Permissions', 'Last Opened']} data={data.criticalFiles.map((r: any) => [r.path, r.owner, r.grp, r.permissions, r.last_opened])} />}
+        {activeTab === 'packages' && (
+          <TableTab
+            title="Installed Packages"
+            columns={['Package Name', 'Version']}
+            columnConfig={[
+              { minWidth: '320px' },
+              { width: '220px', nowrap: true },
+            ]}
+            data={data.packages.map((r: any) => [r.package, r.version])}
+          />
+        )}
+        {activeTab === 'portscan' && (
+          <TableTab
+            title="Open Ports & Services"
+            columns={['Port', 'Protocol', 'Service', 'State']}
+            columnConfig={[
+              { width: '110px', nowrap: true, align: 'center' },
+              { width: '120px', nowrap: true, align: 'center' },
+              { minWidth: '200px' },
+              { width: '140px', nowrap: true, align: 'center' },
+            ]}
+            data={data.portscans.map((r: any) => [r.port, r.protocol, r.service, r.state])}
+          />
+        )}
+        {activeTab === 'files' && (
+          <TableTab
+            title="Critical File Monitor"
+            columns={['Path', 'Owner', 'Group', 'Permissions', 'Last Opened']}
+            columnConfig={[
+              { minWidth: '320px' },
+              { width: '160px', nowrap: true },
+              { width: '160px', nowrap: true },
+              { width: '140px', nowrap: true, align: 'center' },
+              { width: '180px', nowrap: true },
+            ]}
+            data={data.criticalFiles.map((r: any) => [r.path, r.owner, r.grp, r.permissions, r.last_opened])}
+          />
+        )}
         {activeTab === 'vnc' && (
           <div style={{ backgroundColor: 'var(--card-bg)', border: '1px solid var(--border-color)', borderRadius: '12px', overflow: 'hidden', height: '700px' }}>
             {agentName && <VncViewer agentName={agentName} />}
@@ -365,28 +407,41 @@ const AgentDetail: React.FC = () => {
         )}
         {activeTab === 'docker' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '32px' }}>
-            <TableTab 
-              title="Docker Container Inventory" 
-              columns={['Container ID', 'Name', 'Image', 'Status', 'State', 'Created At']} 
+            <TableTab
+              title="Docker Container Inventory"
+              columns={['Container ID', 'Name', 'Image', 'Status', 'State', 'Created At']}
+              columnConfig={[
+                { width: '140px', nowrap: true },
+                { width: '180px', nowrap: true },
+                { minWidth: '220px', nowrap: true },
+                { width: '140px', nowrap: true, align: 'center' },
+                { width: '110px', nowrap: true, align: 'center' },
+                { width: '180px', nowrap: true },
+              ]}
               data={data.containers.map((c: any) => [
-                c.container_id?.substring(0, 12), 
-                c.name, 
-                c.image, 
-                c.status, 
-                c.state, 
+                c.container_id?.substring(0, 12),
+                c.name,
+                c.image,
+                c.status,
+                c.state,
                 c.created_at
-              ])} 
+              ])}
             />
-            <TableTab 
-              title="Docker Events (Activity Logs)" 
-              columns={['Timestamp', 'Event', 'Details']} 
+            <TableTab
+              title="Docker Events (Activity Logs)"
+              columns={['Timestamp', 'Event', 'Details']}
+              columnConfig={[
+                { width: '160px', nowrap: true },
+                { width: '160px', nowrap: true },
+                { minWidth: '320px' },
+              ]}
               data={data.siem
                 .filter((e: any) => e.source === 'DockerMonitor' || e.message?.includes('docker event:'))
                 .map((e: any) => [
-                  e.timestamp, 
-                  e.message?.split('docker event: ')[1]?.split(' ')[0] || 'event', 
+                  e.timestamp,
+                  e.message?.split('docker event: ')[1]?.split(' ')[0] || 'event',
                   e.message
-                ])} 
+                ])}
             />
           </div>
         )}
@@ -578,7 +633,19 @@ const VulnsTab: React.FC<{ agentName: string, data: any[], onRefresh: () => void
   );
 };
 
-const TableTab: React.FC<{ title: string, columns: string[], data: any[] }> = ({ title, columns, data }) => {
+type TableColConfig = {
+  width?: string;
+  minWidth?: string;
+  nowrap?: boolean;
+  align?: 'left' | 'center' | 'right';
+};
+
+const TableTab: React.FC<{
+  title: string;
+  columns: string[];
+  data: any[];
+  columnConfig?: TableColConfig[];
+}> = ({ title, columns, data, columnConfig }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [searchMode, setSearchMode] = useState('fuzzy');
   const [visibleCount, setVisibleCount] = useState(50);
@@ -647,21 +714,78 @@ const TableTab: React.FC<{ title: string, columns: string[], data: any[] }> = ({
           </div>
         </div>
       </div>
-      <div className="table-container" onScroll={handleScroll} style={{ maxHeight: '600px', overflowY: 'auto' }}>
-        <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.875rem' }}>
+      <div className="table-container" onScroll={handleScroll} style={{ maxHeight: '600px', overflowY: 'auto', overflowX: 'auto' }}>
+        <table
+          style={{
+            width: '100%',
+            minWidth: columnConfig ? columnConfig.reduce((sum, c) => sum + (parseInt(c?.width || c?.minWidth || '120', 10) || 120), 0) + 'px' : undefined,
+            borderCollapse: 'collapse',
+            textAlign: 'left',
+            fontSize: '0.875rem',
+            tableLayout: columnConfig ? 'fixed' : 'auto',
+          }}
+        >
+          {columnConfig && (
+            <colgroup>
+              {columns.map((_, i) => (
+                <col key={i} style={{ width: columnConfig[i]?.width, minWidth: columnConfig[i]?.minWidth }} />
+              ))}
+            </colgroup>
+          )}
           <thead style={{ position: 'sticky', top: 0, backgroundColor: 'var(--sidebar-bg)', zIndex: 10 }}>
             <tr style={{ borderBottom: '1px solid var(--border-color)' }}>
-              {columns.map(col => <th key={col} style={{ padding: '14px 20px', fontWeight: 700, color: 'var(--text-secondary)', textTransform: 'uppercase', fontSize: '0.75rem' }}>{col}</th>)}
+              {columns.map((col, i) => {
+                const cfg = columnConfig?.[i];
+                return (
+                  <th
+                    key={col}
+                    style={{
+                      padding: '14px 20px',
+                      fontWeight: 700,
+                      color: 'var(--text-secondary)',
+                      textTransform: 'uppercase',
+                      fontSize: '0.75rem',
+                      whiteSpace: 'nowrap',
+                      textAlign: cfg?.align || 'left',
+                      width: cfg?.width,
+                      minWidth: cfg?.minWidth,
+                    }}
+                  >
+                    {col}
+                  </th>
+                );
+              })}
             </tr>
           </thead>
           <tbody>
             {visibleData.map((row, i) => (
               <tr key={i} style={{ borderBottom: '1px solid var(--border-color)', transition: 'background-color 0.2s ease' }} onMouseOver={e => e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.01)'} onMouseOut={e => e.currentTarget.style.backgroundColor = 'transparent'}>
-                {row.map((cell: any, j: number) => (
-                  <td key={j} style={{ padding: '14px 20px', wordBreak: 'break-word', whiteSpace: 'pre-wrap' }}>
-                    {cell?.toString().includes('CRITICAL') ? <span style={{ color: 'var(--accent-color)', fontWeight: 700 }}>{cell}</span> : cell}
-                  </td>
-                ))}
+                {row.map((cell: any, j: number) => {
+                  const cfg = columnConfig?.[j];
+                  const nowrap = !!cfg?.nowrap;
+                  const text = cell == null ? '' : cell.toString();
+                  const isCritical = text.includes('CRITICAL');
+                  return (
+                    <td
+                      key={j}
+                      title={nowrap ? text : undefined}
+                      style={{
+                        padding: '14px 20px',
+                        wordBreak: nowrap ? 'keep-all' : 'break-word',
+                        whiteSpace: nowrap ? 'nowrap' : 'pre-wrap',
+                        overflow: nowrap ? 'hidden' : undefined,
+                        textOverflow: nowrap ? 'ellipsis' : undefined,
+                        textAlign: cfg?.align || 'left',
+                        verticalAlign: 'top',
+                        width: cfg?.width,
+                        minWidth: cfg?.minWidth,
+                        maxWidth: cfg?.width,
+                      }}
+                    >
+                      {isCritical ? <span style={{ color: 'var(--accent-color)', fontWeight: 700 }}>{cell}</span> : cell}
+                    </td>
+                  );
+                })}
               </tr>
             ))}
           </tbody>
@@ -1209,14 +1333,22 @@ const SourceLogModal: React.FC<{ source?: string | null, sourceFile?: string, ti
         position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.7)',
         display: 'flex', alignItems: 'center', justifyContent: 'center',
         zIndex: 9999, padding: '24px',
+        overflowY: 'auto',
       }}
     >
       <div
         onClick={e => e.stopPropagation()}
         className="card"
-        style={{ width: 'min(900px, 100%)', maxHeight: '80vh', display: 'flex', flexDirection: 'column', padding: 0 }}
+        style={{
+          width: 'min(900px, 100%)',
+          height: 'min(85vh, 700px)',
+          display: 'flex',
+          flexDirection: 'column',
+          padding: 0,
+          overflow: 'hidden',
+        }}
       >
-        <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border-color)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px' }}>
+        <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border-color)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', flexShrink: 0 }}>
           <div>
             <div style={{ fontSize: '0.95rem', fontWeight: 700 }}>Source Log Analyzed by AI</div>
             <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '2px' }}>
@@ -1230,7 +1362,16 @@ const SourceLogModal: React.FC<{ source?: string | null, sourceFile?: string, ti
             ×
           </button>
         </div>
-        <div style={{ padding: '16px 20px', overflowY: 'auto', flex: 1 }} className="custom-scrollbar">
+        <div
+          style={{
+            padding: '16px 20px',
+            overflowY: 'auto',
+            overflowX: 'auto',
+            flex: '1 1 auto',
+            minHeight: 0,
+          }}
+          className="custom-scrollbar"
+        >
           {pretty ? (
             <pre style={{ fontSize: '0.8rem', backgroundColor: 'rgba(0,0,0,0.3)', padding: '14px', borderRadius: '8px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: 'var(--text-primary)', margin: 0 }}>
               {pretty}

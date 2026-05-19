@@ -88,10 +88,22 @@ def _extract_json(text: str):
 
 
 def _format_insight(verdict: dict, prefix: str) -> str:
-    """Render a verdict JSON into a human-readable single-line insight."""
+    """Render a verdict JSON into a human-readable single-line insight.
+
+    The defensive prompt returns `reason` instead of `summary`, the manual
+    prompt returns `summary`, automation returns `summary` + `indicator`.
+    We pull whichever fields are present so the rendered line is never an
+    empty stub like `[AI DEFENSIVE] [INFO] -> none`.
+    """
     sev = (verdict.get('severity') or 'INFO').upper()
     conf = verdict.get('confidence')
-    summary = verdict.get('summary') or ''
+    summary = (
+        verdict.get('summary')
+        or verdict.get('reason')
+        or verdict.get('rationale')
+        or verdict.get('explanation')
+        or ''
+    )
     indicator = verdict.get('indicator') or verdict.get('kill_chain_stage') or ''
     action = verdict.get('recommended_action') or verdict.get('action') or ''
     parts = [f"[{prefix}]", f"[{sev}]"]
@@ -99,8 +111,9 @@ def _format_insight(verdict: dict, prefix: str) -> str:
         parts.append(f"conf={conf:.2f}")
     if indicator and indicator != 'none':
         parts.append(f"({indicator})")
-    parts.append(summary)
-    if action and action not in ('MONITOR', 'none'):
+    if summary:
+        parts.append(summary.strip())
+    if action and action not in ('MONITOR', 'none', ''):
         parts.append(f"-> {action}")
     return ' '.join(p for p in parts if p)
 
@@ -131,18 +144,27 @@ async def handle_automation(agent, table, data, api_key, endpoint, model=None):
     is_critical = (v == 'CRITICAL' and sev in ('CRITICAL', 'HIGH') and conf >= CRITICAL_CONFIDENCE_THRESHOLD)
     is_suspicious = (v == 'SUSPICIOUS' and conf >= SUSPICIOUS_CONFIDENCE_THRESHOLD)
 
-    if not (is_critical or is_suspicious or intel_match):
-        logger.info(f"[.] Skipped non-critical (Automation) for {agent}/{table} verdict={v} sev={sev} conf={conf}")
-        return
+    if is_critical or is_suspicious or intel_match:
+        summary_line = _format_insight(verdict, "AUTO") if verdict else f"[AUTO] {raw[:300]}"
+        if intel_match:
+            summary_line = f"{summary_line}\n[!!] GLOBAL THREAT INTEL MATCH: {intel_match}"
+        source_file = f"Realtime_{table}"
+        logger.info(f"[!] CRITICAL (Automation) for {agent}: {summary_line[:120]}")
+    else:
+        if verdict:
+            short_sev = sev or 'INFO'
+            summary = verdict.get('summary') or 'No critical indicator detected.'
+            summary_line = f"[AUTO REVIEW] [{short_sev}] conf={conf:.2f} {summary}"
+        elif raw:
+            summary_line = f"[AUTO REVIEW] {raw[:280]}"
+        else:
+            summary_line = f"[AUTO REVIEW] No response from AI service."
+        source_file = f"Reviewed_{table}"
+        logger.info(f"[.] Reviewed (Automation) for {agent}/{table} v={v} conf={conf}")
 
-    summary_line = _format_insight(verdict, "AUTO") if verdict else f"[AUTO] {raw[:300]}"
-    if intel_match:
-        summary_line = f"{summary_line}\n[!!] GLOBAL THREAT INTEL MATCH: {intel_match}"
-
-    logger.info(f"[!] CRITICAL (Automation) for {agent}: {summary_line[:120]}")
     result_entry = {
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'source_file': f"Realtime_{table}",
+        'source_file': source_file,
         'critical_summary': summary_line,
         'source_data': log_text,
     }
@@ -217,41 +239,58 @@ async def handle_defensive(agent, table, data, api_key, endpoint, model=None):
     except Exception:
         conf = 0.0
 
-    if v != 'ACT' or conf < CRITICAL_CONFIDENCE_THRESHOLD:
-        logger.info(f"[.] Skipped non-actionable (Defensive) for {agent}/{table} verdict={v} conf={conf}")
-        return
-
-    summary_line = _format_insight(verdict, "AI DEFENSIVE ADVICE")
     action = (verdict.get('action') or '').upper()
     target = verdict.get('target') or ''
-    if target and target != 'none':
-        summary_line = f"{summary_line} target={target}"
+    reason = verdict.get('reason') or ''
 
-    auto_dispatched = False
-    if (
-        action in AUTONOMOUS_ACTIONS
-        and conf >= AUTONOMOUS_ACTION_CONFIDENCE
+    should_act = (
+        v == 'ACT'
+        and conf >= CRITICAL_CONFIDENCE_THRESHOLD
+        and action in AUTONOMOUS_ACTIONS
         and target
         and target != 'none'
-    ):
+    )
+
+    auto_dispatched = False
+    if should_act and conf >= AUTONOMOUS_ACTION_CONFIDENCE:
         ok = await asyncio.to_thread(
             queue_soar_action,
             agent,
             action.lower(),
             str(target),
-            f"AI auto-action conf={conf:.2f} reason={verdict.get('reason') or ''}".strip(),
+            f"AI auto-action conf={conf:.2f} reason={reason}".strip(),
         )
-        auto_dispatched = ok
+        auto_dispatched = bool(ok)
         if ok:
-            summary_line = f"{summary_line} | AUTO-DISPATCHED {action}"
             logger.warning(f"[!!] AUTO-ACTION {action} target={target} agent={agent} conf={conf}")
-        else:
-            summary_line = f"{summary_line} | AUTO-DISPATCH FAILED"
 
-    logger.info(f"[?] Defensive Recommendation for {agent}: {summary_line[:120]}")
+    if verdict:
+        base = _format_insight(verdict, "AI DEFENSIVE")
+        if target and target != 'none':
+            base = f"{base} target={target}"
+        if auto_dispatched:
+            summary_line = f"{base} | AUTO-DISPATCHED {action}"
+            source_file = "AI_DEFENSIVE_AUTO"
+        elif should_act:
+            summary_line = f"{base} | RECOMMENDED {action} (conf below auto-dispatch threshold)"
+            source_file = "AI_DEFENSIVE_ADVICE"
+        elif v == 'ACT':
+            summary_line = f"{base} | NEEDS-REVIEW (no valid target/action)"
+            source_file = "AI_DEFENSIVE_ADVICE"
+        else:
+            summary_line = f"{base} | {v or 'MONITOR'}"
+            source_file = "AI_DEFENSIVE_MONITOR"
+    elif raw:
+        summary_line = f"[AI DEFENSIVE] {raw[:280]}"
+        source_file = "AI_DEFENSIVE_MONITOR"
+    else:
+        summary_line = "[AI DEFENSIVE] No response from AI service."
+        source_file = "AI_DEFENSIVE_MONITOR"
+
+    logger.info(f"[?] Defensive ({source_file}) for {agent}: {summary_line[:140]}")
     result_entry = {
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'source_file': "AI_DEFENSIVE_AUTO" if auto_dispatched else "AI_DEFENSIVE_ADVICE",
+        'source_file': source_file,
         'critical_summary': summary_line,
         'source_data': log_text,
     }
