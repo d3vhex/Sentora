@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useParams, Link } from 'react-router-dom';
 import { 
   ShieldAlert, 
@@ -306,10 +307,10 @@ const AgentDetail: React.FC = () => {
             title="SIEM Events"
             columns={['Timestamp', 'Severity', 'Event Type', 'Source', 'Message']}
             columnConfig={[
-              { width: '160px', nowrap: true },
-              { width: '110px', nowrap: true, align: 'center' },
-              { width: '180px', nowrap: true },
-              { width: '240px', nowrap: true },
+              { minWidth: '170px', nowrap: true },
+              { minWidth: '100px', nowrap: true, align: 'center' },
+              { minWidth: '180px' },
+              { minWidth: '260px' },
               { minWidth: '320px' },
             ]}
             data={data.siem.map((r: any) => {
@@ -328,7 +329,7 @@ const AgentDetail: React.FC = () => {
             columns={['Package Name', 'Version']}
             columnConfig={[
               { minWidth: '320px' },
-              { width: '220px', nowrap: true },
+              { minWidth: '160px' },
             ]}
             data={data.packages.map((r: any) => [r.package, r.version])}
           />
@@ -338,10 +339,10 @@ const AgentDetail: React.FC = () => {
             title="Open Ports & Services"
             columns={['Port', 'Protocol', 'Service', 'State']}
             columnConfig={[
-              { width: '110px', nowrap: true, align: 'center' },
-              { width: '120px', nowrap: true, align: 'center' },
+              { minWidth: '90px', nowrap: true, align: 'center' },
+              { minWidth: '110px', nowrap: true, align: 'center' },
               { minWidth: '200px' },
-              { width: '140px', nowrap: true, align: 'center' },
+              { minWidth: '120px', nowrap: true, align: 'center' },
             ]}
             data={data.portscans.map((r: any) => [r.port, r.protocol, r.service, r.state])}
           />
@@ -352,10 +353,10 @@ const AgentDetail: React.FC = () => {
             columns={['Path', 'Owner', 'Group', 'Permissions', 'Last Opened']}
             columnConfig={[
               { minWidth: '320px' },
-              { width: '160px', nowrap: true },
-              { width: '160px', nowrap: true },
-              { width: '140px', nowrap: true, align: 'center' },
-              { width: '180px', nowrap: true },
+              { minWidth: '140px' },
+              { minWidth: '140px' },
+              { minWidth: '140px', align: 'center' },
+              { minWidth: '180px', nowrap: true },
             ]}
             data={data.criticalFiles.map((r: any) => [r.path, r.owner, r.grp, r.permissions, r.last_opened])}
           />
@@ -411,12 +412,12 @@ const AgentDetail: React.FC = () => {
               title="Docker Container Inventory"
               columns={['Container ID', 'Name', 'Image', 'Status', 'State', 'Created At']}
               columnConfig={[
-                { width: '140px', nowrap: true },
-                { width: '180px', nowrap: true },
-                { minWidth: '220px', nowrap: true },
-                { width: '140px', nowrap: true, align: 'center' },
-                { width: '110px', nowrap: true, align: 'center' },
-                { width: '180px', nowrap: true },
+                { minWidth: '130px', nowrap: true },
+                { minWidth: '160px' },
+                { minWidth: '220px' },
+                { minWidth: '120px', align: 'center' },
+                { minWidth: '100px', nowrap: true, align: 'center' },
+                { minWidth: '170px', nowrap: true },
               ]}
               data={data.containers.map((c: any) => [
                 c.container_id?.substring(0, 12),
@@ -431,8 +432,8 @@ const AgentDetail: React.FC = () => {
               title="Docker Events (Activity Logs)"
               columns={['Timestamp', 'Event', 'Details']}
               columnConfig={[
-                { width: '160px', nowrap: true },
-                { width: '160px', nowrap: true },
+                { minWidth: '170px', nowrap: true },
+                { minWidth: '140px' },
                 { minWidth: '320px' },
               ]}
               data={data.siem
@@ -718,20 +719,12 @@ const TableTab: React.FC<{
         <table
           style={{
             width: '100%',
-            minWidth: columnConfig ? columnConfig.reduce((sum, c) => sum + (parseInt(c?.width || c?.minWidth || '120', 10) || 120), 0) + 'px' : undefined,
             borderCollapse: 'collapse',
             textAlign: 'left',
             fontSize: '0.875rem',
-            tableLayout: columnConfig ? 'fixed' : 'auto',
+            tableLayout: 'auto',
           }}
         >
-          {columnConfig && (
-            <colgroup>
-              {columns.map((_, i) => (
-                <col key={i} style={{ width: columnConfig[i]?.width, minWidth: columnConfig[i]?.minWidth }} />
-              ))}
-            </colgroup>
-          )}
           <thead style={{ position: 'sticky', top: 0, backgroundColor: 'var(--sidebar-bg)', zIndex: 10 }}>
             <tr style={{ borderBottom: '1px solid var(--border-color)' }}>
               {columns.map((col, i) => {
@@ -747,7 +740,6 @@ const TableTab: React.FC<{
                       fontSize: '0.75rem',
                       whiteSpace: 'nowrap',
                       textAlign: cfg?.align || 'left',
-                      width: cfg?.width,
                       minWidth: cfg?.minWidth,
                     }}
                   >
@@ -768,18 +760,14 @@ const TableTab: React.FC<{
                   return (
                     <td
                       key={j}
-                      title={nowrap ? text : undefined}
                       style={{
                         padding: '14px 20px',
-                        wordBreak: nowrap ? 'keep-all' : 'break-word',
-                        whiteSpace: nowrap ? 'nowrap' : 'pre-wrap',
-                        overflow: nowrap ? 'hidden' : undefined,
-                        textOverflow: nowrap ? 'ellipsis' : undefined,
+                        wordBreak: 'break-word',
+                        overflowWrap: 'anywhere',
+                        whiteSpace: nowrap ? 'nowrap' : 'normal',
                         textAlign: cfg?.align || 'left',
                         verticalAlign: 'top',
-                        width: cfg?.width,
                         minWidth: cfg?.minWidth,
-                        maxWidth: cfg?.width,
                       }}
                     >
                       {isCritical ? <span style={{ color: 'var(--accent-color)', fontWeight: 700 }}>{cell}</span> : cell}
@@ -1120,7 +1108,23 @@ function parseInsight(raw: string): ParsedInsight {
   // AUTO-DISPATCHED marker emitted by defensive worker on auto-action
   body = body.replace(/\|\s*AUTO-DISPATCHED\s+\S+/, '').replace(/\|\s*AUTO-DISPATCH FAILED/, '');
 
-  r.summary = body.replace(/^\s*\|+\s*/, '').replace(/\s*\|\s*$/, '').trim();
+  // Worker appends "\nReason: <text>" when the model gave a narrative.
+  // Pull it out as the primary summary so the operator actually sees it.
+  const reasonLineMatch = body.match(/\n?\s*Reason:\s*([\s\S]+?)\s*$/i);
+  if (reasonLineMatch) {
+    r.reason = reasonLineMatch[1].trim();
+    body = body.replace(reasonLineMatch[0], '');
+  }
+
+  let summary = body.replace(/^\s*\|+\s*/, '').replace(/\s*\|\s*$/, '').trim();
+  // If the residual summary is just the verdict echo (MONITOR / ACT / ...)
+  // and we have a real reason, promote reason to summary.
+  const verdictWords = ['MONITOR', 'ACT', 'IGNORE', 'CRITICAL', 'SUSPICIOUS', 'NOT_CRITICAL', 'INSUFFICIENT_DATA'];
+  if (r.reason && (!summary || verdictWords.includes(summary.toUpperCase()))) {
+    if (summary && !r.verdict) r.verdict = summary;
+    summary = r.reason;
+  }
+  r.summary = summary;
   return r;
 }
 
@@ -1173,7 +1177,7 @@ const Chip: React.FC<{ children: React.ReactNode, color?: string, bg?: string, m
   </span>
 );
 
-const InsightCard: React.FC<{ insight: any }> = ({ insight }) => {
+export const InsightCard: React.FC<{ insight: any }> = ({ insight }) => {
   const [showRaw, setShowRaw] = useState(false);
   const [showSource, setShowSource] = useState(false);
   const p = parseInsight(insight.critical_summary || '');
@@ -1241,12 +1245,22 @@ const InsightCard: React.FC<{ insight: any }> = ({ insight }) => {
         </div>
       )}
 
-      {/* Summary */}
-      {p.summary && (
-        <p style={{ fontSize: '0.95rem', lineHeight: 1.6, color: 'var(--text-primary)', margin: 0, marginBottom: '14px' }}>
-          {p.summary}
-        </p>
-      )}
+      {/* Summary - hide if it's just a one-word echo of the verdict/severity */}
+      {(() => {
+        const s = (p.summary || '').trim();
+        if (!s) return null;
+        const upper = s.toUpperCase();
+        const isVerdictEcho =
+          upper === (p.verdict || '').toUpperCase()
+          || upper === (p.severity || '').toUpperCase()
+          || ['ACT', 'MONITOR', 'IGNORE', 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO', 'NOT_CRITICAL', 'SUSPICIOUS', 'INSUFFICIENT_DATA'].includes(upper);
+        if (isVerdictEcho) return null;
+        return (
+          <p style={{ fontSize: '0.95rem', lineHeight: 1.6, color: 'var(--text-primary)', margin: 0, marginBottom: '14px' }}>
+            {s}
+          </p>
+        );
+      })()}
 
       {/* Target */}
       {p.target && p.target !== 'none' && (
@@ -1317,7 +1331,19 @@ const InsightCard: React.FC<{ insight: any }> = ({ insight }) => {
 };
 
 const SourceLogModal: React.FC<{ source?: string | null, sourceFile?: string, timestamp?: string, onClose: () => void }> = ({ source, sourceFile, timestamp, onClose }) => {
-  // source_data is missing on legacy insights (column added later). NULL → clear notice.
+  // Lock body scroll while the modal is open so the page underneath doesn't
+  // scroll when the user wheels inside the modal.
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => {
+      document.body.style.overflow = prev;
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [onClose]);
+
   let pretty = '';
   if (source) {
     try {
@@ -1326,45 +1352,57 @@ const SourceLogModal: React.FC<{ source?: string | null, sourceFile?: string, ti
       pretty = source;
     }
   }
-  return (
+
+  // Render to document.body via portal. The InsightCard host uses `.card`
+  // which sets `backdrop-filter` — and any ancestor with backdrop-filter,
+  // filter, transform or perspective becomes a new containing block for
+  // `position: fixed`, which previously trapped the modal inside the card
+  // (it looked half-cut / off-screen). Portaling outside the card fixes it.
+  const modal = (
     <div
       onClick={onClose}
       style={{
-        position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.7)',
+        position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.85)',
         display: 'flex', alignItems: 'center', justifyContent: 'center',
         zIndex: 9999, padding: '24px',
         overflowY: 'auto',
+        backdropFilter: 'blur(4px)',
+        WebkitBackdropFilter: 'blur(4px)',
       }}
     >
       <div
         onClick={e => e.stopPropagation()}
-        className="card"
         style={{
-          width: 'min(900px, 100%)',
-          height: 'min(85vh, 700px)',
+          width: 'min(1100px, 96vw)',
+          height: 'min(88vh, 800px)',
           display: 'flex',
           flexDirection: 'column',
           padding: 0,
           overflow: 'hidden',
+          backgroundColor: 'var(--card-bg, #0f172a)',
+          border: '1px solid var(--border-color, #334155)',
+          borderRadius: '12px',
+          boxShadow: '0 25px 60px rgba(0,0,0,0.6)',
         }}
       >
-        <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border-color)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', flexShrink: 0 }}>
+        <div style={{ padding: '18px 24px', borderBottom: '1px solid var(--border-color)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', flexShrink: 0 }}>
           <div>
-            <div style={{ fontSize: '0.95rem', fontWeight: 700 }}>Source Log Analyzed by AI</div>
+            <div style={{ fontSize: '1rem', fontWeight: 700 }}>Source Log Analyzed by AI</div>
             <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '2px' }}>
               {sourceLabel(sourceFile)} · {timestamp || '-'}
             </div>
           </div>
           <button
             onClick={onClose}
-            style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)', fontSize: '1.5rem', cursor: 'pointer', lineHeight: 1 }}
+            aria-label="Close"
+            style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)', fontSize: '1.75rem', cursor: 'pointer', lineHeight: 1, padding: '4px 10px' }}
           >
             ×
           </button>
         </div>
         <div
           style={{
-            padding: '16px 20px',
+            padding: '20px 24px',
             overflowY: 'auto',
             overflowX: 'auto',
             flex: '1 1 auto',
@@ -1373,11 +1411,11 @@ const SourceLogModal: React.FC<{ source?: string | null, sourceFile?: string, ti
           className="custom-scrollbar"
         >
           {pretty ? (
-            <pre style={{ fontSize: '0.8rem', backgroundColor: 'rgba(0,0,0,0.3)', padding: '14px', borderRadius: '8px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: 'var(--text-primary)', margin: 0 }}>
+            <pre style={{ fontSize: '0.85rem', backgroundColor: 'rgba(0,0,0,0.35)', padding: '16px', borderRadius: '8px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: 'var(--text-primary)', margin: 0, lineHeight: 1.5 }}>
               {pretty}
             </pre>
           ) : (
-            <div style={{ padding: '40px 12px', textAlign: 'center', color: 'var(--text-secondary)', fontSize: '0.875rem' }}>
+            <div style={{ padding: '60px 12px', textAlign: 'center', color: 'var(--text-secondary)', fontSize: '0.875rem' }}>
               Raw log was not stored when this insight was saved. <br />
               <span style={{ fontSize: '0.75rem', opacity: 0.7 }}>(The "View Source" feature is active for new insights only.)</span>
             </div>
@@ -1386,6 +1424,9 @@ const SourceLogModal: React.FC<{ source?: string | null, sourceFile?: string, ti
       </div>
     </div>
   );
+
+  if (typeof document === 'undefined') return modal;
+  return createPortal(modal, document.body);
 };
 
 const InsightSection: React.FC<{ label: string, children: React.ReactNode }> = ({ label, children }) => (

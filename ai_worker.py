@@ -51,12 +51,19 @@ Return ONLY a single JSON object, no prose, no markdown fences:
 LOGS:
 {log_text}
 """,
-    "defensive": """You are a SOAR response advisor. Recommend a defensive action ONLY if the threat is clear and high-confidence. If unclear, recommend MONITOR.
+    "defensive": """You are a senior SOC analyst writing a SHORT technical incident note for the operator. The log below is a real security telemetry event that the SIEM already flagged as worth a look. Your job is to READ the log carefully and explain WHAT happened in plain language, then say what defensive action (if any) makes sense.
+
+Rules:
+- NEVER say "insufficient information" or "insufficient evidence". If the data is thin, describe exactly what you CAN see (process name, event ID, source IP, account name, log channel) and what threat class it most resembles.
+- Identify the event by name where possible (e.g. "Windows Event 4625 - failed logon", "vmauthd recv() failure on local socket", "Microsoft-Windows-SMBServer suspicious connection from ::1").
+- If the event is benign / routine noise, say WHY it is routine (loopback, expected service noise, no privileged account, etc) — do not just stamp MONITOR.
+- The `reason` field MUST be a complete English sentence (15-50 words) that a tier-1 analyst can paste into a ticket. NEVER repeat the verdict ("MONITOR") as the reason.
+- Use ACT only when there is a concrete indicator (known-bad IP, credential theft pattern, lateral-movement command, ransomware file extension). Use IGNORE for clear false positives. Otherwise MONITOR.
 
 Return ONLY a single JSON object, no prose, no markdown fences:
-{{"verdict":"ACT|MONITOR|IGNORE","severity":"CRITICAL|HIGH|MEDIUM|LOW|INFO","confidence":<0.0-1.0>,"action":"BLOCK_IP|KILL_PROCESS|RESTART_SERVICE|ISOLATE_HOST|DISABLE_USER|QUARANTINE_FILE|MONITOR","target":"<IP/PID/Username/Path or 'none'>","reason":"<one sentence justification>"}}
+{{"verdict":"ACT|MONITOR|IGNORE","severity":"CRITICAL|HIGH|MEDIUM|LOW|INFO","confidence":<0.0-1.0>,"event_name":"<short label of the event>","action":"BLOCK_IP|KILL_PROCESS|RESTART_SERVICE|ISOLATE_HOST|DISABLE_USER|QUARANTINE_FILE|MONITOR","target":"<IP/PID/Username/Path or 'none'>","reason":"<full sentence, what you actually see in the log and why this verdict>"}}
 
-LOGS:
+LOG:
 {log_text}
 """
 }
@@ -264,10 +271,78 @@ async def handle_defensive(agent, table, data, api_key, endpoint, model=None):
         if ok:
             logger.warning(f"[!!] AUTO-ACTION {action} target={target} agent={agent} conf={conf}")
 
+    # Build a real analyst-friendly explanation. The model frequently returns
+    # the structured JSON with `reason` blank — in that case we keep its raw
+    # commentary too so the operator actually sees what the AI concluded
+    # instead of an empty "MONITOR" badge.
+    def _trim(s: str, n: int = 600) -> str:
+        s = (s or '').strip()
+        return s if len(s) <= n else s[: n - 3] + '...'
+
     if verdict:
         base = _format_insight(verdict, "AI DEFENSIVE")
         if target and target != 'none':
             base = f"{base} target={target}"
+
+        explanation = (
+            verdict.get('reason')
+            or verdict.get('summary')
+            or verdict.get('rationale')
+            or verdict.get('explanation')
+            or ''
+        ).strip()
+        event_name = (verdict.get('event_name') or '').strip()
+
+        # The small llama3.2:3b model loves the lazy "Insufficient information
+        # to determine X" non-answer. When we detect that pattern, rebuild a
+        # useful note from the actual log content so the operator gets a real
+        # description instead of a copy-pasted apology.
+        def _lazy(text: str) -> bool:
+            t = (text or '').strip().lower()
+            if not t:
+                return True
+            lazy_starts = (
+                'insufficient information',
+                'insufficient evidence',
+                'insufficient data',
+                'unclear',
+                'cannot determine',
+                "can't determine",
+                'no information',
+                'not enough information',
+                'no further action',
+            )
+            return any(t.startswith(p) for p in lazy_starts)
+
+        if _lazy(explanation):
+            try:
+                parsed_log = json.loads(log_text) if log_text.strip().startswith('{') else None
+            except Exception:
+                parsed_log = None
+            rec = parsed_log if isinstance(parsed_log, dict) else {}
+            src = (rec.get('source') or rec.get('channel') or rec.get('logger') or '').strip()
+            sev_lg = (rec.get('severity') or rec.get('level') or '').strip()
+            msg = (rec.get('message') or rec.get('msg') or rec.get('details') or '').strip()
+            cats = (rec.get('categories') or rec.get('event_type') or '').strip()
+            facts = []
+            if event_name: facts.append(event_name)
+            elif cats: facts.append(cats)
+            if src: facts.append(f"source={src}")
+            if sev_lg: facts.append(f"severity={sev_lg}")
+            head = ' | '.join(facts) if facts else 'Telemetry event'
+            tail = msg[:240] if msg else 'no message body'
+            verdict_word = v or 'MONITOR'
+            explanation = (
+                f"{head}. Observed: {tail}. "
+                f"No high-confidence indicator of compromise detected, defaulting to {verdict_word}."
+            )
+
+        if not explanation and raw:
+            # JSON parsed but model gave no narrative — surface raw answer
+            cleaned = raw.replace('\n', ' ').strip()
+            if cleaned and not cleaned.startswith('{'):
+                explanation = cleaned
+
         if auto_dispatched:
             summary_line = f"{base} | AUTO-DISPATCHED {action}"
             source_file = "AI_DEFENSIVE_AUTO"
@@ -280,8 +355,11 @@ async def handle_defensive(agent, table, data, api_key, endpoint, model=None):
         else:
             summary_line = f"{base} | {v or 'MONITOR'}"
             source_file = "AI_DEFENSIVE_MONITOR"
+
+        if explanation:
+            summary_line = f"{summary_line}\nReason: {_trim(explanation)}"
     elif raw:
-        summary_line = f"[AI DEFENSIVE] {raw[:280]}"
+        summary_line = f"[AI DEFENSIVE] {_trim(raw)}"
         source_file = "AI_DEFENSIVE_MONITOR"
     else:
         summary_line = "[AI DEFENSIVE] No response from AI service."

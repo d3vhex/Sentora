@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import requests
 import mysql.connector
@@ -12,6 +13,21 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "my-secret-pw")
 USERDB_NAME = os.getenv("USERDB_NAME", "userdb")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434/api")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+
+
+def _agent_db(agent: str) -> str:
+    """Map an agent identifier to its MySQL database name.
+
+    Windows hostnames contain '-' (e.g. DESKTOP-EVS8H9J) which is not a valid
+    MySQL identifier character. The ingest path (`server.py:_sanitize_db_name`)
+    replaces non-[A-Za-z0-9_] with `_` when CREATING the database, so the worker
+    MUST use the same mapping when READING/WRITING — otherwise we end up
+    asking MySQL for `DESKTOP-EVS8H9J_db` while the actual DB is
+    `DESKTOP_EVS8H9J_db` and every save_ai_results raises "Unknown database".
+    """
+    safe = re.sub(r'[^A-Za-z0-9_]', '_', agent or 'agent')
+    safe = safe.strip('_') or 'agent'
+    return f"{safe}_db"
 
 
 @contextmanager
@@ -122,7 +138,7 @@ def analyze_with_ai(api_key, text, prompt_template, endpoint=None, agent=None, m
 
 def get_ai_cache(agent: str, prompt_hash: str):
     """Retrieve cached AI result if available"""
-    db_name = f"{agent}_db"
+    db_name = _agent_db(agent)
     try:
         with _conn(db_name) as conn:
             cursor = conn.cursor()
@@ -137,7 +153,7 @@ def get_ai_cache(agent: str, prompt_hash: str):
 
 def set_ai_cache(agent: str, prompt_hash: str, response: str):
     """Store AI result in cache"""
-    db_name = f"{agent}_db"
+    db_name = _agent_db(agent)
     try:
         with _conn(db_name) as conn:
             cursor = conn.cursor()
@@ -183,7 +199,7 @@ def queue_soar_action(agent: str, action: str, target: str, comment: str = "") -
     safest way for the defensive AI worker to trigger a real response without
     touching app.py's HTTP layer.
     """
-    db_name = f"{agent}_db"
+    db_name = _agent_db(agent)
     if not action or not target:
         return False
     try:
@@ -213,7 +229,7 @@ def save_ai_results(agent: str, results: list):
     `source_data` (raw log text fed to the model) is optional but recommended so
     the UI can show "what did the AI actually look at" for each insight.
     """
-    db_name = f"{agent}_db"
+    db_name = _agent_db(agent)
     try:
         with _conn(db_name) as conn:
             cursor = conn.cursor()

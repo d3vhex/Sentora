@@ -1,11 +1,10 @@
 import React, { useEffect, useState } from 'react';
-import { 
-  Monitor, 
-  Search, 
-  Filter, 
+import {
+  Monitor,
+  Search,
+  Filter,
   Clock,
   RefreshCw,
-  Download,
   ChevronRight
 } from 'lucide-react';
 import { agentService } from '../services/api';
@@ -15,42 +14,6 @@ const Agents: React.FC = () => {
   const [agents, setAgents] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
-
-  const [downloading, setDownloading] = useState<string | null>(null);
-  const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || (import.meta.env.DEV ? 'http://127.0.0.1:8000' : window.location.origin);
-
-  const handleDownload = async (os: 'windows' | 'linux') => {
-    setDownloading(os);
-    try {
-      const userId = localStorage.getItem('userId');
-      const response = await fetch(`${API_BASE_URL}/api/agent/download/${os}`, {
-        headers: {
-          'X-User-ID': userId || '0'
-        }
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        alert(`Download failed: ${errorData.message || response.statusText}`);
-        return;
-      }
-
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.setAttribute('download', `Zer0Vuln-Agent-${os}.zip`);
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.URL.revokeObjectURL(url);
-    } catch (err) {
-      console.error("Download error:", err);
-      alert("An error occurred during download.");
-    } finally {
-      setTimeout(() => setDownloading(null), 2000);
-    }
-  };
 
   useEffect(() => {
     fetchAgents(true);
@@ -86,23 +49,6 @@ const Agents: React.FC = () => {
           <p style={{ color: 'var(--text-secondary)' }}>Manage and monitor all endpoints connected to the Zer0Vuln network.</p>
         </div>
         <div className="flex-responsive" style={{ gap: '12px' }}>
-          <div style={{ display: 'flex', backgroundColor: 'var(--bg-color)', borderRadius: '6px', border: '1px solid var(--border-color)', padding: '4px' }}>
-            <button 
-              onClick={() => handleDownload('linux')}
-              disabled={downloading === 'linux'}
-              style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 16px', borderRadius: '6px', fontSize: '0.8125rem', fontWeight: 600, color: 'var(--text-primary)', cursor: downloading === 'linux' ? 'not-allowed' : 'pointer', opacity: downloading === 'linux' ? 0.7 : 1 }}
-            >
-              <Download size={16} color="var(--accent-secondary)" /> Linux
-            </button>
-            <div style={{ width: '1px', backgroundColor: 'var(--border-color)', margin: '4px 0' }}></div>
-            <button 
-              onClick={() => handleDownload('windows')}
-              disabled={downloading === 'windows'}
-              style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 16px', borderRadius: '6px', fontSize: '0.8125rem', fontWeight: 600, color: 'var(--text-primary)', cursor: downloading === 'windows' ? 'not-allowed' : 'pointer', opacity: downloading === 'windows' ? 0.7 : 1 }}
-            >
-              <Download size={16} color="var(--accent-secondary)" /> Windows
-            </button>
-          </div>
           <button className="btn-secondary" onClick={() => fetchAgents(true)} style={{ padding: '8px 16px', borderRadius: '6px', display: 'flex', alignItems: 'center', gap: '8px', backgroundColor: 'var(--bg-color)' }}>
             <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
           </button>

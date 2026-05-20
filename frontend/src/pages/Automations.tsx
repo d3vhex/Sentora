@@ -200,13 +200,13 @@ const Automations: React.FC = () => {
                       {auto.action?.toUpperCase()}
                     </div>
                   </td>
-                  <td style={{ padding: '16px 20px', fontFamily: 'monospace', color: 'var(--text-secondary)' }}>
-                    {auto.target}
+                  <td style={{ padding: '16px 20px', color: 'var(--text-secondary)', verticalAlign: 'top', minWidth: '180px', maxWidth: '260px' }}>
+                    <TargetCell auto={auto} />
                   </td>
-                  <td style={{ padding: '16px 20px' }}>
+                  <td style={{ padding: '16px 20px', verticalAlign: 'top', whiteSpace: 'nowrap' }}>
                     <StatusBadge status={auto.status} />
                   </td>
-                  <td style={{ padding: '16px 20px', color: 'var(--text-secondary)', fontSize: '0.8125rem', maxWidth: '320px' }}>
+                  <td style={{ padding: '16px 20px', verticalAlign: 'top', minWidth: '260px' }}>
                     <ReasonCell auto={auto} />
                   </td>
                   <td style={{ padding: '16px 20px', textAlign: 'right' }}>
@@ -338,17 +338,41 @@ const ReasonCell: React.FC<{ auto: any }> = ({ auto }) => {
   }
   return (
     <div
-      title={text}
       style={{
         color: isFailure ? 'var(--accent-color)' : 'var(--text-secondary)',
-        whiteSpace: 'nowrap',
-        overflow: 'hidden',
-        textOverflow: 'ellipsis',
-        maxWidth: '320px'
+        whiteSpace: 'normal',
+        wordBreak: 'break-word',
+        overflowWrap: 'anywhere',
+        lineHeight: 1.4,
+        fontSize: '0.8125rem',
       }}
     >
       {text}
     </div>
+  );
+};
+
+const TargetCell: React.FC<{ auto: any }> = ({ auto }) => {
+  let display = auto.target;
+  if (typeof display === 'string') {
+    const trimmed = display.trim();
+    if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+      try {
+        const arr = JSON.parse(trimmed);
+        if (Array.isArray(arr)) {
+          display = arr.join(' ');
+        }
+      } catch {
+        // leave as-is
+      }
+    }
+  } else if (Array.isArray(display)) {
+    display = display.join(' ');
+  }
+  return (
+    <span style={{ fontFamily: 'monospace', wordBreak: 'break-word', overflowWrap: 'anywhere' }}>
+      {display}
+    </span>
   );
 };
 

@@ -596,9 +596,39 @@ def _exec_local_action(task: dict) -> (bool, str):
         return ok, msg
 
     if ttype == "run_cmd":
+        # Pending automations arrive as {"params": {"target": "<json or argv>"}}
+        # while direct pushes use {"params": {"cmd": [...]}}. Accept both,
+        # and recover a list from a JSON-encoded string like '["dir"]' or
+        # nested escapes from a buggy upstream.
         cmd = params.get("cmd")
+        if cmd is None:
+            cmd = params.get("target")
+        if isinstance(cmd, str):
+            s = cmd.strip()
+            parsed_ok = False
+            for _ in range(6):
+                if not (s.startswith('[') and s.endswith(']')):
+                    break
+                try:
+                    parsed = json.loads(s)
+                except Exception:
+                    break
+                if not isinstance(parsed, list):
+                    break
+                if len(parsed) == 1 and isinstance(parsed[0], str) and parsed[0].startswith('[') and parsed[0].endswith(']'):
+                    s = parsed[0]
+                    continue
+                cmd = [str(x) for x in parsed if x is not None and str(x) != ""]
+                parsed_ok = True
+                break
+            if not parsed_ok and isinstance(cmd, str):
+                try:
+                    import shlex as _shlex
+                    cmd = _shlex.split(s, posix=False) or [s]
+                except Exception:
+                    cmd = [s]
         if not cmd or not isinstance(cmd, list):
-            return False, "cmd must be a list (no shell)"
+            return False, "cmd must be a non-empty list (no shell)"
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=params.get("timeout", 30), encoding='utf-8', errors='replace')
             if result.returncode == 0:
@@ -1138,10 +1168,13 @@ async def soar_execute(request: Request):
 
         eid = int(event_id or 0)
 
+        # fetch_one() already appends "ORDER BY ... LIMIT 1" — passing them
+        # in the WHERE clause produces "LIMIT 1 LIMIT 1" → Postgres syntax error.
         row = fetch_one(
             "soar_actions",
-            where="event_id=%s AND action=%s AND target=%s ORDER BY id DESC LIMIT 1",
+            where="event_id=%s AND action=%s AND target=%s",
             params=(eid, db_action, target_str),
+            order_by="id DESC",
         )
         if row:
             soar_action_id = row.get("id")

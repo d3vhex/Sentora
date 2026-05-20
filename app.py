@@ -1087,10 +1087,44 @@ def _render_windows_install(server_url: str, server_ip: str, token: str) -> str:
             return
         }}
 
+        # Stop any previously installed agent BEFORE extracting, otherwise the
+        # running main.exe locks itself and Expand-Archive blows up with
+        # UnauthorizedAccessException. This is the upgrade-in-place path.
+        $existingExe = Join-Path $InstallDir "main.exe"
+        if (Test-Path $existingExe) {{
+            Write-Host "[*] Stopping previous agent to release main.exe..." -ForegroundColor Cyan
+            try {{
+                $prevTask = Get-ScheduledTask -TaskName "Zer0VulnAgent" -ErrorAction SilentlyContinue
+                if ($prevTask) {{
+                    Stop-ScheduledTask -TaskName "Zer0VulnAgent" -ErrorAction SilentlyContinue
+                    Unregister-ScheduledTask -TaskName "Zer0VulnAgent" -Confirm:$false -ErrorAction SilentlyContinue
+                }}
+            }} catch {{}}
+            try {{
+                Get-Process -Name "main" -ErrorAction SilentlyContinue | Where-Object {{
+                    try {{ $_.Path -eq $existingExe }} catch {{ $false }}
+                }} | Stop-Process -Force -ErrorAction SilentlyContinue
+            }} catch {{}}
+
+            # Wait until the file is no longer locked. Up to 10s — Windows
+            # releases the handle a beat after the process exits.
+            for ($i = 0; $i -lt 20; $i++) {{
+                try {{
+                    $fs = [System.IO.File]::Open($existingExe, 'Open', 'ReadWrite', 'None')
+                    $fs.Close()
+                    break
+                }} catch {{
+                    Start-Sleep -Milliseconds 500
+                }}
+            }}
+        }}
+
         try {{
             Expand-Archive -Path "agent.zip" -DestinationPath "." -Force
         }} catch {{
             Write-Host "[!] Failed to extract agent.zip: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "    The previous agent may still be locking main.exe." -ForegroundColor Yellow
+            Write-Host "    Manually stop it and retry: Stop-ScheduledTask -TaskName Zer0VulnAgent; Get-Process main | Stop-Process -Force" -ForegroundColor Yellow
             return
         }}
 
@@ -1495,7 +1529,7 @@ def send_email(template_name: str, context: dict) -> bool:
         return False
 
 def dispatch_critical_alerts(agent: str, limit: int = 100) -> int:
-    db_name = f"{agent}_db"
+    db_name = _agent_db_name(agent)
     try:
         with sync_mysql_conn(db_name) as conn:
             cursor = conn.cursor(dictionary=True)
@@ -1571,7 +1605,7 @@ def _fetch_rows_safely(db_name: str, query: str, params: tuple = (), context: st
 
 def fetch_unsent_siem_logs(agent: str, limit: int = 100):
     return _fetch_rows_safely(
-        f"{agent}_db",
+        _agent_db_name(agent),
         "SELECT * FROM siem_events WHERE (ai_analyzed IS NULL OR ai_analyzed = FALSE) ORDER BY id ASC LIMIT %s",
         (limit,),
         f"unsent SIEM logs for {agent}",
@@ -1581,7 +1615,7 @@ def mark_logs_as_analyzed(agent: str, log_ids: list):
     """Mark SIEM logs as analyzed by AI"""
     if not log_ids:
         return
-    db_name = f"{agent}_db"
+    db_name = _agent_db_name(agent)
     try:
         with sync_mysql_conn(db_name) as conn:
             cursor = conn.cursor()
@@ -1600,7 +1634,7 @@ def mark_logs_as_analyzed(agent: str, log_ids: list):
 
 def fetch_critical_files_data(agent: str, limit: int = 100):
     return _fetch_rows_safely(
-        f"{agent}_db",
+        _agent_db_name(agent),
         "SELECT * FROM critical_files ORDER BY id DESC LIMIT %s",
         (limit,),
         f"critical files for {agent}",
@@ -1608,7 +1642,7 @@ def fetch_critical_files_data(agent: str, limit: int = 100):
 
 def fetch_events_alert_data(agent: str, limit: int = 100):
     return _fetch_rows_safely(
-        f"{agent}_db",
+        _agent_db_name(agent),
         "SELECT * FROM events_alert ORDER BY id DESC LIMIT %s",
         (limit,),
         f"events alert for {agent}",
@@ -1616,7 +1650,7 @@ def fetch_events_alert_data(agent: str, limit: int = 100):
 
 def fetch_vulnerabilities_data(agent: str, limit: int = 100):
     return _fetch_rows_safely(
-        f"{agent}_db",
+        _agent_db_name(agent),
         "SELECT * FROM vulnerabilities_report ORDER BY id DESC LIMIT %s",
         (limit,),
         f"vulnerabilities_report for {agent}",
@@ -1624,7 +1658,7 @@ def fetch_vulnerabilities_data(agent: str, limit: int = 100):
 
 def fetch_soar_actions_data(agent: str, limit: int = 100):
     return _fetch_rows_safely(
-        f"{agent}_db",
+        _agent_db_name(agent),
         "SELECT * FROM soar_actions ORDER BY id DESC LIMIT %s",
         (limit,),
         f"soar_actions for {agent}",
@@ -1716,7 +1750,7 @@ async def analyze_selected_logs(agent: str, logs: list):
 
 def fetch_one_log_from_db(agent, table, log_id):
     """Helper to fetch a single log row for re-decryption"""
-    db_name = f"{agent}_db"
+    db_name = _agent_db_name(agent)
     try:
         with sync_mysql_conn(db_name) as conn:
             cursor = conn.cursor(dictionary=True)
@@ -1976,8 +2010,18 @@ def _make_userdb_factory():
     return _f
 
 
+def _agent_db_name(agent: str) -> str:
+    """Map an agent identifier (possibly a Windows hostname containing '-')
+    to its MySQL database name. MUST mirror server.py:_sanitize_db_name so
+    every code path lands on the same DB that the ingest layer created.
+    """
+    safe = re.sub(r'[^A-Za-z0-9_]', '_', agent or 'agent')
+    safe = safe.strip('_') or 'agent'
+    return f"{safe}_db"
+
+
 def _make_agent_factory(agent: str):
-    db_name = f"{agent}_db"
+    db_name = _agent_db_name(agent)
     async def _f():
         try:
             return await connect(
@@ -2954,7 +2998,7 @@ async def get_all_ai_insights(request):
                             SELECT TABLE_NAME
                             FROM information_schema.tables
                             WHERE table_schema = %s AND table_name = 'ai_analysis_results'
-                        """, (f"{agent}_db",))
+                        """, (_agent_db_name(agent),))
 
                         if await acur.fetchone():
                             try:
@@ -2966,7 +3010,7 @@ async def get_all_ai_insights(request):
                             await acur.execute("""
                                 SELECT id, timestamp, source_file, critical_summary, source_data, created_at
                                 FROM ai_analysis_results
-                                ORDER BY created_at DESC LIMIT 15
+                                ORDER BY created_at DESC LIMIT 100
                             """)
                             rows = await acur.fetchall()
                             for r in rows:
@@ -2990,7 +3034,9 @@ async def get_all_ai_insights(request):
 
         return sanic_json({
             "success": True,
-            "results": sorted_results[:50]
+            "results": sorted_results[:500],
+            "agents_scanned": agents,
+            "agents_with_insights": sorted({r['agent'] for r in sorted_results}),
         })
         
     except Exception as e:
@@ -3174,7 +3220,7 @@ async def assign_permissions_to_role(request):
 @app.route("/ai-analysis-status/<agent>")
 async def get_ai_analysis_status(request, agent):
     try:
-        db_name = f"{agent}_db"
+        db_name = _agent_db_name(agent)
         def _query():
             with sync_mysql_conn(db_name) as conn:
                 cursor = conn.cursor(dictionary=True)
@@ -5482,16 +5528,41 @@ def _shape_soar_target(action: str, target):
     """Normalize a target value into the shape each SOAR action expects.
 
     run_cmd on the agent requires a non-empty *list* (argv form); everything
-    else takes a single string. Accept strings, lists, or anything stringable
+    else takes a single string. Accept strings, lists, JSON-encoded lists,
     and shape consistently.
+
+    CRITICAL: must be idempotent. If a previous trigger already JSON-encoded
+    the list to `'["dir"]'` and stored it in the automations table, the next
+    poll cycle that re-shapes the value MUST NOT wrap it again (otherwise
+    each retry escapes the quotes once more and the target eventually
+    explodes into a multi-kilobyte chain of backslashes).
     """
     act = (action or "").strip().lower()
     if act == "run_cmd":
+        # already a list — just clean it
         if isinstance(target, list):
             return [str(x) for x in target if x is not None and str(x) != ""]
         s = "" if target is None else str(target).strip()
         if not s:
             return []
+        # JSON-encoded list ('["dir"]') from a previous shaping round — unwrap
+        # and keep unwrapping while we still find a nested JSON list, so we
+        # never double-escape.
+        for _ in range(6):
+            if not (s.startswith('[') and s.endswith(']')):
+                break
+            try:
+                parsed = pyjson.loads(s)
+            except Exception:
+                break
+            if not isinstance(parsed, list):
+                break
+            cleaned = [str(x) for x in parsed if x is not None and str(x) != ""]
+            if len(cleaned) == 1 and cleaned[0].startswith('[') and cleaned[0].endswith(']'):
+                s = cleaned[0]
+                continue
+            return cleaned
+        # plain shell-style string — split with shlex (POSIX off for Windows paths)
         import shlex
         try:
             return shlex.split(s, posix=False)
