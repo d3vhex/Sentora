@@ -1,291 +1,276 @@
 # Zer0Vuln Community Edition
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
-[![Made with Sanic](https://img.shields.io/badge/built%20with-Sanic-FF7600)](https://sanic.dev/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![Built with Sanic](https://img.shields.io/badge/built%20with-Sanic-FF7600)](https://sanic.dev/)
 
-Zer0Vuln is a self-hosted SIEM, SOAR and EDR platform with locally-run LLM
-triage. Cross-platform agents collect telemetry from your endpoints, an
-Ollama model classifies incoming events in real time, and a built-in
-playbook engine can act on high-confidence threats without sending a
-single byte to a third-party AI service.
+Self-hosted security stack for small/mid teams that don't have a dedicated
+SOC. Drop an agent on each endpoint, point them at the server, and you get
+SIEM logs, file integrity, package vulnerabilities, an OpenSearch-powered
+log explorer, autonomous AI triage and a SOAR playbook engine, all in one
+`docker compose up`.
 
-This is the Community Edition released under AGPL-3.0. Pro / Enterprise
-features (multi-tenancy, SAML/SCIM, compliance dashboards, HA, signed
-air-gap update bundles, premium integrations) live in a separate paid
-distribution. If you want to use the platform without AGPL's
-network-copyleft obligations, a commercial licence waiver is available.
-The core SIEM + SOAR + Local AI capability is and will remain open-source.
+The "AI" part is a locally-running Ollama model (default `llama3.2:3b`).
+Logs never leave the box; there's no OpenAI key, no Anthropic key, no
+phone-home. If you want a smarter model and have the RAM, swap it in `.env`.
 
----
-
-## Features
-
-- Local AI triage. Ollama (default `llama3.2:3b`) runs inside the same
-  Docker stack. Logs never leave your network.
-- Three specialised AI workers. Automation (real-time triage), Manual
-  (operator-driven deep scans), Defensive (autonomous SOAR action dispatch).
-- Cross-platform agents. Windows and Linux. SIEM, FIM, package inventory,
-  open-port scan, Docker monitor, screen streaming.
-- Server-side OSV vulnerability scanner. Reads each agent's installed
-  packages, queries OSV (or your in-network mirror), persists CVE findings.
-- Playbook engine. Visual SOAR playbooks with multi-node execution and
-  per-step result tracking.
-- Air-gap ready. Local Fernet key, optional OSV mirror, locally-bundled
-  fonts, no external CDN. Works fully offline.
-- Per-agent enrolment. One-time tokens issue 64-char per-agent keys that
-  authenticate every server-agent call.
-- Integrated remote desktop. WebSocket JPEG screen streaming without a
-  TightVNC install.
+![Dashboard](docs/pics/dashboard.jpg)
 
 ---
 
-## Why Zer0Vuln (vs. Wazuh / Elastic SIEM)
+## What it actually does
 
-Wazuh and Elastic SIEM are excellent log pipelines, but both stop at
-"alerts in a dashboard" and assume an analyst will read, correlate and
-act. Zer0Vuln is built around the opposite assumption: most small teams
-do not have a 24/7 SOC, so the platform itself has to triage and respond.
+- **Collects telemetry** from Windows and Linux agents over a single TCP
+  channel. SIEM events, alerts, FIM, packages, network connections,
+  open ports, Docker activity, screen frames.
+- **Triages every event with a local LLM.** Three workers run in parallel:
+  one watches every incoming event in real time, one runs operator-driven
+  deep scans, and one decides whether to take a defensive action
+  (`BLOCK_IP`, `ISOLATE_HOST`, `KILL_PROCESS`, etc.).
+- **Indexes everything in OpenSearch** so you can grep your fleet with
+  fuzzy / exact / starts-with queries from one place.
+- **Runs SOAR playbooks** built in a small visual editor with multi-step,
+  per-node result tracking, can be triggered manually or by AI verdict.
+- **Vulnerability scans** every agent's installed packages against OSV
+  (online or via an internal mirror).
+- **Built-in remote desktop** via WebSocket JPEG streaming, no separate
+  VNC install needed on the endpoint.
 
-- **Local LLM triage out of the box.** A bundled Ollama model classifies
-  every event in real time. No SIEM rule writing, no ELK query language,
-  no external AI API key. Wazuh and Elastic both require you to ship
-  events to a separate LLM provider (or buy their AI add-on) to get the
-  same behaviour.
-- **SOAR is in the box, not a separate product.** Visual playbooks plus
-  an autonomous defensive worker that can `BLOCK_IP` / `ISOLATE_HOST` /
-  `KILL_PROCESS` etc. directly on the agent. Elastic's equivalent
-  (Security + Osquery + Fleet + connectors) is a multi-product setup;
-  Wazuh has no native SOAR at all.
-- **One stack, one install.** SIEM, EDR agent, vuln scanner, SOAR and
-  local AI in a single `docker compose up`. No Logstash, no Filebeat, no
-  separate Wazuh manager + indexer + dashboard split.
-- **Air-gap by default.** Local Fernet keys, optional OSV mirror, bundled
-  fonts, no external CDN, no telemetry phone-home. Works fully offline.
-- **AGPL, not "open core".** The triage AI, SOAR engine and agent are all
-  open-source. Paid tier only adds enterprise glue (SSO, multi-tenancy,
-  HA, compliance reports) — never the core detection capability.
+## What it looks like
 
-Pick Wazuh/Elastic if you already have analysts and want maximum query
-flexibility. Pick Zer0Vuln if you want the box to actually act when
-something bad happens.
+The sidebar groups everything into three sections: telemetry (dashboard,
+agents, alerts, assets, FIM, logs, AI), automation response
+(defensive actions, playbooks, automation rules), and administration.
+
+<p align="center">
+  <img src="docs/pics/sidebar.jpg" alt="Sidebar navigation" width="240"/>
+</p>
+
+### Per-agent view
+
+Each enrolled agent has its own page with twelve tabs. The overview
+shows live resource meters, the most recent SIEM logs, agent metadata
+and a threat summary:
+
+![Agent overview](docs/pics/agent-overview.jpg)
+
+Alerts are everything the agent's own correlation rules already flagged.
+Severity-coloured, filterable, searchable:
+
+![Agent alerts](docs/pics/agent-alerts.jpg)
+
+The AI Analysis tab is the operator-facing side of the local LLM. Manual
+and automatic scans both land here. Each insight carries a verdict chip,
+confidence, MITRE indicators (when the model returns them), IOCs, next
+steps, and a *View Source* button that opens the exact log row the AI
+looked at:
+
+![AI analysis](docs/pics/agent-ai-analysis.jpg)
+
+### Asset inventory
+
+Hardware, software, and network sockets per agent. Hardware tab lists
+every PnP device, software lists installed packages, network lists every
+TCP/UDP socket with its owning process:
+
+![Asset inventory: hardware](docs/pics/asset-inventory-hardware.jpg)
+
+![Asset inventory: network](docs/pics/asset-inventory-network.jpg)
+
+### Log Explorer
+
+Cross-agent search backed by OpenSearch. Pick an agent, pick a dataset
+(SIEM events, security alerts, process events, network, FIM, audit
+logs), and search. There's also a button to open OpenSearch Dashboards
+(Kibana fork) for power users:
+
+![Log Explorer](docs/pics/log-explorer.jpg)
+
+### Audit logs
+
+Every login attempt against the platform itself, both local and LDAP,
+with result, source IP, and timestamp. Useful when someone is in the
+"who-logged-in-when" mood:
+
+![Audit logs](docs/pics/audit-logs.jpg)
 
 ---
 
-## System Requirements
+## Quick start
 
-The full stack (Ollama + OpenSearch + MySQL + RabbitMQ + 3 AI workers +
-Sanic API + ingest) is heavy. Plan accordingly:
-
-| Tier | CPU | RAM | Disk | Notes |
-| :--- | :--- | :--- | :--- | :--- |
-| Minimum (lab / single host, ≤ 5 agents) | 4 cores | **12 GB** | 40 GB SSD | `llama3.2:3b` only; OpenSearch tuned to 1 GB heap. |
-| Recommended (small team, 10–50 agents) | 8 cores | **16 GB** | 100 GB SSD | Default compose settings. Room for log retention. |
-| Production (50+ agents, longer retention) | 16+ cores | **32 GB+** | 250 GB+ NVMe | Consider separating OpenSearch and Ollama onto their own hosts. |
-
-Rough per-service footprint at idle:
-
-- Ollama (`llama3.2:3b`): ~3 GB RAM, spikes higher under inference.
-- OpenSearch: ~2 GB RAM (default heap), disk grows with log volume.
-- MySQL 8.0: ~500 MB–1 GB RAM.
-- RabbitMQ: ~300 MB RAM.
-- Sanic + ingest + 3 AI workers: ~1 GB RAM combined.
-
-Running under 12 GB RAM is possible if you swap to a smaller Ollama
-model (`qwen2.5:1.5b` etc.) and shrink the OpenSearch heap, but expect
-slow triage. A GPU is **not** required — `llama3.2:3b` runs on CPU
-comfortably; if you have one, Ollama will use it automatically.
-
----
-
-## Quick Start (Docker Compose)
-
-Prerequisites: Docker 24+ with Compose v2, Python 3.10+ (for the agent
-build step below). See [System Requirements](#system-requirements) above
-before you start — the full stack expects ~16 GB RAM.
+You'll need Docker 24+ with Compose v2 and Python 3.10+ on the host (only
+for the one-time agent build step). The full stack wants ~16 GB RAM,
+see [System requirements](#system-requirements) below.
 
 ```bash
 git clone https://github.com/0giv/Zer0Vuln-Community-Edition.git
 cd Zer0Vuln-Community-Edition
 
-# Create your local env file. Never commit .env.
+# .env holds your local secrets. Never commit it.
 cp .env.example .env
-# Edit .env. At minimum set DB_PASSWORD to something secure.
+# Edit .env: at minimum change DB_PASSWORD.
 
-# Build the cross-platform agent binaries BEFORE bringing the stack up.
-# These produce Zer0Vuln/main (Linux) and Zer0Vuln/main.exe (Windows),
-# which the server then serves via /api/agent/download/{linux,windows}.
-# Skipping this step means the agent download endpoints return 404.
+# Build the agent binary once. The server serves it via
+# /api/agent/download/{linux,windows}; skipping this means agents can't be
+# deployed because the download endpoint returns 404.
 cd Zer0Vuln
-./build_agent.sh          # Linux / macOS / WSL host
-# Or, on a Windows host:
-# .\build_agent.ps1
+./build_agent.sh                 # on Linux/macOS/WSL
+# .\build_agent.ps1              # on Windows
 cd ..
 
 docker compose up --build -d
 ```
 
-Why the build step? The server doesn't ship pre-built agent binaries. You
-build them once locally so the artefacts you distribute to your endpoints
-came from your own toolchain. Rebuild whenever you change anything under
-`Zer0Vuln/` and restart the server container so the new binary is picked up.
+Open <http://localhost:8000>. Default login is `admin` / `admin123`.
+Change it immediately under **Users & Roles**.
 
-This brings up the full stack:
+Ollama auto-pulls `llama3.2:3b` on first boot. Verify with:
+
+```bash
+docker exec zer0vuln-ollama ollama list
+```
+
+Deploying an agent: from the **Deploy Agent** page, copy the one-liner
+for the OS you want. On the target machine (admin shell), paste it. The
+installer downloads the binary, drops a config, enrols with the server,
+and registers itself as a scheduled task / systemd unit.
+
+---
+
+## Services in the compose
 
 | Service | Port | Purpose |
 | :--- | :--- | :--- |
 | `app` | `:8000` | REST API + React UI |
-| `ingest` | `:5001` | Async TCP log collector |
+| `ingest` | `:5001` | TCP log collector (the agent sends here) |
 | `db` | `:3307` | MySQL 8.0 (host port; 3306 inside the network) |
 | `rabbitmq` | `:5672` / `:15672` | Job queue + management UI |
-| `ollama` | `:11434` | Local LLM runtime (auto-pulls `llama3.2:3b`) |
+| `ollama` | `:11434` | Local LLM runtime |
 | `opensearch` | `:9200` | Full-text log search |
-| `opensearch-dashboards` | `:5601` | Optional log explorer |
-| `ai-worker-{automation,manual,defensive}` | | LLM analysis workers |
-
-Open <http://localhost:8000>. Default credentials are `admin` / `admin123`.
-Change them immediately in *Users & Roles*.
+| `opensearch-dashboards` | `:5601` | Optional Kibana-style explorer |
+| `ai-worker-{automation,manual,defensive}` |   | LLM analysis workers |
 
 ---
 
-## Security Notes
+## System requirements
 
-### Self-signed certificates
+| Profile | CPU | RAM | Disk | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| Lab (≤ 5 agents) | 4 cores | 12 GB | 40 GB SSD | `llama3.2:3b`, OpenSearch heap at 1 GB |
+| Small team (10–50 agents) | 8 cores | 16 GB | 100 GB SSD | Compose defaults are fine |
+| Production (50+ agents) | 16+ cores | 32 GB+ | 250 GB+ NVMe | Move OpenSearch and Ollama onto their own hosts |
 
-The `certs/` directory ships with self-signed development certificates so
-the stack works out of the box on `localhost`. They are intentionally
-public and not secrets. They grant zero trust outside the demo.
+Idle footprint:
 
-For any deployment that is not your laptop:
+- Ollama (`llama3.2:3b`): ~3 GB, more under inference
+- OpenSearch: ~2 GB default heap, disk grows with retention
+- MySQL: 500 MB – 1 GB
+- RabbitMQ: ~300 MB
+- Sanic + ingest + 3 AI workers: ~1 GB combined
 
-```bash
-cd certs
-python generate_certs.py            # produces a fresh CA + server cert
+If you're tight on RAM, swap to `qwen2.5:1.5b` or another small Ollama
+model and shrink the OpenSearch heap. A GPU isn't required but Ollama
+will use it automatically if present.
+
+---
+
+## Defensive AI auto-actions
+
+When the defensive worker's verdict is `ACT` with confidence ≥
+`AI_AUTO_ACT_CONF` (default `0.75`) and the recommended action is on the
+safe-list below, the worker queues the action straight into the agent's
+`automations` table:
+
+```
+BLOCK_IP        KILL_PROCESS      RESTART_SERVICE   ISOLATE_HOST
+DISABLE_USER    QUARANTINE_FILE   SUSPEND_PROCESS   LOGOFF_USER
+CONTAINER_ISOLATE   CONTAINER_STOP   CONTAINER_KILL
 ```
 
-Or supply your own organizational CA-signed certificate.
+Anything outside that list (arbitrary `RUN_CMD`, `DELETE_FILE`, etc.)
+gets downgraded to an advisory insight. The operator has to dispatch
+it manually from the SOAR Hub. Auto-dispatched actions show a red AUTO
+chip in the UI.
+
+To disable autonomy entirely, set `AI_AUTO_ACT_CONF=1.0` in `.env`. To
+disable the periodic defensive sweep, set `AI_DEFENSIVE_SWEEP_ENABLED=0`.
+
+---
+
+## Security notes
 
 ### Default secrets
 
 `.env.example` ships with placeholders. The real `.env` is git-ignored.
-Never commit it. Rotate the following before exposing the platform to
-anything beyond `localhost`:
+Rotate these before exposing the platform to anything beyond `localhost`:
 
-- MySQL `DB_PASSWORD`
-- The default `admin / admin123` UI login
-- `AGENT_SHARED_SECRET` env (agent auth token). Auto-generated on first
-  boot if unset; export your own value to keep it stable across restarts.
+- `DB_PASSWORD`
+- The `admin / admin123` UI login
+- `AGENT_SHARED_SECRET` (agent auth fallback). Auto-generated on first
+  boot if unset.
+
+### Self-signed certs
+
+`certs/` ships with self-signed dev certs so the stack works on
+`localhost` out of the box. They are public and grant zero trust. For
+anything that isn't your laptop, regenerate:
+
+```bash
+cd certs && python generate_certs.py
+```
+
+Or supply your own organisational CA.
 
 ### Local Fernet keys
 
-The server uses two separate Fernet keys, both auto-generated on first
-boot. You do not need to create them manually for a normal install.
+The server uses two Fernet keys, both auto-generated on first boot:
 
-| Key | Where it lives | What it protects |
+| Key | Location | Protects |
 | :--- | :--- | :--- |
-| `data/fernet.key` | `data/fernet.key` (or `FERNET_KEY_PATH` env) | Agent telemetry. Handed to each enrolled agent via `/api/agents/bootstrap`. |
-| `.env` `FERNET_KEY` | `.env` (written via `set_key`) | Server-internal at-rest encryption (e.g. user-password column). |
+| Agent key | `data/fernet.key` (or `FERNET_KEY_PATH`) | Agent telemetry; handed out via `/api/agents/bootstrap` |
+| Server key | `.env` `FERNET_KEY` | Server-internal at-rest fields (e.g. password column) |
 
-Treat both files like private keys:
+`chmod 600` both. Back them up. Losing either makes the corresponding
+encrypted data unreadable. There is no in-place rotation yet.
 
-- `chmod 600 data/fernet.key` (already set)
-- `.env` should be `chmod 600` and is git-ignored by default.
-- Back them up. Losing `data/fernet.key` makes existing encrypted-at-rest
-  telemetry unreadable; losing `.env` `FERNET_KEY` does the same for
-  internal server data.
+### Threat intel keys
 
-#### Generating a key manually
-
-You only need this if you want to pre-seed the key (for example to ship
-the same key to an air-gap host, or to rotate after a leak). Both files
-accept the standard `Fernet.generate_key()` output (44-char URL-safe
-base64).
-
-```bash
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-```
-
-To pre-write the agent-shared key to disk:
-
-```bash
-mkdir -p data
-python -c "from cryptography.fernet import Fernet; open('data/fernet.key','wb').write(Fernet.generate_key())"
-chmod 600 data/fernet.key
-```
-
-To set the server-internal key via `.env`:
-
-```bash
-echo "FERNET_KEY=$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')" >> .env
-chmod 600 .env
-```
-
-To store the agent-shared key somewhere other than `data/fernet.key`,
-set `FERNET_KEY_PATH` in `.env` (or your process env) before the first
-server boot:
-
-```bash
-FERNET_KEY_PATH=/run/secrets/zer0vuln.fernet
-```
-
-#### Rotating a key
-
-There is no in-place rotation yet. To rotate:
-
-1. Stop the server.
-2. Replace `data/fernet.key` (or `.env` `FERNET_KEY`) with a fresh key.
-3. Start the server. Existing rows encrypted with the old key will not
-   decrypt anymore. Plan for downtime and either re-enrol agents or
-   accept the loss of historical encrypted telemetry.
-
-### Threat intel API keys
-
-`OTX_API_KEY` and `VT_API_KEY` are optional. When unset, threat-intel
-enrichment becomes a no-op and no external API calls are made. This keeps
-the stack air-gap-friendly by default.
+`OTX_API_KEY` and `VT_API_KEY` are optional. Unset → enrichment becomes
+a no-op, no external API calls. Keeps the stack air-gap-friendly.
 
 ### Air-gap mode
 
-Set in `.env`:
-
-```bash
-OSV_MODE=auto                          # auto | online | mirror
-OSV_MIRROR_URL=http://osv.internal     # only required when air-gapped
+```ini
+OSV_MODE=mirror
+OSV_MIRROR_URL=http://osv.internal
 ```
 
-`auto` probes public OSV at boot and falls back to the mirror on
-connection failure. See
-[docs/Zer0Vuln_Architecture.md](docs/Zer0Vuln_Architecture.md#5-air-gap-deployment)
-for the complete dependency matrix.
+Bundled fonts, local Ollama, no external CDN. Works fully offline.
 
 ---
 
-## Architecture
+## Architecture overview
 
 ```
-Agents (Win/Linux)
-  |
-  |  TCP frames + REST polling
-  v
-ingest (server.py :5001) -----> RabbitMQ -----> AI worker fleet
-  |                                                |
-  v                                                v
-MySQL  (per-agent <name>_db schemas)        ai_analysis_results
-  |
-  v
-app (Sanic :8000)  serves SPA + REST + WebSocket screen proxy
-  |
-  v
-React UI  (locally bundled fonts, ships with the image)
+ Agent (Win / Linux)
+    │  TCP frames + REST polling
+    ▼
+ ingest (:5001) ──► RabbitMQ ──► AI worker fleet (3 modes)
+    │                                  │
+    ▼                                  ▼
+ MySQL (per-agent <name>_db)    ai_analysis_results
+    │
+    ▼
+ app (Sanic :8000)  ──► React UI + REST + WebSocket screen proxy
 ```
 
-For the deep dive (module layout, AI pipeline, SOAR autonomy, on-disk
-schema, air-gap surfaces) see
+The deeper version (per-module layout, schema, AI pipeline, SOAR
+autonomy, air-gap surfaces) lives in
 [docs/Zer0Vuln_Architecture.md](docs/Zer0Vuln_Architecture.md).
 
 ---
 
-## Manual / Development Setup
+## Development setup
 
 ```bash
 # 1. Database
@@ -296,18 +281,18 @@ mysql -u root -p < init.sql
 pip install -r requirements.txt
 python app.py
 
-# 3. Ingest service (separate terminal)
+# 3. Ingest (separate terminal)
 python server.py
 
-# 4. Frontend dev server (HMR)
+# 4. Frontend dev server
 cd frontend
 npm install
 npm run dev
 ```
 
-### AI workers
+### AI workers manually
 
-Each worker is the same `ai_worker.py` script with a different role:
+Same script, three roles:
 
 ```bash
 WORKER_TYPE=automation python ai_worker.py
@@ -315,124 +300,78 @@ WORKER_TYPE=manual     python ai_worker.py
 WORKER_TYPE=defensive  python ai_worker.py
 ```
 
-Production deployments should let `docker-compose.yaml` handle it.
-
----
-
-## Defensive AI Auto-Actions
-
-When the defensive worker's LLM verdict is `ACT` with confidence at or
-above `AI_AUTO_ACT_CONF` (default `0.75`) and the recommended action is
-on the safe-list, the worker queues the action directly into the agent's
-`automations` table:
-
-```
-BLOCK_IP, KILL_PROCESS, RESTART_SERVICE, ISOLATE_HOST, DISABLE_USER,
-QUARANTINE_FILE, SUSPEND_PROCESS, LOGOFF_USER,
-CONTAINER_ISOLATE, CONTAINER_STOP, CONTAINER_KILL
-```
-
-Anything else (for example arbitrary command exec, `DELETE_FILE`) is
-downgraded to an advisory insight. Auto-dispatched actions are flagged
-with a red AUTO badge in the SOAR Hub UI.
-
-To raise the bar (or disable autonomy entirely), tune `AI_AUTO_ACT_CONF`
-to `1.0` in `.env`.
+Production: let `docker-compose.yaml` do it.
 
 ---
 
 ## Contributing
 
-Issues and PRs welcome. Please:
+PRs welcome. Before opening:
 
-1. Fork, branch, PR against `main`.
-2. Run `npx tsc --noEmit` in `frontend/` and `python -m py_compile app.py`
-   before opening.
-3. New endpoints behind `@require_permission(...)`. No exceptions.
-4. Translations and docs improvements absolutely encouraged.
+1. Fork → branch → PR against `main`.
+2. `npx tsc --noEmit` in `frontend/` and `python -m py_compile app.py`.
+3. New endpoints must be wrapped in `@require_permission(...)`.
 
-For larger features, open an issue first to align on direction.
+For anything bigger than a fix, open an issue first so we can align on
+the approach.
 
 ---
 
-## Project Layout
+## Project layout
 
 ```
 .
 ├── app.py                # Sanic API + React SPA host
-├── server.py             # Async TCP ingest
+├── server.py             # TCP ingest
 ├── ai_worker.py          # AI worker fleet (3 modes)
 ├── ai/
 │   ├── utils.py          # LLM helpers, AI cache, SOAR queueing
-│   └── intel.py          # OTX / VirusTotal indicator enrichment (opt-in)
+│   └── intel.py          # OTX / VT enrichment (opt-in)
 ├── core/
 │   ├── mq.py             # RabbitMQ publisher
 │   └── opensearch.py     # OpenSearch index/search
 ├── scanners/
-│   └── vuln.py           # Server-side OSV vuln scanner
-├── frontend/             # React 18 + TypeScript SPA
+│   └── vuln.py           # Server-side OSV scanner
+├── frontend/             # React 18 + TS SPA
 ├── Zer0Vuln/             # Cross-platform agent
-├── certs/                # Self-signed dev certs (regenerate for prod)
-├── docs/                 # Architecture, progress, TODO
-└── docker-compose.yaml   # Full-stack deployment
+├── certs/                # Self-signed dev certs
+├── docs/                 # Architecture + screenshots
+└── docker-compose.yaml
 ```
 
 ---
 
 ## License
 
-Released under the GNU Affero General Public License v3.0. See
-[LICENSE](LICENSE).
+AGPL-3.0. See [LICENSE](LICENSE).
 
-You are free to use, modify and redistribute Zer0Vuln Community Edition.
-The key thing AGPL adds on top of regular GPL: if you run a modified
-version on a network server and let others interact with it, you must
-offer those users the modified source code under the same licence.
+Use, modify, redistribute. The thing AGPL adds on top of regular GPL:
+if you run a modified version on a network server where other users
+interact with it, you must publish the modifications under AGPL too.
 
-In practice:
+- Self-hosting for internal use → no source-disclosure obligation.
+- Public-facing SaaS on top of a modified Zer0Vuln → you must publish
+  the modifications.
+- Want to ship a closed-source derivative or skip the network-copyleft
+  clause? A commercial licence waiver is available. Contact the author.
 
-- Self-hosting for internal use: no source-disclosure obligations. Use,
-  modify and run as you like inside your organisation.
-- Public-facing SaaS or managed offering: if you expose a modified
-  Zer0Vuln to external users over a network, you must publish your
-  modifications under AGPL-3.0.
-- Commercial licence waiver: organisations that want to ship a
-  closed-source derivative (or avoid the network-copyleft clause
-  entirely) can obtain a commercial licence from the project authors.
-
-The "Zer0Vuln" name and any related logos are trademarks of the project
-authors and are not covered by the AGPL. Fork freely, but please rename
-if you redistribute as your own product.
+The "Zer0Vuln" name and logo are trademarks of the project authors and
+are not covered by AGPL. Fork freely, but rename if you redistribute as
+your own product.
 
 ---
 
-## What's NOT in Community Edition
+## What's not in Community Edition
 
-Community Edition ships the full core SIEM + SOAR + Local-AI capability
-under AGPL-3.0 with no artificial caps on agents, retention, log volume
-or feature usage. Run it at whatever scale your hardware allows.
+Community Edition has zero artificial caps: no agent limit, no
+retention limit, no feature gating on the core. Run it as wide as your
+hardware allows.
 
-The following features live in the paid Pro / Enterprise distribution:
+The paid Pro / Enterprise distribution adds enterprise-glue features
+(SAML/SCIM SSO, multi-tenancy, compliance reports, HA, WORM audit,
+signed air-gap update bundles, 4-eyes SOAR approvals, premium
+ticketing/SIEM forwarders). The core detection capability never gets
+moved behind that wall.
 
-| Feature | Community | Pro | Enterprise |
-| :--- | :---: | :---: | :---: |
-| Local-AI triage (Ollama) | yes | yes | yes |
-| Core SIEM + SOAR + agent | yes | yes | yes |
-| OSV vulnerability scanning | yes | yes | yes |
-| Visual playbook engine | yes | yes | yes |
-| Local user / role management | yes | yes | yes |
-| SAML 2.0 / OIDC SSO | no | yes | yes |
-| SCIM 2.0 user provisioning | no | yes | yes |
-| Multi-tenancy / MSSP mode | no | no | yes |
-| Compliance dashboards (PCI-DSS / ISO 27001 / HIPAA) | no | no | yes |
-| WORM audit retention | no | no | yes |
-| High-availability clustering | no | read replica | full HA |
-| Signed air-gap update bundles | no | no | yes |
-| SOAR 4-eyes approval workflow | no | no | yes |
-| Splunk / MS Sentinel forwarders | no | yes | yes |
-| ServiceNow / Jira ticketing | no | no | yes |
-| Support | community | email 24 h | phone + SLA |
-
-If any of those matter for your deployment,
-[reach out](mailto:oguzhanbayarslan@gmail.com) and we'll point you to
-the commercial offering.
+If any of that matters for your deployment,
+[reach out](mailto:oguzhanbayarslan@gmail.com).
