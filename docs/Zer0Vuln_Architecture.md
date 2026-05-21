@@ -35,7 +35,7 @@ endpoint visibility, real-time log analysis and automated remediation.
 | `rabbitmq` | rabbitmq:3-management | Queues `ai_automation_queue`, `ai_manual_queue`, `ai_soar_queue`. |
 | `ai-worker-automation` | Local build | Real-time LLM triage of incoming logs. |
 | `ai-worker-manual` | Local build | Operator-initiated deep scans. |
-| `ai-worker-defensive` | Local build | Confidence-gated autonomous SOAR action dispatch. |
+| `ai-worker-defensive` | Local build | Confidence-gated autonomous SOAR action dispatch. Honours `AI_SHADOW_MODE=1` to stage proposals for operator approval (see [§3.3 Shadow Mode](#33-shadow-mode)). |
 | `opensearch` + `opensearch-dashboards` | opensearchproject:2.12.0 | Full-text log search, audit index. |
 
 ### 1.2 Server-Side Module Layout
@@ -213,19 +213,73 @@ the agent's `automations` table; the agent picks it up on the next poll.
 If the agent inbound port is unreachable the polling fallback still
 delivers it.
 
-### 3.3 Insight Storage Schema
+### 3.3 Shadow Mode
+
+Set `AI_SHADOW_MODE=1` on the `ai-worker-defensive` container (or in the
+shared `.env`) to suspend autonomous dispatch. When a verdict satisfies
+all the conditions that would normally trigger `queue_soar_action`
+(`verdict=ACT`, `confidence >= AI_AUTO_ACT_CONF`, action on the
+allow-list, valid target), the worker writes a **proposal** instead:
+
+- `source_file = 'AI_DEFENSIVE_SHADOW'`
+- `shadow_status = 'pending'`
+- `proposed_action`, `proposed_target` populated with what would have
+  fired
+- `critical_summary` carries a `SHADOW-PROPOSED <ACTION>` marker
+
+The proposal is then routed to the SOAR Hub > Shadow Queue tab. The
+operator either:
+
+| Decision | Endpoint | Side-effects |
+| :--- | :--- | :--- |
+| Approve | `POST /<agent>/shadow/<id>/approve` (perm: `manage_soar`) | Calls `call_agent_soar(action, target)`. Updates row to `shadow_status='approved'` with `shadow_decided_at`, `shadow_decided_by`. |
+| Reject | `POST /<agent>/shadow/<id>/reject` (perm: `manage_soar`) | Updates row to `shadow_status='rejected'`. Optional `note` recorded in `critical_summary`. |
+
+Listing endpoints (perm: `read_telemetry`):
+
+- `GET /<agent>/shadow/pending`
+- `GET /shadow/pending` (cross-agent aggregator)
+
+Proposals have **no expiry**. They sit in the pending list until the
+operator decides. This is intentional: with autonomy paused, the model
+must not silently "lose" decisions because nobody noticed in time.
+
+Other defensive verdicts (advice, monitor) are unaffected by shadow mode
+and still produce `AI_DEFENSIVE_ADVICE` / `AI_DEFENSIVE_MONITOR`
+insights as usual. Only the auto-dispatchable subset gets staged.
+
+Typical lifecycle:
+
+```
+events_alert  →  ai_soar_queue  →  defensive worker
+                                       │
+                       AI_SHADOW_MODE=1 ↓
+                                  proposal row (pending)
+                                       │
+                            operator approves
+                                       ↓
+                       call_agent_soar  →  automations table  →  agent poll  →  executed
+```
+
+### 3.4 Insight Storage Schema
 
 `ai_analysis_results` columns:
 
 - `id`, `timestamp`, `created_at`
 - `source_file`. Worker tag (`Realtime_<table>`, `Manual_<table>`,
-  `AI_DEFENSIVE_AUTO`, `AI_DEFENSIVE_ADVICE`).
+  `AI_DEFENSIVE_AUTO`, `AI_DEFENSIVE_ADVICE`, `AI_DEFENSIVE_MONITOR`,
+  `AI_DEFENSIVE_SHADOW`).
 - `critical_summary`. One-line tagged summary used by the UI.
 - `source_data` LONGTEXT. Raw log JSON the AI actually saw. Surfaced by
   the View Source modal in the per-agent AI Analysis tab. Idempotent
   `ALTER TABLE` adds the column on legacy DBs.
+- `proposed_action`, `proposed_target`. Populated for shadow proposals
+  (Section 3.3); NULL otherwise.
+- `shadow_status`. `'pending' | 'approved' | 'rejected' | NULL`.
+- `shadow_decided_at`, `shadow_decided_by`. Audit trail of who approved
+  or rejected a shadow proposal and when.
 
-### 3.4 Threat-Intel Enrichment (`ai/intel.py`)
+### 3.5 Threat-Intel Enrichment (`ai/intel.py`)
 
 Optional enrichment of LLM verdicts using public reputation services:
 

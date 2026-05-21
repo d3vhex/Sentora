@@ -27,6 +27,10 @@ phone-home. If you want a smarter model and have the RAM, swap it in `.env`.
   one watches every incoming event in real time, one runs operator-driven
   deep scans, and one decides whether to take a defensive action
   (`BLOCK_IP`, `ISOLATE_HOST`, `KILL_PROCESS`, etc.).
+- **Shadow mode for the defensive worker.** Flip `AI_SHADOW_MODE=1` and
+  every autonomous verdict is staged for human approval in the SOAR Hub
+  instead of being dispatched. Useful for tuning the model on real
+  traffic before letting it act on its own.
 - **Indexes everything in OpenSearch** so you can grep your fleet with
   fuzzy / exact / starts-with queries from one place.
 - **Runs SOAR playbooks** built in a small visual editor with multi-step,
