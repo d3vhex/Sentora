@@ -195,6 +195,23 @@ chip in the UI.
 To disable autonomy entirely, set `AI_AUTO_ACT_CONF=1.0` in `.env`. To
 disable the periodic defensive sweep, set `AI_DEFENSIVE_SWEEP_ENABLED=0`.
 
+### Shadow mode
+
+Set `AI_SHADOW_MODE=1` in `.env` and the defensive worker stops firing
+real actions. Verdicts that would have triggered an autonomous response
+are saved as **proposals** instead, with `source_file = AI_DEFENSIVE_SHADOW`
+and `shadow_status = pending`. The operator reviews each one from
+**SOAR Hub > Shadow Queue** and either:
+
+- **Approve** > the real SOAR action (`call_agent_soar`) fires and the
+  proposal is marked `approved` (with timestamp + operator name).
+- **Reject** > the proposal is marked `rejected` with an optional note.
+  No action is taken.
+
+Proposals never expire; nothing decides for you. Useful for letting the
+model run on production telemetry while you build confidence in its
+verdicts before unleashing real `BLOCK_IP` / `ISOLATE_HOST` etc.
+
 ---
 
 ## Security notes

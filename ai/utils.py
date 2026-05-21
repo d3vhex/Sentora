@@ -241,23 +241,46 @@ def save_ai_results(agent: str, results: list):
                         source_file VARCHAR(255),
                         critical_summary TEXT,
                         source_data LONGTEXT NULL,
+                        proposed_action VARCHAR(64) NULL,
+                        proposed_target VARCHAR(512) NULL,
+                        shadow_status VARCHAR(16) NULL,
+                        shadow_decided_at DATETIME NULL,
+                        shadow_decided_by VARCHAR(128) NULL,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
-                try:
-                    cursor.execute("ALTER TABLE ai_analysis_results ADD COLUMN source_data LONGTEXT NULL")
-                except Exception:
-                    pass
+                # Backfill columns for tables created by an older worker so
+                # we don't blow up on INSERT when shadow_* fields are pushed.
+                for ddl in (
+                    "ALTER TABLE ai_analysis_results ADD COLUMN source_data LONGTEXT NULL",
+                    "ALTER TABLE ai_analysis_results ADD COLUMN proposed_action VARCHAR(64) NULL",
+                    "ALTER TABLE ai_analysis_results ADD COLUMN proposed_target VARCHAR(512) NULL",
+                    "ALTER TABLE ai_analysis_results ADD COLUMN shadow_status VARCHAR(16) NULL",
+                    "ALTER TABLE ai_analysis_results ADD COLUMN shadow_decided_at DATETIME NULL",
+                    "ALTER TABLE ai_analysis_results ADD COLUMN shadow_decided_by VARCHAR(128) NULL",
+                ):
+                    try:
+                        cursor.execute(ddl)
+                    except Exception:
+                        pass
                 for res in results:
-                    cursor.execute("""
-                        INSERT INTO ai_analysis_results (timestamp, source_file, critical_summary, source_data)
-                        VALUES (%s, %s, %s, %s)
-                    """, (
-                        res['timestamp'],
-                        res['source_file'],
-                        res['critical_summary'],
-                        res.get('source_data'),
-                    ))
+                    cursor.execute(
+                        """
+                        INSERT INTO ai_analysis_results
+                            (timestamp, source_file, critical_summary, source_data,
+                             proposed_action, proposed_target, shadow_status)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            res['timestamp'],
+                            res['source_file'],
+                            res['critical_summary'],
+                            res.get('source_data'),
+                            res.get('proposed_action'),
+                            res.get('proposed_target'),
+                            res.get('shadow_status'),
+                        ),
+                    )
                 conn.commit()
             finally:
                 cursor.close()

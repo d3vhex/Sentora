@@ -2897,6 +2897,219 @@ async def trigger_defensive_scan(request, agent):
         return sanic_json({"success": False, "error": str(e)}, status=500)
 
 
+# ─────────────────────── Shadow Mode (defensive AI) ───────────────────────
+# When AI_SHADOW_MODE is set on the defensive worker, auto-dispatchable
+# verdicts are saved as `AI_DEFENSIVE_SHADOW` insights with shadow_status
+# 'pending' instead of being executed. The operator reviews them in the
+# SOAR Hub and either approves (→ real SOAR action is queued) or rejects
+# (→ recorded and hidden from pending list). No retention timer — proposals
+# live until decided.
+
+@require_permission("read_telemetry")
+@app.route("/<agent>/shadow/pending", methods=["GET"])
+async def list_shadow_pending(request, agent):
+    """Return pending shadow proposals for one agent."""
+    db_name = _agent_db_name(agent)
+    try:
+        async with agent_conn(agent) as cnx:
+            cur = await cnx.cursor(aiomysql.DictCursor)
+            try:
+                await cur.execute(
+                    """
+                    SELECT id, timestamp, source_file, critical_summary, source_data,
+                           proposed_action, proposed_target, shadow_status,
+                           shadow_decided_at, shadow_decided_by, created_at
+                    FROM ai_analysis_results
+                    WHERE source_file = 'AI_DEFENSIVE_SHADOW'
+                      AND shadow_status = 'pending'
+                    ORDER BY id DESC
+                    LIMIT 200
+                    """
+                )
+                rows = await cur.fetchall()
+            finally:
+                await cur.close()
+        for r in rows:
+            r['agent'] = agent
+            for k in ('created_at', 'timestamp', 'shadow_decided_at'):
+                if r.get(k) and hasattr(r[k], 'isoformat'):
+                    r[k] = r[k].isoformat()
+        return sanic_json({"success": True, "results": rows})
+    except Exception as e:
+        if "doesn't exist" in str(e).lower() or "1146" in str(e):
+            return sanic_json({"success": True, "results": []})
+        return sanic_json({"success": False, "error": str(e)}, status=500)
+
+
+@require_permission("read_telemetry")
+@app.route("/shadow/pending", methods=["GET"])
+async def list_shadow_pending_all(request):
+    """Return pending shadow proposals across every agent."""
+    try:
+        def get_agent_names():
+            with sync_mysql_conn() as conn:
+                cursor = conn.cursor()
+                try:
+                    cursor.execute("SHOW DATABASES")
+                    return [d[0].replace('_db', '') for d in cursor.fetchall() if d[0].endswith('_db')]
+                finally:
+                    cursor.close()
+
+        agents = await asyncio.to_thread(get_agent_names)
+        out = []
+        for ag in agents:
+            try:
+                async with agent_conn(ag) as cnx:
+                    cur = await cnx.cursor(aiomysql.DictCursor)
+                    try:
+                        await cur.execute(
+                            """
+                            SELECT id, timestamp, source_file, critical_summary, source_data,
+                                   proposed_action, proposed_target, shadow_status,
+                                   shadow_decided_at, shadow_decided_by, created_at
+                            FROM ai_analysis_results
+                            WHERE source_file = 'AI_DEFENSIVE_SHADOW'
+                              AND shadow_status = 'pending'
+                            ORDER BY id DESC LIMIT 100
+                            """
+                        )
+                        for r in await cur.fetchall():
+                            r['agent'] = ag
+                            for k in ('created_at', 'timestamp', 'shadow_decided_at'):
+                                if r.get(k) and hasattr(r[k], 'isoformat'):
+                                    r[k] = r[k].isoformat()
+                            out.append(r)
+                    finally:
+                        await cur.close()
+            except Exception as e:
+                if "doesn't exist" in str(e).lower() or "1146" in str(e):
+                    continue
+                print(f"[!] shadow/pending skip agent={ag}: {e}", flush=True)
+                continue
+        out.sort(key=lambda x: x.get('created_at') or '', reverse=True)
+        return sanic_json({"success": True, "results": out})
+    except Exception as e:
+        return sanic_json({"success": False, "error": str(e)}, status=500)
+
+
+@require_permission("manage_soar")
+@app.route("/<agent>/shadow/<insight_id:int>/approve", methods=["POST"])
+async def approve_shadow(request, agent, insight_id):
+    """Approve a pending shadow proposal → dispatch the proposed SOAR action."""
+    try:
+        async with agent_conn(agent) as cnx:
+            cur = await cnx.cursor(aiomysql.DictCursor)
+            try:
+                await cur.execute(
+                    """
+                    SELECT id, proposed_action, proposed_target, shadow_status, critical_summary
+                    FROM ai_analysis_results WHERE id = %s
+                    """,
+                    (insight_id,),
+                )
+                row = await cur.fetchone()
+            finally:
+                await cur.close()
+
+        if not row:
+            return sanic_json({"success": False, "error": "shadow proposal not found"}, status=404)
+        if row.get('shadow_status') != 'pending':
+            return sanic_json(
+                {"success": False, "error": f"proposal already {row.get('shadow_status') or 'finalized'}"},
+                status=409,
+            )
+
+        action = row.get('proposed_action') or ''
+        target = row.get('proposed_target') or ''
+        if not action or not target:
+            return sanic_json({"success": False, "error": "proposal has no action/target"}, status=400)
+
+        actor = ''
+        try:
+            actor = (request.ctx.session.get('username') if getattr(request.ctx, 'session', None) else '') or ''
+        except Exception:
+            actor = ''
+        if not actor:
+            actor = request.headers.get('X-Forwarded-User') or 'operator'
+
+        soar_result = await call_agent_soar(
+            agent,
+            action=action,
+            target=target,
+            comment=f"Shadow approved by {actor}: insight#{insight_id}",
+        )
+
+        async with agent_conn(agent) as cnx:
+            cur = await cnx.cursor()
+            try:
+                await cur.execute(
+                    """
+                    UPDATE ai_analysis_results
+                    SET shadow_status = 'approved',
+                        shadow_decided_at = NOW(),
+                        shadow_decided_by = %s,
+                        critical_summary = CONCAT(critical_summary, '\n[APPROVED] ', %s, ' by ', %s)
+                    WHERE id = %s
+                    """,
+                    (actor, action.upper(), actor, insight_id),
+                )
+                await cnx.commit()
+            finally:
+                await cur.close()
+
+        return sanic_json({
+            "success": True,
+            "insight_id": insight_id,
+            "action": action,
+            "target": target,
+            "dispatched": bool(soar_result.get('ok')),
+            "soar_result": soar_result,
+        })
+    except Exception as e:
+        return sanic_json({"success": False, "error": str(e)}, status=500)
+
+
+@require_permission("manage_soar")
+@app.route("/<agent>/shadow/<insight_id:int>/reject", methods=["POST"])
+async def reject_shadow(request, agent, insight_id):
+    """Reject a pending shadow proposal → record decision, no action taken."""
+    data = request.json or {}
+    note = (data.get('note') or '').strip()[:240]
+    try:
+        actor = ''
+        try:
+            actor = (request.ctx.session.get('username') if getattr(request.ctx, 'session', None) else '') or ''
+        except Exception:
+            actor = ''
+        if not actor:
+            actor = request.headers.get('X-Forwarded-User') or 'operator'
+
+        async with agent_conn(agent) as cnx:
+            cur = await cnx.cursor()
+            try:
+                await cur.execute(
+                    """
+                    UPDATE ai_analysis_results
+                    SET shadow_status = 'rejected',
+                        shadow_decided_at = NOW(),
+                        shadow_decided_by = %s,
+                        critical_summary = CONCAT(critical_summary, '\n[REJECTED] by ', %s, %s)
+                    WHERE id = %s AND shadow_status = 'pending'
+                    """,
+                    (actor, actor, (f' ({note})' if note else ''), insight_id),
+                )
+                affected = cur.rowcount
+                await cnx.commit()
+            finally:
+                await cur.close()
+
+        if not affected:
+            return sanic_json({"success": False, "error": "not found or already finalized"}, status=404)
+        return sanic_json({"success": True, "insight_id": insight_id, "actor": actor})
+    except Exception as e:
+        return sanic_json({"success": False, "error": str(e)}, status=500)
+
+
 DEFENSIVE_SWEEP_INTERVAL = int(os.getenv("AI_DEFENSIVE_SWEEP_SEC", "300"))
 DEFENSIVE_SWEEP_BATCH = int(os.getenv("AI_DEFENSIVE_SWEEP_BATCH", "10"))
 

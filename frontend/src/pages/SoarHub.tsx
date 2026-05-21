@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { 
+import {
   Zap,
   Activity,
   ShieldCheck,
@@ -9,12 +9,18 @@ import {
   RefreshCw,
   Terminal,
   Server,
-  AlertTriangle
+  AlertTriangle,
+  Eye,
+  Check,
+  X
 } from 'lucide-react';
 import { agentService } from '../services/api';
 import { Link } from 'react-router-dom';
 
+type Tab = 'overview' | 'shadow';
+
 const SoarHub: React.FC = () => {
+  const [tab, setTab] = useState<Tab>('overview');
   const [stats, setStats] = useState({
     totalActions: 0,
     successful: 0,
@@ -27,6 +33,59 @@ const SoarHub: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [filterMode, setFilterMode] = useState<'all' | 'failed'>('all');
   const [aiAdvice, setAiAdvice] = useState<any[]>([]);
+  const [shadowList, setShadowList] = useState<any[]>([]);
+  const [shadowLoading, setShadowLoading] = useState(false);
+  const [shadowBusy, setShadowBusy] = useState<number | null>(null);
+
+  const fetchShadow = async () => {
+    setShadowLoading(true);
+    try {
+      const res = await agentService.getShadowPendingAll();
+      setShadowList(Array.isArray(res?.results) ? res.results : []);
+    } catch (err) {
+      console.error('Shadow fetch failed', err);
+      setShadowList([]);
+    } finally {
+      setShadowLoading(false);
+    }
+  };
+
+  const handleApprove = async (item: any) => {
+    if (!item?.agent || !item?.id) return;
+    if (!window.confirm(`Approve ${item.proposed_action?.toUpperCase()} on ${item.proposed_target}?`)) return;
+    setShadowBusy(item.id);
+    try {
+      const res = await agentService.approveShadow(item.agent, item.id);
+      if (res?.success) {
+        alert(`Approved. SOAR call: ${res.soar_result?.message || (res.dispatched ? 'dispatched' : 'queued')}`);
+        fetchShadow();
+      } else {
+        alert(`Approve failed: ${res?.error || 'unknown'}`);
+      }
+    } catch (err: any) {
+      alert(`Approve failed: ${err?.response?.data?.error || err?.message}`);
+    } finally {
+      setShadowBusy(null);
+    }
+  };
+
+  const handleReject = async (item: any) => {
+    if (!item?.agent || !item?.id) return;
+    const note = window.prompt('Reject reason (optional):', '') || '';
+    setShadowBusy(item.id);
+    try {
+      const res = await agentService.rejectShadow(item.agent, item.id, note);
+      if (res?.success) {
+        fetchShadow();
+      } else {
+        alert(`Reject failed: ${res?.error || 'unknown'}`);
+      }
+    } catch (err: any) {
+      alert(`Reject failed: ${err?.response?.data?.error || err?.message}`);
+    } finally {
+      setShadowBusy(null);
+    }
+  };
 
   const fetchAIData = async () => {
     try {
@@ -57,9 +116,14 @@ const SoarHub: React.FC = () => {
   useEffect(() => {
     fetchData();
     fetchAIData();
-    const interval = setInterval(() => { fetchData(); fetchAIData(); }, 30000);
+    fetchShadow();
+    const interval = setInterval(() => {
+      fetchData();
+      fetchAIData();
+      if (tab === 'shadow') fetchShadow();
+    }, 30000);
     return () => clearInterval(interval);
-  }, []);
+  }, [tab]);
 
   const fetchData = async () => {
     setLoading(true);
@@ -133,8 +197,8 @@ const SoarHub: React.FC = () => {
           <p style={{ color: 'var(--text-secondary)' }}>Automated response monitoring and incident mitigation center.</p>
         </div>
         <div style={{ display: 'flex', gap: '12px' }}>
-          <button onClick={() => { fetchData(); fetchAIData(); }} style={{ padding: '10px 20px', borderRadius: '10px', backgroundColor: 'rgba(255,255,255,0.03)', border: '1px solid var(--border-color)', color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.875rem', fontWeight: 600 }}>
-            <RefreshCw size={16} className={loading ? 'animate-spin' : ''} /> Refresh Hub
+          <button onClick={() => { fetchData(); fetchAIData(); fetchShadow(); }} style={{ padding: '10px 20px', borderRadius: '10px', backgroundColor: 'rgba(255,255,255,0.03)', border: '1px solid var(--border-color)', color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.875rem', fontWeight: 600 }}>
+            <RefreshCw size={16} className={loading || shadowLoading ? 'animate-spin' : ''} /> Refresh Hub
           </button>
           <Link to="/automations" style={{ padding: '10px 20px', borderRadius: '10px', backgroundColor: 'var(--accent-secondary)', color: 'white', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.875rem', fontWeight: 700 }}>
             <Zap size={16} /> Manage Rules
@@ -142,6 +206,64 @@ const SoarHub: React.FC = () => {
         </div>
       </div>
 
+      {/* Tab switcher */}
+      <div style={{ display: 'flex', gap: '4px', marginBottom: '24px', padding: '4px', backgroundColor: 'var(--card-bg)', border: '1px solid var(--border-color)', borderRadius: '12px', width: 'fit-content' }}>
+        <button
+          onClick={() => setTab('overview')}
+          style={{
+            padding: '10px 20px',
+            borderRadius: '8px',
+            backgroundColor: tab === 'overview' ? 'rgba(96, 165, 250, 0.15)' : 'transparent',
+            color: tab === 'overview' ? 'var(--accent-secondary)' : 'var(--text-secondary)',
+            border: 'none',
+            cursor: 'pointer',
+            fontSize: '0.875rem',
+            fontWeight: 700,
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px',
+          }}
+        >
+          <Activity size={16} /> Overview
+        </button>
+        <button
+          onClick={() => setTab('shadow')}
+          style={{
+            padding: '10px 20px',
+            borderRadius: '8px',
+            backgroundColor: tab === 'shadow' ? 'rgba(167, 139, 250, 0.15)' : 'transparent',
+            color: tab === 'shadow' ? '#a78bfa' : 'var(--text-secondary)',
+            border: 'none',
+            cursor: 'pointer',
+            fontSize: '0.875rem',
+            fontWeight: 700,
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px',
+          }}
+        >
+          <Eye size={16} /> Shadow Queue
+          {shadowList.length > 0 && (
+            <span style={{ backgroundColor: '#a78bfa', color: 'white', borderRadius: '10px', padding: '1px 8px', fontSize: '0.7rem', fontWeight: 800 }}>
+              {shadowList.length}
+            </span>
+          )}
+        </button>
+      </div>
+
+      {tab === 'shadow' && (
+        <ShadowQueue
+          items={shadowList}
+          loading={shadowLoading}
+          busyId={shadowBusy}
+          onApprove={handleApprove}
+          onReject={handleReject}
+          onRefresh={fetchShadow}
+        />
+      )}
+
+      {tab === 'overview' && (
+      <>
       {/* Stats Overview */}
       <div className="responsive-grid" style={{ marginBottom: '32px' }}>
         <SoarStatCard label="Mitigated Threats" value={stats.successful} icon={<ShieldCheck color="var(--accent-success)" />} color="var(--accent-success)" />
@@ -299,6 +421,128 @@ const SoarHub: React.FC = () => {
             )}
           </div>
         </div>
+      </div>
+      </>
+      )}
+    </div>
+  );
+};
+
+const ShadowQueue: React.FC<{
+  items: any[];
+  loading: boolean;
+  busyId: number | null;
+  onApprove: (item: any) => void;
+  onReject: (item: any) => void;
+  onRefresh: () => void;
+}> = ({ items, loading, busyId, onApprove, onReject, onRefresh }) => {
+  return (
+    <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+      <div style={{ padding: '20px 24px', borderBottom: '1px solid var(--border-color)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px' }}>
+        <div>
+          <h3 style={{ fontSize: '1.125rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <Eye size={18} color="#a78bfa" />
+            Shadow Mode Queue
+          </h3>
+          <p style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)', marginTop: '4px' }}>
+            Defensive AI verdicts staged for operator review. Approving dispatches the real SOAR action; rejecting records the decision and clears it from this list.
+          </p>
+        </div>
+        <button onClick={onRefresh} style={{ padding: '8px 14px', borderRadius: '8px', backgroundColor: 'rgba(255,255,255,0.03)', border: '1px solid var(--border-color)', color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.8125rem', fontWeight: 600, cursor: 'pointer' }}>
+          <RefreshCw size={14} className={loading ? 'animate-spin' : ''} /> Refresh
+        </button>
+      </div>
+
+      <div style={{ maxHeight: '720px', overflowY: 'auto' }}>
+        {loading && items.length === 0 ? (
+          <div style={{ padding: '60px', textAlign: 'center', color: 'var(--text-secondary)' }}>
+            <RefreshCw size={32} className="animate-spin" style={{ opacity: 0.3, marginBottom: '12px' }} />
+            <p>Loading shadow queue...</p>
+          </div>
+        ) : items.length === 0 ? (
+          <div style={{ padding: '80px 24px', textAlign: 'center', color: 'var(--text-secondary)' }}>
+            <Eye size={48} style={{ opacity: 0.1, marginBottom: '16px', margin: '0 auto' }} />
+            <p style={{ fontWeight: 600 }}>No shadow proposals pending.</p>
+            <p style={{ fontSize: '0.8125rem', marginTop: '6px', maxWidth: '420px', margin: '6px auto 0' }}>
+              When <code style={{ fontSize: '0.75rem', backgroundColor: 'rgba(167,139,250,0.1)', padding: '1px 6px', borderRadius: '4px' }}>AI_SHADOW_MODE=1</code> is set on <code style={{ fontSize: '0.75rem', backgroundColor: 'rgba(167,139,250,0.1)', padding: '1px 6px', borderRadius: '4px' }}>zer0vuln-ai-worker-defensive</code>, autonomous verdicts land here instead of being executed.
+            </p>
+          </div>
+        ) : (
+          items.map((item) => {
+            const busy = busyId === item.id;
+            const action = (item.proposed_action || '').toUpperCase();
+            return (
+              <div key={item.id} style={{ padding: '20px 24px', borderBottom: '1px solid rgba(255,255,255,0.04)', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '12px', flexWrap: 'wrap' }}>
+                  <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
+                    <span style={{ padding: '4px 10px', backgroundColor: 'rgba(167,139,250,0.12)', border: '1px solid rgba(167,139,250,0.3)', borderRadius: '6px', fontSize: '0.7rem', fontWeight: 800, color: '#a78bfa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                      PROPOSED {action}
+                    </span>
+                    <span style={{ padding: '4px 10px', backgroundColor: 'rgba(255,255,255,0.04)', border: '1px solid var(--border-color)', borderRadius: '6px', fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                      <Server size={12} /> {item.agent}
+                    </span>
+                    <span style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                      <Clock size={11} /> {item.created_at ? new Date(item.created_at).toLocaleString() : item.timestamp}
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <button
+                      onClick={() => onApprove(item)}
+                      disabled={busy}
+                      style={{
+                        padding: '8px 16px',
+                        borderRadius: '8px',
+                        backgroundColor: busy ? 'rgba(52,211,153,0.05)' : 'rgba(52,211,153,0.12)',
+                        border: '1px solid rgba(52,211,153,0.35)',
+                        color: '#34d399',
+                        fontWeight: 700,
+                        fontSize: '0.8125rem',
+                        cursor: busy ? 'not-allowed' : 'pointer',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '6px',
+                        opacity: busy ? 0.6 : 1,
+                      }}
+                    >
+                      <Check size={14} /> Approve
+                    </button>
+                    <button
+                      onClick={() => onReject(item)}
+                      disabled={busy}
+                      style={{
+                        padding: '8px 16px',
+                        borderRadius: '8px',
+                        backgroundColor: busy ? 'rgba(239,68,68,0.05)' : 'rgba(239,68,68,0.10)',
+                        border: '1px solid rgba(239,68,68,0.30)',
+                        color: '#ef4444',
+                        fontWeight: 700,
+                        fontSize: '0.8125rem',
+                        cursor: busy ? 'not-allowed' : 'pointer',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '6px',
+                        opacity: busy ? 0.6 : 1,
+                      }}
+                    >
+                      <X size={14} /> Reject
+                    </button>
+                  </div>
+                </div>
+
+                <div style={{ display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)' }}>Target:</span>
+                  <code style={{ fontSize: '0.8125rem', padding: '4px 10px', borderRadius: '6px', backgroundColor: 'rgba(251,191,36,0.10)', border: '1px solid rgba(251,191,36,0.2)', color: '#fbbf24', wordBreak: 'break-all' }}>
+                    {item.proposed_target}
+                  </code>
+                </div>
+
+                <div style={{ fontSize: '0.875rem', color: 'var(--text-primary)', lineHeight: 1.55, whiteSpace: 'pre-wrap', wordBreak: 'break-word', padding: '12px 14px', backgroundColor: 'rgba(0,0,0,0.18)', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
+                  {item.critical_summary}
+                </div>
+              </div>
+            );
+          })
+        )}
       </div>
     </div>
   );

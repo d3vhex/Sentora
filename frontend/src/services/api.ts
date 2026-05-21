@@ -82,6 +82,12 @@ export const agentService = {
   executeSoarAction: (agent: string, data: any) => api.post(`/${agent}/soar/execute`, data).then(res => res.data),
   resolveSoarAction: (agent: string, id: number, comment: string) => api.patch(`/${agent}/soar_actions/${id}/resolve`, { comment }).then(res => res.data),
 
+  // Shadow Mode (defensive AI proposals awaiting operator approval)
+  getShadowPendingAll: () => api.get('/shadow/pending').then(res => res.data),
+  getShadowPending: (agent: string) => api.get(`/${agent}/shadow/pending`).then(res => res.data),
+  approveShadow: (agent: string, insightId: number) => api.post(`/${agent}/shadow/${insightId}/approve`).then(res => res.data),
+  rejectShadow: (agent: string, insightId: number, note?: string) => api.post(`/${agent}/shadow/${insightId}/reject`, { note }).then(res => res.data),
+
   // Playbooks & Automations
   getPlaybooks: (agent: string) => api.get(`/${agent}/playbooks`).then(res => res.data),
   createPlaybook: (agent: string, data: any) => api.post(`/${agent}/playbooks`, data).then(res => res.data),

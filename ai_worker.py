@@ -232,6 +232,12 @@ AUTONOMOUS_ACTIONS = {
 
 AUTONOMOUS_ACTION_CONFIDENCE = float(os.getenv("AI_AUTO_ACT_CONF", "0.75"))
 
+# Shadow mode: when enabled, the defensive worker stops dispatching real SOAR
+# actions and instead writes a "proposal" insight that the operator can
+# approve or reject from the SOAR Hub. Lets you test autonomy on production
+# data before letting the model actually pull triggers.
+SHADOW_MODE = os.getenv("AI_SHADOW_MODE", "0").lower() in ("1", "true", "yes", "on")
+
 
 async def handle_defensive(agent, table, data, api_key, endpoint, model=None):
     log_text = json.dumps(data, indent=2)
@@ -259,17 +265,28 @@ async def handle_defensive(agent, table, data, api_key, endpoint, model=None):
     )
 
     auto_dispatched = False
+    shadow_proposed = False
     if should_act and conf >= AUTONOMOUS_ACTION_CONFIDENCE:
-        ok = await asyncio.to_thread(
-            queue_soar_action,
-            agent,
-            action.lower(),
-            str(target),
-            f"AI auto-action conf={conf:.2f} reason={reason}".strip(),
-        )
-        auto_dispatched = bool(ok)
-        if ok:
-            logger.warning(f"[!!] AUTO-ACTION {action} target={target} agent={agent} conf={conf}")
+        if SHADOW_MODE:
+            # Don't actually fire. The proposal will be saved into
+            # ai_analysis_results with shadow_status='pending'; the operator
+            # approves or rejects from the SOAR Hub.
+            shadow_proposed = True
+            logger.info(
+                f"[~] SHADOW {action} target={target} agent={agent} conf={conf} "
+                f"(would have auto-dispatched; queued for operator review)"
+            )
+        else:
+            ok = await asyncio.to_thread(
+                queue_soar_action,
+                agent,
+                action.lower(),
+                str(target),
+                f"AI auto-action conf={conf:.2f} reason={reason}".strip(),
+            )
+            auto_dispatched = bool(ok)
+            if ok:
+                logger.warning(f"[!!] AUTO-ACTION {action} target={target} agent={agent} conf={conf}")
 
     # Build a real analyst-friendly explanation. The model frequently returns
     # the structured JSON with `reason` blank — in that case we keep its raw
@@ -343,7 +360,17 @@ async def handle_defensive(agent, table, data, api_key, endpoint, model=None):
             if cleaned and not cleaned.startswith('{'):
                 explanation = cleaned
 
-        if auto_dispatched:
+        proposed_action = None
+        proposed_target = None
+        shadow_status = None
+
+        if shadow_proposed:
+            summary_line = f"{base} | SHADOW-PROPOSED {action} (awaiting operator approval)"
+            source_file = "AI_DEFENSIVE_SHADOW"
+            proposed_action = action.lower()
+            proposed_target = str(target)
+            shadow_status = 'pending'
+        elif auto_dispatched:
             summary_line = f"{base} | AUTO-DISPATCHED {action}"
             source_file = "AI_DEFENSIVE_AUTO"
         elif should_act:
@@ -361,9 +388,15 @@ async def handle_defensive(agent, table, data, api_key, endpoint, model=None):
     elif raw:
         summary_line = f"[AI DEFENSIVE] {_trim(raw)}"
         source_file = "AI_DEFENSIVE_MONITOR"
+        proposed_action = None
+        proposed_target = None
+        shadow_status = None
     else:
         summary_line = "[AI DEFENSIVE] No response from AI service."
         source_file = "AI_DEFENSIVE_MONITOR"
+        proposed_action = None
+        proposed_target = None
+        shadow_status = None
 
     logger.info(f"[?] Defensive ({source_file}) for {agent}: {summary_line[:140]}")
     result_entry = {
@@ -371,6 +404,9 @@ async def handle_defensive(agent, table, data, api_key, endpoint, model=None):
         'source_file': source_file,
         'critical_summary': summary_line,
         'source_data': log_text,
+        'proposed_action': proposed_action,
+        'proposed_target': proposed_target,
+        'shadow_status': shadow_status,
     }
     try:
         await asyncio.to_thread(save_ai_results, agent, [result_entry])
