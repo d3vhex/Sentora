@@ -1,6 +1,6 @@
-# Zer0Vuln Architecture and Features
+# Sentora Architecture and Features
 
-This document is a technical breakdown of the Zer0Vuln platform: feature
+This document is a technical breakdown of the Sentora platform: feature
 set, container topology, data flow and component-level workflows derived
 from the live source.
 
@@ -8,7 +8,7 @@ from the live source.
 
 ## 1. High-Level System Topography
 
-Zer0Vuln operates on a distributed hub-and-spoke model designed for
+Sentora operates on a distributed hub-and-spoke model designed for
 endpoint visibility, real-time log analysis and automated remediation.
 
 - Cybersecurity Command Center (Frontend). A React 18 plus TypeScript SPA
@@ -20,7 +20,7 @@ endpoint visibility, real-time log analysis and automated remediation.
   MySQL databases keep scan and telemetry data isolated.
 - AI Intelligence Multiplexer. RabbitMQ-fronted worker fleet (three
   specialised roles) running locally-hosted LLMs (Ollama `llama3.2:3b`).
-- Zer0Vuln Agent (Sensor). Cross-platform (Windows and Linux) sensor that
+- Sentora Agent (Sensor). Cross-platform (Windows and Linux) sensor that
   ships SIEM logs, FIM data, package inventory, Docker events and
   inventory, and accepts SOAR action pushes.
 
@@ -44,7 +44,7 @@ After the 2026-04 reorganization the flat utility files at root were
 split into intent-based packages:
 
 ```
-Zer0Vuln-Server/
+Sentora-Server/
 ├── app.py            entry: Sanic API + SPA
 ├── server.py         entry: TCP ingest
 ├── ai_worker.py      entry: AI worker fleet (WORKER_TYPE env selects role)

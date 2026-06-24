@@ -59,7 +59,7 @@ const Login: React.FC = () => {
           }}>
             <ShieldAlert size={40} color="var(--text-primary)" />
           </div>
-          <h1 style={{ fontSize: '1.5rem', fontWeight: 600, letterSpacing: '-0.01em', marginBottom: '8px', color: 'var(--text-primary)' }}>Zer0Vuln Platform</h1>
+          <h1 style={{ fontSize: '1.5rem', fontWeight: 600, letterSpacing: '-0.01em', marginBottom: '8px', color: 'var(--text-primary)' }}>Sentora Platform</h1>
           <p className="mono" style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>SECURE CONSOLE AUTHENTICATION</p>
         </div>
 
@@ -172,7 +172,7 @@ const Login: React.FC = () => {
           color: 'var(--text-secondary)',
           opacity: 0.7
         }}>
-          Zer0Vuln Enterprise Security Platform
+          Sentora Enterprise Security Platform
         </p>
       </div>
     </div>

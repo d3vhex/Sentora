@@ -81,6 +81,6 @@ jobs:
         with:
           context: .
           push: false
-          tags: zer0vuln-community:ci
+          tags: sentora-community:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max

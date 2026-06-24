@@ -87,6 +87,9 @@ export const agentService = {
   getShadowPending: (agent: string) => api.get(`/${agent}/shadow/pending`).then(res => res.data),
   approveShadow: (agent: string, insightId: number) => api.post(`/${agent}/shadow/${insightId}/approve`).then(res => res.data),
   rejectShadow: (agent: string, insightId: number, note?: string) => api.post(`/${agent}/shadow/${insightId}/reject`, { note }).then(res => res.data),
+  verifyShadowChain: (agent?: string) => agent
+    ? api.get(`/${agent}/shadow/chain/verify`).then(res => res.data)
+    : api.get('/shadow/chain/verify').then(res => res.data),
 
   // Playbooks & Automations
   getPlaybooks: (agent: string) => api.get(`/${agent}/playbooks`).then(res => res.data),

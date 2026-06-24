@@ -20,7 +20,7 @@ def generate_root_ca(common_name: str, days: int):
 
     subject = issuer = x509.Name([
         x509.NameAttribute(NameOID.COUNTRY_NAME, u"TR"),
-        x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"Zer0Vuln Dev"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"Sentora Dev"),
         x509.NameAttribute(NameOID.COMMON_NAME, common_name),
     ])
 
@@ -57,7 +57,7 @@ def generate_server_cert(cn: str, days: int, ca_key, ca_cert):
 
     subject = x509.Name([
         x509.NameAttribute(NameOID.COUNTRY_NAME, u"TR"),
-        x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"Zer0Vuln Dev"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"Sentora Dev"),
         x509.NameAttribute(NameOID.COMMON_NAME, cn),
     ])
 
@@ -121,7 +121,7 @@ def main():
         return
 
     print("[i] Generating Root CA …")
-    ca_key, ca_cert = generate_root_ca(common_name="Zer0Vuln-Local-RootCA", days=args.days * 5)
+    ca_key, ca_cert = generate_root_ca(common_name="Sentora-Local-RootCA", days=args.days * 5)
 
     write_pem(
         root_key_path,

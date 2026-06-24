@@ -1,6 +1,6 @@
-# Zer0Vuln Agent
+# Sentora Agent
 
-The endpoint agent for the Zer0Vuln SIEM/SOAR/EDR platform.
+The endpoint agent for the Sentora SIEM/SOAR/EDR platform.
 
 For everything user-facing (what it does, how to deploy, configuration,
 modules, troubleshooting) see [README.md](README.md).

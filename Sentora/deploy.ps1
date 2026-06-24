@@ -1,4 +1,4 @@
-# Zer0Vuln Agent - Token-Based Installer (Windows)
+# Sentora Agent - Token-Based Installer (Windows)
 #
 # Usage:
 #   .\deploy.ps1 -Token <ENROLLMENT_TOKEN> -Server <SERVER_URL>
@@ -21,7 +21,7 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 
 $Server     = $Server.TrimEnd('/')
 $ServerIp   = ($Server -replace '^https?://','' -replace ':.*$','')
-$InstallDir = "C:\Program Files\Zer0Vuln-Agent"
+$InstallDir = "C:\Program Files\Sentora-Agent"
 
 Write-Host "[*] Registering with $Server ..." -ForegroundColor Yellow
 $RegBody = @{ token = $Token; hostname = $Name; os_type = "windows" } | ConvertTo-Json -Compress
@@ -64,7 +64,7 @@ $ConfigPath = Join-Path $InstallDir "config.json"
     server_ip  = $ServerIp
 } | ConvertTo-Json -Depth 3 | Set-Content -Path $ConfigPath -Encoding UTF8
 
-$svcName = "Zer0VulnAgent"
+$svcName = "SentoraAgent"
 $binPath = "`"$InstallDir\main.exe`" --config `"$ConfigPath`""
 $existing = Get-Service -Name $svcName -ErrorAction SilentlyContinue
 if ($existing) {
@@ -72,7 +72,7 @@ if ($existing) {
     sc.exe delete $svcName | Out-Null
     Start-Sleep -Seconds 2
 }
-sc.exe create $svcName binPath= $binPath start= auto DisplayName= "Zer0Vuln Agent" | Out-Null
+sc.exe create $svcName binPath= $binPath start= auto DisplayName= "Sentora Agent" | Out-Null
 Start-Service -Name $svcName
 
-Write-Host "[+] Zer0Vuln Agent installed and running as: $AgentName" -ForegroundColor Green
+Write-Host "[+] Sentora Agent installed and running as: $AgentName" -ForegroundColor Green

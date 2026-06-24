@@ -1,11 +1,11 @@
 blank_issues_enabled: false
 contact_links:
   - name: 🛡️ Security vulnerability
-    url: https://github.com/0giv/Zer0Vuln-Community-Edition/security/advisories/new
+    url: https://github.com/0giv/Sentora-Community-Edition/security/advisories/new
     about: Privately report a security issue — please do NOT open a public issue.
   - name: 💬 Discussion
-    url: https://github.com/0giv/Zer0Vuln-Community-Edition/discussions
+    url: https://github.com/0giv/Sentora-Community-Edition/discussions
     about: General questions, ideas, deployment help.
   - name: 🏢 Pro / Enterprise enquiry
-    url: https://github.com/0giv/Zer0Vuln-Community-Edition/discussions/categories/enterprise
+    url: https://github.com/0giv/Sentora-Community-Edition/discussions/categories/enterprise
     about: Multi-tenancy, SAML, compliance, SLA support, AGPL commercial licence.

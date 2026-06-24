@@ -188,7 +188,7 @@ class FirewallManager:
         if self.system == 'windows':
             cmd = [
                 'netsh', 'advfirewall', 'firewall', 'add', 'rule',
-                f'name=Zer0Vuln_Block_{ip}',
+                f'name=Sentora_Block_{ip}',
                 'dir=in',
                 'action=block',
                 f'remoteip={ip}',
@@ -216,7 +216,7 @@ class FirewallManager:
         if self.system == 'windows':
             cmd = [
                 'netsh', 'advfirewall', 'firewall', 'delete', 'rule',
-                f'name=Zer0Vuln_Block_{ip}'
+                f'name=Sentora_Block_{ip}'
             ]
         elif self.system == 'linux':
             if self._check_iptables_exists():

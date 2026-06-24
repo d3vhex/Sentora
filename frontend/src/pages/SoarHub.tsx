@@ -12,10 +12,47 @@ import {
   AlertTriangle,
   Eye,
   Check,
-  X
+  X,
+  Link2,
+  Info,
+  History,
 } from 'lucide-react';
 import { agentService } from '../services/api';
 import { Link } from 'react-router-dom';
+
+// ── Action intelligence ──────────────────────────────────────────────────────
+type RiskLevel = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
+interface ActionMeta { desc: string; what: string; risk: RiskLevel }
+
+const ACTION_META: Record<string, ActionMeta> = {
+  BLOCK_IP:          { risk: 'MEDIUM',   desc: 'Adds an inbound firewall deny rule for the target IP.',          what: 'Windows Firewall / iptables deny — reversible' },
+  KILL_PROCESS:      { risk: 'HIGH',     desc: 'Terminates the target process immediately via OS signal.',        what: 'TerminateProcess / SIGKILL — process data lost, not reversible' },
+  ISOLATE_HOST:      { risk: 'CRITICAL', desc: 'Disables all NICs except the management channel. Host goes dark.',what: 'netsh / ip link down on all adapters — HIGH IMPACT, needs local recovery' },
+  DISABLE_USER:      { risk: 'HIGH',     desc: 'Disables the target local user account.',                         what: 'net user /active:no — account locked, active sessions kicked' },
+  QUARANTINE_FILE:   { risk: 'MEDIUM',   desc: 'Moves the target file into an isolated quarantine directory.',    what: 'File relocated to quarantine/ — original path cleared' },
+  SUSPEND_PROCESS:   { risk: 'MEDIUM',   desc: 'Suspends (pauses) the target process without killing it.',        what: 'NtSuspendProcess — paused in memory, resumable' },
+  RESTART_SERVICE:   { risk: 'LOW',      desc: 'Stops then restarts the named service.',                          what: 'sc stop + sc start / systemctl restart' },
+  LOGOFF_USER:       { risk: 'MEDIUM',   desc: 'Forcibly logs off the target active session.',                    what: 'logoff <session> — session terminated, unsaved work lost' },
+  CONTAINER_ISOLATE: { risk: 'HIGH',     desc: 'Disconnects the target Docker container from all networks.',      what: 'docker network disconnect — container loses connectivity' },
+  CONTAINER_STOP:    { risk: 'MEDIUM',   desc: 'Stops the target Docker container gracefully.',                   what: 'docker stop — SIGTERM then SIGKILL after timeout' },
+  CONTAINER_KILL:    { risk: 'HIGH',     desc: 'Immediately kills the target Docker container.',                  what: 'docker kill — SIGKILL, no cleanup' },
+  DELETE_FILE:       { risk: 'HIGH',     desc: 'Permanently deletes the target file from disk.',                  what: 'File removed — not recoverable without backup' },
+  RUN_CMD:           { risk: 'CRITICAL', desc: 'Executes an arbitrary command on the endpoint.',                  what: 'Shell execution — unrestricted; review carefully before approving' },
+};
+
+const RISK_COLOR: Record<RiskLevel, string> = {
+  LOW:      '#34d399',
+  MEDIUM:   '#fbbf24',
+  HIGH:     '#f97316',
+  CRITICAL: '#ef4444',
+};
+
+const RISK_BG: Record<RiskLevel, string> = {
+  LOW:      'rgba(52,211,153,0.1)',
+  MEDIUM:   'rgba(251,191,36,0.1)',
+  HIGH:     'rgba(249,115,22,0.1)',
+  CRITICAL: 'rgba(239,68,68,0.1)',
+};
 
 type Tab = 'overview' | 'shadow';
 
@@ -436,6 +473,21 @@ const ShadowQueue: React.FC<{
   onReject: (item: any) => void;
   onRefresh: () => void;
 }> = ({ items, loading, busyId, onApprove, onReject, onRefresh }) => {
+  const [chainStatus, setChainStatus] = useState<null | { valid: boolean; entries: number; all_valid?: boolean; note?: string }>(null);
+  const [chainLoading, setChainLoading] = useState(false);
+
+  const verifyChain = async () => {
+    setChainLoading(true);
+    try {
+      const res = await agentService.verifyShadowChain();
+      setChainStatus(res);
+    } catch {
+      setChainStatus(null);
+    } finally {
+      setChainLoading(false);
+    }
+  };
+
   return (
     <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
       <div style={{ padding: '20px 24px', borderBottom: '1px solid var(--border-color)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '12px' }}>
@@ -448,9 +500,26 @@ const ShadowQueue: React.FC<{
             Defensive AI verdicts staged for operator review. Approving dispatches the real SOAR action; rejecting records the decision and clears it from this list.
           </p>
         </div>
-        <button onClick={onRefresh} style={{ padding: '8px 14px', borderRadius: '8px', backgroundColor: 'rgba(255,255,255,0.03)', border: '1px solid var(--border-color)', color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.8125rem', fontWeight: 600, cursor: 'pointer' }}>
-          <RefreshCw size={14} className={loading ? 'animate-spin' : ''} /> Refresh
-        </button>
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          {chainStatus && (
+            <span style={{
+              padding: '6px 12px', borderRadius: '8px', fontSize: '0.75rem', fontWeight: 700,
+              backgroundColor: (chainStatus.all_valid ?? chainStatus.valid) ? 'rgba(52,211,153,0.1)' : 'rgba(239,68,68,0.1)',
+              border: `1px solid ${(chainStatus.all_valid ?? chainStatus.valid) ? 'rgba(52,211,153,0.3)' : 'rgba(239,68,68,0.3)'}`,
+              color: (chainStatus.all_valid ?? chainStatus.valid) ? '#34d399' : '#ef4444',
+              display: 'flex', alignItems: 'center', gap: '6px',
+            }}>
+              <Link2 size={12} />
+              {(chainStatus.all_valid ?? chainStatus.valid) ? `Chain intact (${chainStatus.entries ?? '?'} entries)` : 'CHAIN TAMPERED'}
+            </span>
+          )}
+          <button onClick={verifyChain} disabled={chainLoading} style={{ padding: '8px 14px', borderRadius: '8px', backgroundColor: 'rgba(167,139,250,0.08)', border: '1px solid rgba(167,139,250,0.25)', color: '#a78bfa', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.8125rem', fontWeight: 600, cursor: chainLoading ? 'not-allowed' : 'pointer', opacity: chainLoading ? 0.6 : 1 }}>
+            <Link2 size={14} className={chainLoading ? 'animate-spin' : ''} /> Verify Chain
+          </button>
+          <button onClick={onRefresh} style={{ padding: '8px 14px', borderRadius: '8px', backgroundColor: 'rgba(255,255,255,0.03)', border: '1px solid var(--border-color)', color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.8125rem', fontWeight: 600, cursor: 'pointer' }}>
+            <RefreshCw size={14} className={loading ? 'animate-spin' : ''} /> Refresh
+          </button>
+        </div>
       </div>
 
       <div style={{ maxHeight: '720px', overflowY: 'auto' }}>
@@ -464,19 +533,33 @@ const ShadowQueue: React.FC<{
             <Eye size={48} style={{ opacity: 0.1, marginBottom: '16px', margin: '0 auto' }} />
             <p style={{ fontWeight: 600 }}>No shadow proposals pending.</p>
             <p style={{ fontSize: '0.8125rem', marginTop: '6px', maxWidth: '420px', margin: '6px auto 0' }}>
-              When <code style={{ fontSize: '0.75rem', backgroundColor: 'rgba(167,139,250,0.1)', padding: '1px 6px', borderRadius: '4px' }}>AI_SHADOW_MODE=1</code> is set on <code style={{ fontSize: '0.75rem', backgroundColor: 'rgba(167,139,250,0.1)', padding: '1px 6px', borderRadius: '4px' }}>zer0vuln-ai-worker-defensive</code>, autonomous verdicts land here instead of being executed.
+              When <code style={{ fontSize: '0.75rem', backgroundColor: 'rgba(167,139,250,0.1)', padding: '1px 6px', borderRadius: '4px' }}>AI_SHADOW_MODE=1</code> is set on <code style={{ fontSize: '0.75rem', backgroundColor: 'rgba(167,139,250,0.1)', padding: '1px 6px', borderRadius: '4px' }}>sentora-ai-worker-defensive</code>, autonomous verdicts land here instead of being executed.
             </p>
           </div>
         ) : (
           items.map((item) => {
             const busy = busyId === item.id;
-            const action = (item.proposed_action || '').toUpperCase();
+            const actionKey = (item.proposed_action || '').toUpperCase();
+            const meta: ActionMeta | undefined = ACTION_META[actionKey];
+            const risk = meta?.risk ?? 'MEDIUM';
+            const riskColor = RISK_COLOR[risk];
+            const riskBg   = RISK_BG[risk];
+            const prevCount = item.ctx_prev_count ?? 0;
+            const lastSeen  = item.ctx_last_seen;
+            const lastStatus = item.ctx_last_status;
             return (
-              <div key={item.id} style={{ padding: '20px 24px', borderBottom: '1px solid rgba(255,255,255,0.04)', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+              <div key={item.id} style={{ padding: '20px 24px', borderBottom: '1px solid rgba(255,255,255,0.04)', display: 'flex', flexDirection: 'column', gap: '14px' }}>
+
+                {/* Header row: chips + buttons */}
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '12px', flexWrap: 'wrap' }}>
-                  <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
+                  <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+                    {/* PROPOSED badge */}
                     <span style={{ padding: '4px 10px', backgroundColor: 'rgba(167,139,250,0.12)', border: '1px solid rgba(167,139,250,0.3)', borderRadius: '6px', fontSize: '0.7rem', fontWeight: 800, color: '#a78bfa', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-                      PROPOSED {action}
+                      PROPOSED {actionKey}
+                    </span>
+                    {/* Risk badge */}
+                    <span style={{ padding: '4px 10px', backgroundColor: riskBg, border: `1px solid ${riskColor}44`, borderRadius: '6px', fontSize: '0.7rem', fontWeight: 800, color: riskColor, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                      {risk}
                     </span>
                     <span style={{ padding: '4px 10px', backgroundColor: 'rgba(255,255,255,0.04)', border: '1px solid var(--border-color)', borderRadius: '6px', fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: '4px' }}>
                       <Server size={12} /> {item.agent}
@@ -486,49 +569,16 @@ const ShadowQueue: React.FC<{
                     </span>
                   </div>
                   <div style={{ display: 'flex', gap: '8px' }}>
-                    <button
-                      onClick={() => onApprove(item)}
-                      disabled={busy}
-                      style={{
-                        padding: '8px 16px',
-                        borderRadius: '8px',
-                        backgroundColor: busy ? 'rgba(52,211,153,0.05)' : 'rgba(52,211,153,0.12)',
-                        border: '1px solid rgba(52,211,153,0.35)',
-                        color: '#34d399',
-                        fontWeight: 700,
-                        fontSize: '0.8125rem',
-                        cursor: busy ? 'not-allowed' : 'pointer',
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: '6px',
-                        opacity: busy ? 0.6 : 1,
-                      }}
-                    >
+                    <button onClick={() => onApprove(item)} disabled={busy} style={{ padding: '8px 16px', borderRadius: '8px', backgroundColor: busy ? 'rgba(52,211,153,0.05)' : 'rgba(52,211,153,0.12)', border: '1px solid rgba(52,211,153,0.35)', color: '#34d399', fontWeight: 700, fontSize: '0.8125rem', cursor: busy ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: '6px', opacity: busy ? 0.6 : 1 }}>
                       <Check size={14} /> Approve
                     </button>
-                    <button
-                      onClick={() => onReject(item)}
-                      disabled={busy}
-                      style={{
-                        padding: '8px 16px',
-                        borderRadius: '8px',
-                        backgroundColor: busy ? 'rgba(239,68,68,0.05)' : 'rgba(239,68,68,0.10)',
-                        border: '1px solid rgba(239,68,68,0.30)',
-                        color: '#ef4444',
-                        fontWeight: 700,
-                        fontSize: '0.8125rem',
-                        cursor: busy ? 'not-allowed' : 'pointer',
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: '6px',
-                        opacity: busy ? 0.6 : 1,
-                      }}
-                    >
+                    <button onClick={() => onReject(item)} disabled={busy} style={{ padding: '8px 16px', borderRadius: '8px', backgroundColor: busy ? 'rgba(239,68,68,0.05)' : 'rgba(239,68,68,0.10)', border: '1px solid rgba(239,68,68,0.30)', color: '#ef4444', fontWeight: 700, fontSize: '0.8125rem', cursor: busy ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: '6px', opacity: busy ? 0.6 : 1 }}>
                       <X size={14} /> Reject
                     </button>
                   </div>
                 </div>
 
+                {/* Target */}
                 <div style={{ display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' }}>
                   <span style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)' }}>Target:</span>
                   <code style={{ fontSize: '0.8125rem', padding: '4px 10px', borderRadius: '6px', backgroundColor: 'rgba(251,191,36,0.10)', border: '1px solid rgba(251,191,36,0.2)', color: '#fbbf24', wordBreak: 'break-all' }}>
@@ -536,6 +586,37 @@ const ShadowQueue: React.FC<{
                   </code>
                 </div>
 
+                {/* Action preview panel */}
+                {meta && (
+                  <div style={{ padding: '12px 14px', backgroundColor: `${riskBg}`, border: `1px solid ${riskColor}33`, borderRadius: '8px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.8125rem', fontWeight: 700, color: riskColor }}>
+                      <Info size={14} /> {meta.desc}
+                    </div>
+                    <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', fontFamily: 'monospace' }}>
+                      {meta.what}
+                    </div>
+                  </div>
+                )}
+
+                {/* Context: prior executions */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                  <History size={13} />
+                  {prevCount === 0 ? (
+                    <span>No prior executions of this action on this target.</span>
+                  ) : (
+                    <span>
+                      Executed <strong style={{ color: 'var(--text-primary)' }}>{prevCount}x</strong> before
+                      {lastSeen && <> — last <strong style={{ color: 'var(--text-primary)' }}>{new Date(lastSeen).toLocaleString()}</strong></>}
+                      {lastStatus && (
+                        <span style={{ marginLeft: '6px', padding: '1px 6px', borderRadius: '4px', backgroundColor: lastStatus === 'success' ? 'rgba(52,211,153,0.1)' : 'rgba(239,68,68,0.1)', color: lastStatus === 'success' ? '#34d399' : '#ef4444', fontWeight: 700 }}>
+                          {lastStatus}
+                        </span>
+                      )}
+                    </span>
+                  )}
+                </div>
+
+                {/* AI reasoning */}
                 <div style={{ fontSize: '0.875rem', color: 'var(--text-primary)', lineHeight: 1.55, whiteSpace: 'pre-wrap', wordBreak: 'break-word', padding: '12px 14px', backgroundColor: 'rgba(0,0,0,0.18)', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
                   {item.critical_summary}
                 </div>

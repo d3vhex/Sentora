@@ -1,6 +1,6 @@
 import sys
 import os
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "Zer0Vuln"))
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "Sentora"))
 
 import asyncio
 import json

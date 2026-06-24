@@ -1,10 +1,10 @@
-# Zer0Vuln Agent
+# Sentora Agent
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey)](#)
 
-Cross-platform endpoint agent for the [Zer0Vuln](../README.md) SIEM/SOAR/EDR
+Cross-platform endpoint agent for the [Sentora](../README.md) SIEM/SOAR/EDR
 platform. Collects telemetry, performs local detections, executes SOAR
 playbook actions and ships everything back to the central server over an
 authenticated, Fernet-encrypted channel.
@@ -71,8 +71,8 @@ curl -fsSL "https://your-server.example.com/api/agent/deploy/linux?token=ENROL_T
 ```
 
 This downloads `deploy.sh`, registers with the server, drops the binary
-in `/opt/zer0vuln-agent/`, writes a 0600 `config.json` and installs a
-`zer0vuln-agent.service` systemd unit (auto-restart on failure,
+in `/opt/sentora-agent/`, writes a 0600 `config.json` and installs a
+`sentora-agent.service` systemd unit (auto-restart on failure,
 `User=root` required for raw socket and firewall actions).
 
 Manual form:
@@ -92,19 +92,19 @@ iwr -UseBasicParsing "https://your-server.example.com/api/agent/deploy/windows?t
 ```
 
 Equivalent to running `deploy.ps1` with `-Token` and `-Server`. Installs
-into `C:\Program Files\Zer0Vuln\Agent\` and registers a Windows service
+into `C:\Program Files\Sentora\Agent\` and registers a Windows service
 that starts at boot.
 
 ### Verify it's running
 
 ```bash
 # Linux
-systemctl status zer0vuln-agent
-journalctl -u zer0vuln-agent -f
+systemctl status sentora-agent
+journalctl -u sentora-agent -f
 
 # Windows
-Get-Service Zer0VulnAgent
-Get-Content "C:\Program Files\Zer0Vuln\Agent\agent.log" -Tail 50 -Wait
+Get-Service SentoraAgent
+Get-Content "C:\Program Files\Sentora\Agent\agent.log" -Tail 50 -Wait
 ```
 
 The agent log path is always `<install-dir>/agent.log`. The agent
@@ -123,17 +123,17 @@ agent:
 ### Linux
 
 ```bash
-cd Zer0Vuln/
+cd Sentora/
 ./build_agent.sh
-# produces Zer0Vuln/main (PyInstaller --onefile)
+# produces Sentora/main (PyInstaller --onefile)
 ```
 
 ### Windows
 
 ```powershell
-cd Zer0Vuln\
+cd Sentora\
 .\build_agent.ps1
-# produces Zer0Vuln\main.exe
+# produces Sentora\main.exe
 ```
 
 Both scripts run `pip install -r requirements.txt`, then invoke
@@ -258,7 +258,7 @@ stores the active key indefinitely until a manual purge.
 
 | Symptom | Where to look |
 | :--- | :--- |
-| Service won't start | `journalctl -u zer0vuln-agent` (Linux), Event Viewer (Windows) |
+| Service won't start | `journalctl -u sentora-agent` (Linux), Event Viewer (Windows) |
 | Auth failures | `agent.log`. Look for `Agent key rejected by server`, then re-enrol |
 | FIM not firing | `watchdog` requires the agent user to read the monitored paths |
 | SOAR action no-ops | Most actions need root or Administrator. Check the service user |
@@ -290,7 +290,7 @@ logger automatically, so module-side `print(...)` lines land in
 ## License
 
 AGPL-3.0, the same as the rest of
-[Zer0Vuln Community Edition](../LICENSE).
+[Sentora Community Edition](../LICENSE).
 
 If you ship a modified agent to endpoints you don't own (managed-service,
 SaaS, MSSP) you must publish your modifications under AGPL-3.0. A

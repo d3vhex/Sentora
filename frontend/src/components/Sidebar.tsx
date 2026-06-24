@@ -117,7 +117,7 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen }) => {
           <div style={{ padding: '8px', background: 'var(--accent-secondary)', borderRadius: '6px', display: 'flex' }}>
             <ShieldAlert size={24} color="#FFFFFF" />
           </div>
-          <h1 style={{ fontSize: '1.25rem', letterSpacing: '-0.5px', fontWeight: 600, color: 'var(--text-primary)' }}>Zer0Vuln</h1>
+          <h1 style={{ fontSize: '1.25rem', letterSpacing: '-0.5px', fontWeight: 600, color: 'var(--text-primary)' }}>Sentora</h1>
         </Link>
       </div>
 

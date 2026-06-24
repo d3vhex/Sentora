@@ -42,7 +42,7 @@ Fixes # / Refs #
 - [ ] No breaking REST/API changes
   (or) I bumped the response envelope appropriately and updated the UI.
 - [ ] No breaking agent-protocol changes
-  (or) I bumped `Zer0Vuln/VERSION` and called this out below.
+  (or) I bumped `Sentora/VERSION` and called this out below.
 - [ ] No new env vars
   (or) I added them to `.env.example` with documentation.
 

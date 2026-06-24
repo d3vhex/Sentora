@@ -46,7 +46,7 @@ const Agents: React.FC = () => {
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '32px', flexWrap: 'wrap', gap: '20px' }}>
         <div>
           <h2 style={{ fontSize: '2rem', fontWeight: 800, letterSpacing: '-0.025em', marginBottom: '8px' }}>Security Agents</h2>
-          <p style={{ color: 'var(--text-secondary)' }}>Manage and monitor all endpoints connected to the Zer0Vuln network.</p>
+          <p style={{ color: 'var(--text-secondary)' }}>Manage and monitor all endpoints connected to the Sentora network.</p>
         </div>
         <div className="flex-responsive" style={{ gap: '12px' }}>
           <button className="btn-secondary" onClick={() => fetchAgents(true)} style={{ padding: '8px 16px', borderRadius: '6px', display: 'flex', alignItems: 'center', gap: '8px', backgroundColor: 'var(--bg-color)' }}>

@@ -112,8 +112,8 @@ const AIAnalysis: React.FC = () => {
       if (producedTotal === 0) {
         setScanStatus(
           `Timed out after 8 minutes with 0 new insights. ` +
-          `Check: docker logs zer0vuln-ai-worker-defensive — the worker may be stuck on Ollama, ` +
-          `or the model isn't installed (docker exec zer0vuln-ollama ollama list).`
+          `Check: docker logs sentora-ai-worker-defensive — the worker may be stuck on Ollama, ` +
+          `or the model isn't installed (docker exec sentora-ollama ollama list).`
         );
       }
       setScanning(false);

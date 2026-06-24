@@ -17,7 +17,7 @@ body:
       label: What problem are you trying to solve?
       description: Lead with the use-case, not the solution.
       placeholder: |
-        Right now I have to manually X every Y because Zer0Vuln doesn't ...
+        Right now I have to manually X every Y because Sentora doesn't ...
     validations:
       required: true
 

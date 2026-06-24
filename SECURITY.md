@@ -1,6 +1,6 @@
 # Security Policy
 
-Thanks for helping keep Zer0Vuln and its users safe.
+Thanks for helping keep Sentora and its users safe.
 
 ## Supported versions
 
@@ -18,7 +18,7 @@ Please do not file public GitHub issues for security problems.
 Use one of the following instead:
 
 1. GitHub Private Vulnerability Reporting (preferred):
-   <https://github.com/0giv/Zer0Vuln-Community-Edition/security/advisories/new>
+   <https://github.com/0giv/Sentora-Community-Edition/security/advisories/new>
 2. Open an issue tagged `security-contact` asking for a private channel.
    Do not include exploit details in that issue.
 
@@ -53,7 +53,7 @@ In scope:
 
 - Server (`app.py`, `server.py`, `ai_worker.py`, `ai/`, `core/`,
   `scanners/`).
-- Agent (`Zer0Vuln/`) and its bundled binaries.
+- Agent (`Sentora/`) and its bundled binaries.
 - Frontend (`frontend/`).
 - Default Docker Compose deployment.
 

@@ -31,8 +31,8 @@ mysql_data/
 *.log
 tmp/
 temp/
-Zer0Vuln_Source/
-Zer0Vuln_Source_*/
+Sentora_Source/
+Sentora_Source_*/
 
 # OS
 .DS_Store
@@ -51,6 +51,6 @@ data/
 
 # Internal planning — kept local, not part of the public Community repo
 docs/TODO.md
-docs/zer0vuln_marketing_strategy.md
+docs/sentora_marketing_strategy.md
 
-# Zer0Vuln Specific
+# Sentora Specific

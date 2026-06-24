@@ -2,9 +2,9 @@ import os
 import psycopg2
 from psycopg2.extras import DictCursor
 
-DB_NAME = os.getenv('DB_NAME', 'zer0vuln')
-DB_USER = os.getenv('DB_USER', 'zer0vulnuser')
-DB_PASSWORD = os.getenv('DB_PASSWORD', 'zer0vulnpass')
+DB_NAME = os.getenv('DB_NAME', 'sentora')
+DB_USER = os.getenv('DB_USER', 'sentorauser')
+DB_PASSWORD = os.getenv('DB_PASSWORD', 'sentorapass')
 DB_HOST = "127.0.0.1"
 DB_PORT = int(os.getenv('DB_PORT', '5432'))
 

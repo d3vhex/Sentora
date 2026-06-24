@@ -1,7 +1,7 @@
-# Zer0Vuln Progress Report
+# Sentora Progress Report
 
 This document summarises the technical work and security improvements
-made to the Zer0Vuln platform.
+made to the Sentora platform.
 
 ## Security and IAM
 
@@ -26,7 +26,7 @@ made to the Zer0Vuln platform.
 
 - One-line install:
   - Linux: `curl | bash` runs a dependency check and installs to
-    `/opt/zer0vuln-agent`.
+    `/opt/sentora-agent`.
   - Windows: PowerShell `irm | iex` self-elevates to Administrator and
     installs.
 - Windows Scheduled Task support. To work around Windows services not
@@ -264,7 +264,7 @@ The full task tree lives in `TODO.md` (kept private). Build order below.
      `agent_identities`, `audit_logs`
    - Tenant-scoped sessions; every `@require_permission` route filters
      by the caller's tenant
-   - `zer0vuln-ops` admin tenant for impersonation
+   - `sentora-ops` admin tenant for impersonation
    - Sidebar tenant switcher (Enterprise tier only)
    - Migration plan for existing single-tenant deployments
 
@@ -272,7 +272,7 @@ The full task tree lives in `TODO.md` (kept private). Build order below.
    - SAML 2.0 ACS endpoint via `python3-saml`
    - OIDC option (Okta, Azure AD, Google Workspace)
    - SCIM 2.0 user / group provisioning (Pro+)
-   - IdP-group to Zer0Vuln-role mapping
+   - IdP-group to Sentora-role mapping
 
 4. Compliance module
    - PCI-DSS / ISO 27001 / HIPAA dashboard templates
@@ -287,9 +287,9 @@ The full task tree lives in `TODO.md` (kept private). Build order below.
    - Liveness and readiness `/healthz` endpoints
 
 6. Air-gap update bundles (subscription, signed)
-   - `zer0vuln-bundle` CLI: snapshot OSV plus threat-intel feeds plus
+   - `sentora-bundle` CLI: snapshot OSV plus threat-intel feeds plus
      Ollama models
-   - `zer0vuln-bundle apply <file>` on the air-gap host
+   - `sentora-bundle apply <file>` on the air-gap host
    - Bundles are signed; the server verifies the signature against the
      customer's enterprise tier entitlement
 

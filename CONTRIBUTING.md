@@ -1,13 +1,13 @@
-# Contributing to Zer0Vuln Community Edition
+# Contributing to Sentora Community Edition
 
 Thanks for thinking about contributing. This document covers what you'll
 want to know before opening an issue or a pull request.
 
 ## Quick links
 
-- [Report a bug](https://github.com/0giv/Zer0Vuln-Community-Edition/issues/new?template=bug_report.yml)
-- [Request a feature](https://github.com/0giv/Zer0Vuln-Community-Edition/issues/new?template=feature_request.yml)
-- [Architecture deep dive](docs/Zer0Vuln_Architecture.md)
+- [Report a bug](https://github.com/0giv/Sentora-Community-Edition/issues/new?template=bug_report.yml)
+- [Request a feature](https://github.com/0giv/Sentora-Community-Edition/issues/new?template=feature_request.yml)
+- [Architecture deep dive](docs/Sentora_Architecture.md)
 - [Development setup](#development-setup)
 
 ---
@@ -48,7 +48,7 @@ an issue tagged `enterprise-fit` and we'll route it.
 2. Fork, feature branch, PR against `main`.
 3. Make sure the test suite passes locally (`pytest`) and the frontend
    type-checks (`cd frontend && npx tsc --noEmit`).
-4. Follow the conventions in [docs/Zer0Vuln_Architecture.md](docs/Zer0Vuln_Architecture.md):
+4. Follow the conventions in [docs/Sentora_Architecture.md](docs/Sentora_Architecture.md):
    - New REST routes go behind `@require_permission(...)`. No exceptions.
    - New encrypted columns must be registered in `ENCRYPTED_FIELDS_MAP`.
    - AI worker outputs must be strict JSON (use `_extract_json` for parsing).
@@ -57,7 +57,7 @@ an issue tagged `enterprise-fit` and we'll route it.
    [Developer Certificate of Origin](https://developercertificate.org/)
    compliance.
 
-PRs that change agent code must also bump `Zer0Vuln/VERSION` if the
+PRs that change agent code must also bump `Sentora/VERSION` if the
 on-the-wire protocol or auth changes.
 
 ---
@@ -65,8 +65,8 @@ on-the-wire protocol or auth changes.
 ## Development setup
 
 ```bash
-git clone https://github.com/0giv/Zer0Vuln-Community-Edition.git
-cd Zer0Vuln-Community-Edition
+git clone https://github.com/0giv/Sentora-Community-Edition.git
+cd Sentora-Community-Edition
 cp .env.example .env
 # Edit .env. Set DB_PASSWORD and OPENSEARCH_PASSWORD at minimum.
 
@@ -136,7 +136,7 @@ PRs adding meaningful test coverage in either layer get fast-tracked.
 - New API surface goes through `frontend/src/services/api.ts`. Never call
   `axios` / `fetch` from a component.
 
-### Agent (`Zer0Vuln/`)
+### Agent (`Sentora/`)
 
 - Anything that can fail on Windows must be guarded with a try/except
   (the agent runs without admin in dev/WSL).
@@ -162,7 +162,7 @@ Signed-off-by: Your Name <you@example.com>
 Common prefixes used in the repo:
 
 - `app:` Sanic API
-- `agent:` Zer0Vuln/ agent
+- `agent:` Sentora/ agent
 - `frontend:` React UI
 - `ai:` AI workers / triage
 - `scanner:` Vulnerability scanner
@@ -173,7 +173,7 @@ Common prefixes used in the repo:
 
 ## Releasing (maintainers)
 
-1. Bump version in `frontend/package.json` and `Zer0Vuln/VERSION` if applicable.
-2. Update `docs/Zer0Vuln_Architecture.md` if architecture changed.
+1. Bump version in `frontend/package.json` and `Sentora/VERSION` if applicable.
+2. Update `docs/Sentora_Architecture.md` if architecture changed.
 3. Tag: `git tag -a vX.Y.Z -m "..."`, then `git push --tags`.
 4. Draft a GitHub release with the changelog auto-generated from commits.

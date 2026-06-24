@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Zer0Vuln Agent — PyInstaller build script (Linux)
+# Sentora Agent — PyInstaller build script (Linux)
 #
-# Builds Zer0Vuln/main.py into a single 'main' binary that the server ships
+# Builds Sentora/main.py into a single 'main' binary that the server ships
 # via /api/agent/download/linux and the token-based installer consumes.
 #
 # Usage:
@@ -11,7 +11,7 @@
 #   ./build_agent.sh -h | --help
 #
 # Output:
-#   Zer0Vuln/main                   (one-file bundle, ~22-40 MB after excludes)
+#   Sentora/main                   (one-file bundle, ~22-40 MB after excludes)
 #   Prints SHA-256 so the server-side download endpoint can be verified.
 
 set -euo pipefail
@@ -49,7 +49,7 @@ done
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-printf "%s[*] Zer0Vuln Agent Builder (Linux / PyInstaller)%s\n" "$BOLD" "$NC"
+printf "%s[*] Sentora Agent Builder (Linux / PyInstaller)%s\n" "$BOLD" "$NC"
 step "Working dir: $SCRIPT_DIR"
 
 # ─────────────────────── prerequisites ───────────────────────

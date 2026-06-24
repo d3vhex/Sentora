@@ -1,4 +1,4 @@
-# Zer0Vuln Community Edition
+# Sentora Community Edition
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
@@ -107,8 +107,8 @@ for the one-time agent build step). The full stack wants ~16 GB RAM,
 see [System requirements](#system-requirements) below.
 
 ```bash
-git clone https://github.com/0giv/Zer0Vuln-Community-Edition.git
-cd Zer0Vuln-Community-Edition
+git clone https://github.com/0giv/Sentora-Community-Edition.git
+cd Sentora-Community-Edition
 
 # .env holds your local secrets. Never commit it.
 cp .env.example .env
@@ -117,7 +117,7 @@ cp .env.example .env
 # Build the agent binary once. The server serves it via
 # /api/agent/download/{linux,windows}; skipping this means agents can't be
 # deployed because the download endpoint returns 404.
-cd Zer0Vuln
+cd Sentora
 ./build_agent.sh                 # on Linux/macOS/WSL
 # .\build_agent.ps1              # on Windows
 cd ..
@@ -131,7 +131,7 @@ Change it immediately under **Users & Roles**.
 Ollama auto-pulls `llama3.2:3b` on first boot. Verify with:
 
 ```bash
-docker exec zer0vuln-ollama ollama list
+docker exec sentora-ollama ollama list
 ```
 
 Deploying an agent: from the **Deploy Agent** page, copy the one-liner
@@ -287,7 +287,7 @@ Bundled fonts, local Ollama, no external CDN. Works fully offline.
 
 The deeper version (per-module layout, schema, AI pipeline, SOAR
 autonomy, air-gap surfaces) lives in
-[docs/Zer0Vuln_Architecture.md](docs/Zer0Vuln_Architecture.md).
+[docs/Sentora_Architecture.md](docs/Sentora_Architecture.md).
 
 ---
 
@@ -354,7 +354,7 @@ the approach.
 ├── scanners/
 │   └── vuln.py           # Server-side OSV scanner
 ├── frontend/             # React 18 + TS SPA
-├── Zer0Vuln/             # Cross-platform agent
+├── Sentora/             # Cross-platform agent
 ├── certs/                # Self-signed dev certs
 ├── docs/                 # Architecture + screenshots
 └── docker-compose.yaml
@@ -371,12 +371,12 @@ if you run a modified version on a network server where other users
 interact with it, you must publish the modifications under AGPL too.
 
 - Self-hosting for internal use → no source-disclosure obligation.
-- Public-facing SaaS on top of a modified Zer0Vuln → you must publish
+- Public-facing SaaS on top of a modified Sentora → you must publish
   the modifications.
 - Want to ship a closed-source derivative or skip the network-copyleft
   clause? A commercial licence waiver is available. Contact the author.
 
-The "Zer0Vuln" name and logo are trademarks of the project authors and
+The "Sentora" name and logo are trademarks of the project authors and
 are not covered by AGPL. Fork freely, but rename if you redistribute as
 your own product.
 

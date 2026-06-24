@@ -1,6 +1,6 @@
-# Zer0Vuln Agent - PyInstaller build script (Windows)
+# Sentora Agent - PyInstaller build script (Windows)
 #
-# Builds Zer0Vuln/main.py into a single main.exe that the server ships via
+# Builds Sentora/main.py into a single main.exe that the server ships via
 # /api/agent/download/windows and the token-based installer consumes.
 #
 # Usage:
@@ -9,7 +9,7 @@
 #   .\build_agent.ps1 -SkipDeps      # skip `pip install` (use current env as-is)
 #
 # Output:
-#   Zer0Vuln\main.exe                (one-file bundle, ~30-45 MB after excludes)
+#   Sentora\main.exe                (one-file bundle, ~30-45 MB after excludes)
 #   Prints SHA-256 so the server-side download endpoint can be verified.
 
 [CmdletBinding()]
@@ -29,7 +29,7 @@ function Write-Fail($msg) { Write-Host "[x] $msg" -ForegroundColor Red;  exit 1 
 $ScriptDir = Split-Path -Parent $PSCommandPath
 Set-Location $ScriptDir
 
-Write-Host "[*] Zer0Vuln Agent Builder (Windows / PyInstaller)" -ForegroundColor White
+Write-Host "[*] Sentora Agent Builder (Windows / PyInstaller)" -ForegroundColor White
 Write-Step "Working dir: $ScriptDir"
 
 # ─────────────────────── prerequisites ───────────────────────

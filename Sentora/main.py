@@ -271,7 +271,7 @@ class FernetKeyRefresher(threading.Thread):
 
 
 
-app = Sanic("Zer0Vuln_Agent")
+app = Sanic("Sentora_Agent")
 CORS(app)
 
 AGENT_NAME = None
@@ -961,7 +961,7 @@ def due_automations_loop(agent_name: str, interval_sec: int = 5, batch: int = 50
 
 
 def _parse_args():
-    parser = argparse.ArgumentParser(description="Zer0Vuln Agent")
+    parser = argparse.ArgumentParser(description="Sentora Agent")
     parser.add_argument('--automations-mode', type=str, default=os.getenv("AUTOMATIONS_MODE", "server"),
                         choices=['auto', 'server', 'db'],
                         help='Automations backend: server (API), db (local table), or auto (default).')
@@ -1346,7 +1346,7 @@ def main():
 
     args = _parse_args()
 
-    cfg_path = args.config or os.getenv("ZER0VULN_CONFIG")
+    cfg_path = args.config or os.getenv("SENTORA_CONFIG")
     if not cfg_path:
         default_cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
         if os.path.exists(default_cfg):

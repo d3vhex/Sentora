@@ -1,0 +1,2114 @@
+flags:
+  - IGNORECASE
+  - DOTALL
+
+categories:
+  SQL INJECTION:
+    severity: CRITICAL
+    weight: 5
+    patterns: |
+      # Classic SQLi
+      ' OR '1'='1' --
+      ' OR '1'='1'
+      ' OR '1'='1' /*
+      ' OR '1'='1' LIMIT \d+ --
+      ' OR '1'='1' ORDER BY \d+--
+      ' UNION SELECT NULL,NULL--
+      ' UNION ALL SELECT .* FROM .*--
+      a'; DROP TABLE \w+; SELECT \* FROM \w+ WHERE 't'='t
+      '; EXEC xp_cmdshell\('dir'\)--
+      '; SELECT pg_sleep\(\d+\)--
+      ' AND SLEEP\(\d+\)--
+      ' AND ASCII\(SUBSTRING\(\(SELECT database\(\)\),1,1\)\)>\d+--
+      \bUNION(\s+ALL)?\s+SELECT\b
+      \bSELECT\s+.*\s+FROM\b
+      \bINSERT\s+INTO\b
+      \bUPDATE\s+.*\s+SET\b
+      \bDELETE\s+FROM\b
+      \bEXEC(?:UTE)?\b
+      \bDROP\s+TABLE\b
+      \bOR\s+\d+=\d+\b
+      \bSLEEP\(\d+\)\b
+      \bWAITFOR\s+DELAY\b
+      (\%27|')\s*union
+      ;\s*(drop|delete|insert|update)\b
+      information_schema\.(?:tables|columns|schemata)
+      pg_dumpall
+      CHR\((\d{2,3},?)+\)
+      LOAD_FILE\(
+      OUTFILE
+      INTO\s+OUTFILE
+      CONCAT\s*\(
+      ORDER BY \d+--
+      DBMS_PIPE\.RECEIVE_MESSAGE
+      UTL_INADDR\.GET_HOST_ADDRESS
+      ' AND (\d+)=\d+ AND '
+      '\s*OR\s*'\s*=\s*'
+      deneme
+      benchmark\(\d+,md5\(\d+\)\)
+      substring\(.*\s*from\s*\d+\s*for\s*\d+\)
+      convert\(int,\(select\s*@@version\)\)
+      pg_read_file\(
+      xp_dirtree
+      LOAD DATA INFILE
+      \bLIKE\s+'%\['"]
+      \bCAST\s*\(
+      \bCONVERT\s*\(
+      \b(COUNT|SUM|AVG)\s*\(
+      
+      # Real-world SQLi patterns
+      (?:"|'|%27)\s*(?:or|and)\s*(?:"|'|%27)?1(?:"|'|%27)?\s*=\s*(?:"|'|%27)?1(?:"|'|%27)?\s*(?:--|#|\/\*)?
+      (?:"|'|%27)\s*(?:or|and)\s*(?:"|'|%27)?1(?:"|'|%27)?\s*=\s*(?:"|'|%27)?2(?:"|'|%27)?\s*(?:--|#|\/\*)?
+      \bUNION\b\s+(?:ALL\s+)?\bSELECT\b\s+[\s\S]*\bFROM\b
+      /\*![0-9]{3,}\s*SELECT
+      0x[0-9a-fA-F]{8,}
+      \bWAITFOR\s+DELAY\b\s+'0:0:\d{1,2}'
+      \bSELECT\b\s+[\s\S]*\bFROM\b\s+[\s\S]*\bWHERE\b\s+[\s\S]*(?:or|and)\s+\d+\s*=\s*\d+
+      (?:--|#)\s*[^\r\n]*$
+      
+      # WAF bypass techniques
+      \/\*\!\d{5}\s*\*\/
+      %0a%0d\s*UNION
+      (?:un|Uni|UNI)ion\s+(?:sel|SEL|Sel)ect
+      \bUNI%6fn\s+SEL%65ct\b
+      (?:'|%27)(?:\s|%20)*(?:OR|or|Or)(?:\s|%20)*(?:'|%27)
+      \b(?:union|select|from|where|and|or)\b(?:\s|\/\*\*\/|%0a|%0d|%09)+
+      1\s+and\s+1=1
+      1\s+or\s+1=1
+      admin'--
+      admin'#
+      admin'\/\*
+      ' or 1=1--
+      ' or 'a'='a
+      "\) or \("a"="a
+      '\) or \('a'='a
+      
+      # Time-based blind SQLi
+      \bif\s*\(\s*1=1\s*,\s*sleep\s*\(\d+\)\s*,\s*0\s*\)
+      \bpg_sleep\s*\(\d+\)
+      \bwaitfor\s+delay\s+'0:0:\d+'
+      \bbenchmark\s*\(\s*\d+\s*,\s*sha1\s*\(\s*\d+\s*\)\s*\)
+      \brlike\s*\(\s*abcdef\s*,\s*\d+\s*\)
+      \bRANDOMBLOB\s*\(\d+\)
+      
+      # Boolean-based blind SQLi
+      \band\s+\d+=\d+\s*--
+      \bor\s+\d+=\d+\s*--
+      \band\s+substring\s*\(
+      \band\s+ascii\s*\(
+      \band\s+length\s*\(
+      \bextractvalue\s*\(
+      \bupdatexml\s*\(
+      
+      # Error-based SQLi
+      \band\s+extractvalue\s*\(\s*\d+\s*,\s*concat
+      \band\s+updatexml\s*\(\s*\d+\s*,\s*concat
+      \bexp\s*\(\s*~\s*\(select\b
+      \bgeometrycollection\s*\(\s*select
+      \blinestring\s*\(\s*select
+      \bmultipoint\s*\(\s*select
+      \bpolygon\s*\(\s*select
+      
+      # Stacked queries
+      ;\s*(?:exec|execute|call)\s+
+      ;\s*declare\s+@\w+
+      ;\s*set\s+@\w+
+      ;\s*insert\s+into\s+
+      ;\s*update\s+\w+\s+set\s+
+      ;\s*delete\s+from\s+
+      ;\s*create\s+table\s+
+      ;\s*drop\s+table\s+
+      
+      # Second-order SQLi indicators
+      \bupdate\s+.*\s+set\s+.*=\s*concat\s*\(
+      \binsert\s+into\s+.*\s+values\s*\(.*concat
+      
+      # NoSQL injection
+      \{\s*\$ne\s*:\s*null\s*\}
+      \{\s*\$gt\s*:\s*['"]?\s*['"]?\s*\}
+      \{\s*\$regex\s*:\s*['"]\.\*['"]
+      \{\s*\$where\s*:\s*['"]
+      (?:\[|\{)\s*\$regex\s*(?:\]|\})
+      
+      # ORM injection
+      \bfindOne\s*\(\s*\{.*\$where
+      \bfind\s*\(\s*\{.*\$gt
+      \.where\s*\(\s*['"].*['"]\s*\+
+      \.where\s*\(\s*`.*`\s*\+
+      
+      # URL-encoded variations
+      %27%20or%20%271%27=%271
+      %22%20or%20%221%22=%221
+      %27%29%20or%20%28%271%27=%271
+      %20union%20select%20
+      %20and%201=1%20--
+      
+      # Double encoding
+      %2527%20or%20%25271%2527=%25271
+      %252F%252A%252A%252F
+      
+      # Unicode bypass
+      \u0027\s*or\s*\u0027
+      \u002f\u002a\u002a\u002f
+      \uff07\s*or\s*\uff07
+
+  XSS:
+    severity: HIGH
+    weight: 3
+    patterns: |
+      # Classic XSS
+      <script>alert\(1\)</script>
+      <Script>alert\(1\)</Script>
+      <img src=x onerror=alert\(1\)>
+      <img src="x" onerror="alert\(1\)">
+      <svg/onload=alert\(1\)>
+      <SCRIPT SRC=https://cdn.jsdelivr.net/gh/Moksh45/host-xss\.rocks/index\.js></SCRIPT>
+      <Base Href=//X55\.is>
+      JavaScript:alert\(1\)
+      <details open ontoggle=alert\(1\)>
+      <script>.*?</script>
+      <iframe.*?>.*?</iframe>
+      <img\s+src=.*?onerror=.*?>
+      <svg/onload=.*?>
+      javascript:\w+
+      data:text/html;base64,
+      <style>.*?@import\s+url\(javascript:.*?\).*?</style>
+      on(mouseover|click|focus|load|error|submit|abort|blur|change|dblclick|keydown|keypress|keyup|mousedown|mousemove|mouseout|mouseup|reset|resize|scroll|select|unload)=.*?>
+      <iframe\s+src="javascript:alert\(\d+\)">
+      <(script|iframe|object|embed|applet|meta|link|style)[^>]*?>.*?</\1>
+      <[a-z]+\s+[^>]*(on\w+)\s*=\s*['"][^'"]+['"][^>]*>
+      (href|src)\s*=\s*['"](javascript:|data:)[^'"]+['"]
+      \b(eval|alert|setTimeout|setInterval|prompt|confirm)\s*\(.*?\)
+      <body\s+onload=alert\(1\)>
+      <link\s+rel=stylesheet\s+href="data:text/css;base64,
+      &lt;script&gt;alert\(1\)&lt;/script&gt;
+      %3cscript%3ealert(1)%3c/script%3e
+      <div\s+onmouseover="alert\(1\)">
+      <a\s+href="#"\s+onclick="alert\(1\)">
+      <svg><script>alert(1)</script></svg>
+      <math><a+xlink:href='javascript:alert(1)'>
+      document\.cookie
+      window\.location
+      String\.fromCharCode\(\d+\)
+      &#x[0-9a-fA-F]+;
+      &#\d+;
+      confirm\((.*?)\)
+      prompt\((.*?)\)
+      top\.location\.href
+      document\.write
+      document\.domain
+      <input[^>]*type=['"]image['"][^>]*src=['"]javascript:.*['"]
+      <isindex\s+action=['"]javascript:.*['"]
+      background-image:\s*url\s*\(\s*['"]?javascript:.*['"]?\s*\)
+      expression\s*\((.*?)\)
+      \+\s*src=\s*['"]data:text/html;base64,
+      srcdoc\s*=\s*['"]<script>.*</script>['"]
+      
+      # Real-world XSS patterns
+      <script[^>]*>[\s\S]*?<\/script>
+      <[^>]+\s+on(?:load|error|mouseover|click|focus|submit|keydown|keyup|mousemove)\s*=\s*['"][^'"]+['"][^>]*>
+      <[^>]+style\s*=\s*["'][^"']*expression\([^"']*\)[^"']*["']
+      <iframe[^>]+src\s*=\s*["']?javascript:[^"'>]+["']?
+      <img[^>]+src\s*=\s*['"]?javascript:[^'">]+['"]?
+      <a[^>]+href\s*=\s*['"]javascript:[^'"]+['"][^>]*>
+      String\.fromCharCode\(\s*\d+(?:\s*,\s*\d+)*\s*\)
+      onerror\s*=\s*['"]?alert\([^)]*\)['"]?
+      
+      # WAF bypass & obfuscation
+      <scr<script>ipt>alert(1)</scr</script>ipt>
+      <script>alert(String.fromCharCode(88,83,83))</script>
+      <img src=x onerror=eval(atob('YWxlcnQoMSk='))>
+      <svg><script>alert&#40;1&#41;</script></svg>
+      <img src=x oneRRor=alert(1)>
+      <img src=x o\x6eerror=alert(1)>
+      <iframe src=javascript:alert&lpar;1&rpar;>
+      <iframe src=j&Tab;avascript:alert(1)>
+      <iframe src=j&#x09;avascript:alert(1)>
+      <object data="javascript:alert(1)">
+      <embed src="data:text/html,<script>alert(1)</script>">
+      
+      # Polyglot XSS (Fixed regex)
+      jaVasCript:/\*-/\*`/\*`/\*'/\*"/\*\*/\(/\* \*/oNcliCk=alert\(\) \)//%0D%0A%0d%0a//</stYle/</titLe/</teXtarEa/</scRipt/--!>\x3csVg/<sVg/oNloAd=alert\(\)//>\x3e
+      javascript://'/</title></style></textarea></script>--><p" onclick=alert()//>*/alert()//
+      
+      # DOM-based XSS
+      location\.hash\.slice\(1\)
+      location\.search\.substring\(1\)
+      document\.URL
+      document\.documentURI
+      document\.referrer
+      window\.name
+      decodeURI\(
+      decodeURIComponent\(
+      unescape\(
+      innerHTML\s*=
+      outerHTML\s*=
+      insertAdjacentHTML\(
+      document\.write\(
+      document\.writeln\(
+      
+      # Modern framework XSS
+      \{\{.*constructor.*\}\}
+      \{\{.*__proto__.*\}\}
+      \{\{.*toString.*\}\}
+      \[\[.*constructor.*\]\]
+      ng-bind-html=
+      v-html=
+      dangerouslySetInnerHTML
+      
+      # Template injection (XSS via template engines)
+      \{\{7\*7\}\}
+      \$\{7\*7\}
+      \#\{7\*7\}
+      \{\{constructor\.constructor\(['"]alert\(1\)['"]\)\(\)\}\}
+      \{\{_self\.env\.registerUndefinedFilterCallback\("exec"\)
+      
+      # Mutation XSS (mXSS)
+      <noscript><p title="</noscript><img src=x onerror=alert(1)>">
+      <style><img src=x onerror=alert(1)></style>
+      <svg><style><img src=x onerror=alert(1)></style></svg>
+      
+      # Event handler obfuscation
+      <img src=x on error=alert(1)>
+      <img src=x on\x20error=alert(1)>
+      <img src=x on%20error=alert(1)>
+      <img src=x on%09error=alert(1)>
+      <img src=x on%0derror=alert(1)>
+      <img src=x on%0aerror=alert(1)>
+      
+      # CSS-based XSS
+      <style>@import['"]javascript:alert(1)['"];</style>
+      <style>body\{background:url['"]javascript:alert(1)['"];\}</style>
+      <style>@import['"]http://attacker.com/xss.css['"];</style>
+      <link rel="stylesheet" href="javascript:alert(1)">
+      
+      # PDF XSS
+      /AA\s*<<\s*/O\s*<<\s*/F\s*\(
+      /OpenAction\s*<<\s*/S\s*/JavaScript
+      
+      # XML-based XSS
+      <!\[CDATA\[<script>alert\(1\)</script>\]\]>
+      
+      # Flash XSS
+      allowScriptAccess["']always["']
+      ExternalInterface\.call\(['"]eval
+      
+      # SVG-based advanced XSS
+      <svg><animate onbegin=alert(1)>
+      <svg><set attributeName=onmouseover to=alert(1)>
+      <svg><foreignObject><body onload=alert(1)></foreignObject>
+      <svg><use href="data:image/svg+xml,<svg id='x' xmlns='http://www.w3.org/2000/svg'><image href='x' onerror='alert(1)'/></svg>#x"/>
+
+  COMMAND INJECTION:
+    severity: CRITICAL
+    weight: 5
+    patterns: |
+      # Classic command injection
+      ;\s*rm -rf /
+      language=&ping -c \d+ [0-9\.]+ &
+      &\s*ping -c
+      ;\s*(mv|cp|rm|chmod|chown|mkdir|rmdir|touch|ln|find|grep|awk|sed|cut|xargs|nc|netcat)\s+
+      \bping\b.*\b-c\s+\d+\b
+      \bwget\s+http
+      \bcurl\s+http
+      ^.*"(?:GET|POST|PUT|DELETE).*\?.*=[;|&`><$\(\)\[\]\{\}\*\/\\'\"].*HTTP\/.*".*$
+      \|\|\s*(?:nc|netcat)\s+
+      &\s*(?:whoami|id|ipconfig|ifconfig|uname|hostname|ps|ls|dir|cat|type|echo|pwd|which|whereis)\b
+      ;\s*cat\s+/etc/passwd
+      ;\s*type\s+c:\\windows\\system32\\drivers\\etc\\hosts
+      \\s*&&\\s*(\w+)
+      `\s*(\w+)\s*`
+      \$\(.*?\)
+      &gt;|&lt;|&amp;
+      \|(?:\s*|)(\w+)
+      (\%0a|\%0d|\n|\r)\s*(?:cmd|sh|bash|powershell)
+      exec\s*\(["'](?:cmd\.exe|sh|bash|powershell)
+      system\s*\(["'].*?["']\)
+      nc\s+.*?\s+-e\s+/bin/sh
+      sh\s+.*?\s+-c
+      \b(?:python|perl|php|ruby)\s+-c
+      \bmsfvenom\b
+      \b(?:nmap|sqlmap|nikto)\b
+      x-exec
+      Content-Disposition:\s*attachment;\s*filename="`.*`"
+      2>&1
+      >/dev/null
+      \b(?:kali|parrot)\b
+      \b(?:cron|at)\s+-f\b
+      
+      # Real-world command chaining
+      (?:;|\|\||&&)\s*(?:rm|mv|cp|chmod|chown|mkdir|rmdir|touch|ln|find|grep|awk|sed|cut|xargs|nc|netcat)\b
+      (?:;|\|\||&&)\s*(?:cat|tail|head)\s+/etc/passwd
+      (?:;|\|\||&&)\s*(?:wget|curl)\s+https?://
+      (?:;|\|\||&&)\s*(?:bash|sh|python|perl|php)\s+-c\s+["']
+      \$\(\s*(?:id|whoami|uname|hostname)\s*\)
+      \|\s*(?:whoami|id|ifconfig|ipconfig|netstat)\b
+      
+      # Advanced command injection
+      ;\s*bash\s+-i\s*>&\s*/dev/tcp/
+      ;\s*nc\s+-e\s+/bin/(?:sh|bash)
+      ;\s*telnet\s+\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\s+\d+\s*\|\s*/bin/sh
+      ;\s*/bin/bash\s+-c\s+['"]exec\s+bash\s+-i
+      ;\s*python\s+-c\s+['"]import\s+socket
+      ;\s*perl\s+-e\s+['"]use\s+Socket
+      ;\s*ruby\s+-rsocket\s+-e
+      ;\s*php\s+-r\s+['"]\\$sock=fsockopen
+      
+      # Windows-specific
+      &\s*(?:net\s+user|net\s+localgroup|net\s+share|net\s+view)
+      ;\s*powershell\s+-(?:enc|encodedcommand|e|ec)
+      ;\s*cmd\s*/c\s+
+      ;\s*cmd\.exe\s*/c\s+
+      ;\s*wmic\s+
+      ;\s*reg\s+(?:add|delete|query)
+      ;\s*schtasks\s+/create
+      ;\s*bitsadmin\s+/transfer
+      ;\s*certutil\s+-urlcache
+      ;\s*mshta\s+(?:vbscript|javascript|http)
+      ;\s*rundll32\s+
+      ;\s*regsvr32\s+
+      
+      # Environment variable manipulation
+      export\s+\w+=
+      setenv\s+\w+\s+
+      \$(?:PATH|LD_PRELOAD|LD_LIBRARY_PATH|BASH_ENV)=
+      
+      # Command substitution variations
+      \$\{[^}]*\}
+      `[^`]*`
+      \$\([^\)]*\)
+      %\{[^}]*\}
+      
+      # Filter bypass (Fixed backslash escapes)
+      ca\$\{IFS\}t
+      c''at
+      c""at
+      c\\at
+      /\\b\\i\\n/\\c\\a\\t
+      \${PATH:0:1}bin${PATH:0:1}cat
+      
+      # URL encoding bypass
+      %0a\s*(?:ls|cat|whoami|id)
+      %0d\s*(?:ls|cat|whoami|id)
+      %0a%0d\s*(?:ls|cat|whoami|id)
+      
+      # Null byte injection
+      \x00\s*(?:;|&&|\|\|)
+      %00\s*(?:;|&&|\|\|)
+      
+      # Time-based command injection
+      ;\s*sleep\s+\d+
+      ;\s*timeout\s+/t\s+\d+
+      ;\s*ping\s+-(?:n|c)\s+\d+\s+127\.0\.0\.1
+      
+      # Process substitution
+      <\([^)]+\)
+      >\([^)]+\)
+      
+      # Reverse shell patterns
+      /dev/tcp/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d+
+      bash\s+-i\s*>&
+      nc\s+-[lnvz]+\s+\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}
+      mkfifo\s+/tmp/[a-z]+;\s*nc
+      socat\s+(?:exec|system):
+      
+      # Cloud metadata access
+      ;\s*curl\s+(?:169\.254\.169\.254|metadata\.google\.internal|100\.100\.100\.100)
+      ;\s*wget\s+(?:169\.254\.169\.254|metadata\.google\.internal|100\.100\.100\.100)
+
+  LOCAL FILE INCLUSION:
+    severity: MEDIUM
+    weight: 2
+    patterns: |
+      # Classic LFI
+      \.\./
+      %2e%2e%2f
+      %5c%5c
+      (\.\./){3,}etc/passwd
+      \.\\\.\\windows\\system32\\cmd\.exe
+      (\.\./){2,}
+      file:///
+      /etc/passwd
+      \\\\windows\\\\system32\\\\cmd\.exe
+      \/etc\/passwd
+      \/etc\/shadow
+      \/etc\/hosts
+      \/etc\/group
+      \/etc\/apache2\/apache2\.conf
+      /proc/self/environ
+      /var/log/apache2/(?:access|error)\.log
+      /var/log/nginx/(?:access|error)\.log
+      php://filter/convert.base64-encode/resource=
+      php://input
+      ../..\..\..\..\..\..\..\..\windows/win.ini
+      C:\\boot.ini
+      data:text/plain;base64,
+      zip://
+      phar://
+      \.\./%2e%2e/
+      \%252e\%252e\%252f
+      /var/log/auth\.log
+      /var/log/syslog
+      /var/log/messages
+      C:\\Windows\\System32\\drivers\\etc\\hosts
+      C:\\Windows\\win.ini
+      C:\\inetpub\\wwwroot\\web.config
+      file_get_contents\(
+      readfile\(
+      include\(
+      require\(
+      input=(?:.*\/)*
+      page=(?:.*\/)*
+      view=(?:.*\/)*
+      \b(?:file|read|include|require)\s*\(\s*['"]?\w+\.(?:php|asp|jsp|txt|html)['"]?\s*\)
+      proc/self/fd/
+      /dev/urandom
+      /dev/zero
+      
+      # Deep traversal variants
+      (?:\.\./){4,}
+      (?:\.\./)+etc/passwd
+      (?:\.\./)+var/log/
+      (?:\.\./)+windows/win\.ini
+      
+      # Advanced LFI techniques
+      (?:\.\./)+proc/self/environ
+      (?:\.\./)+proc/self/cmdline
+      (?:\.\./)+proc/self/cwd
+      (?:\.\./)+proc/self/exe
+      (?:\.\./)+proc/self/fd/\d+
+      (?:\.\./)+proc/self/maps
+      (?:\.\./)+proc/version
+      (?:\.\./)+proc/net/tcp
+      (?:\.\./)+proc/net/udp
+      
+      # PHP wrappers
+      php://filter/read=convert\.base64-encode/resource=
+      php://filter/convert\.iconv\.[^/]+/resource=
+      php://filter/zlib\.deflate/resource=
+      php://filter/string\.rot13/resource=
+      php://filter/string\.toupper/resource=
+      php://filter/string\.tolower/resource=
+      expect://
+      data:text/plain;base64,PD9waHAgc3lzdGVt
+      zip://[^#]+#
+      phar://[^/]+/
+      
+      # Log poisoning
+      /var/log/apache2/access\.log
+      /var/log/apache2/error\.log
+      /var/log/nginx/access\.log
+      /var/log/nginx/error\.log
+      /var/log/vsftpd\.log
+      /var/log/sshd\.log
+      /var/log/mail
+      /usr/local/apache2/logs/access_log
+      /usr/local/apache2/logs/error_log
+      C:\\xampp\\apache\\logs\\access\.log
+      C:\\xampp\\apache\\logs\\error\.log
+      C:\\Program Files\\Apache Group\\Apache2\\logs\\access\.log
+      
+      # Session file inclusion
+      /var/lib/php/sessions/sess_
+      /var/lib/php5/sessions/sess_
+      /tmp/sess_
+      C:\\Windows\\Temp\\sess_
+      
+      # Double encoding
+      %252e%252e%252f
+      %252e%252e/
+      ..%252f
+      %252e%252e%255c
+      
+      # UTF-8 encoding
+      \xc0\xae\xc0\xae/
+      \xc0\xaf
+      %c0%ae%c0%ae/
+      %c0%af
+      
+      # Null byte injection
+      \.\.\/\.\.\/\.\.\/etc\/passwd%00
+      \.\.\/\.\.\/\.\.\/etc\/passwd\x00
+      /etc/passwd%00.jpg
+      /etc/passwd\x00.jpg
+      
+      # Filter bypass with special chars
+      \.\./\.\./\.\.\/etc\/passwd
+      ..\/..\/../etc/passwd
+      .\\.\\.\\.\\windows\\win.ini
+      
+      # Cloud-specific paths
+      /home/\.aws/credentials
+      /home/\.ssh/id_rsa
+      /home/\.ssh/id_dsa
+      /home/\.docker/config\.json
+      /home/\.kube/config
+      \.azure/credentials
+      \.config/gcloud/credentials
+      
+      # Application-specific
+      /var/www/html/\.env
+      \.git/config
+      \.git/HEAD
+      \.svn/entries
+      \.env\.local
+      \.env\.production
+      WEB-INF/web\.xml
+      META-INF/context\.xml
+      conf/server\.xml
+      /opt/tomcat/conf/tomcat-users\.xml
+
+  META REFRESH:
+    severity: INFORMATIVE
+    weight: 1
+    patterns: |
+      <META HTTP-EQUIV="refresh" CONTENT="0;url=data:text/html;base64,[A-Za-z0-9+/=]+">
+      <meta\s+http-equiv=["']?refresh["']?\s+content="\d+;url=.*?">
+      window\.location\.replace\(['"].*?['"]\)
+      window\.location\.href\s*=\s*['"].*?['"]
+      window\.open\(['"].*?['"]\)
+      document\.location\.assign\(['"].*?['"]\)
+      document\.location\.replace\(['"].*?['"]\)
+      <meta\s+charset="utf-8">\s*<noscript><meta\s+http-equiv="refresh"\s+content="0;url=.*?"\/></noscript>
+      content="\d+;url=javascript:void\(0\)"
+      content="\d+;url=//.*?\s*"
+      HTTP/1\.\d\s+30\d\s+Found\s+Location:\s+.*
+      Response\.Redirect\(
+      header\(['"]Location:.*['"]\)
+      return redirect\(
+      res\.redirect\(
+      \b(?:location\.reload|history\.pushState|history\.replaceState)\s*\(
+      
+      # Advanced redirect techniques
+      window\.location\s*=\s*atob\(['"][A-Za-z0-9+/=]+['"]\)
+      top\.location\.href\s*=
+      parent\.location\.href\s*=
+      self\.location\.href\s*=
+      location\.assign\(['"].*?['"]\)
+      location\.replace\(['"].*?['"]\)
+      
+      # Meta refresh with base64
+      <meta[^>]+content\s*=\s*['"]\d+;\s*url\s*=\s*data:text/html[^'"]*base64
+      
+      # JavaScript-based redirects
+      setTimeout\s*\(\s*function\s*\(\)\s*\{\s*window\.location
+      setInterval\s*\(\s*function\s*\(\)\s*\{\s*window\.location
+
+  KEYWORD ACCESS:
+    severity: MEDIUM
+    weight: 2
+    patterns: |
+      \b(?:sudo|ssh|root)\b
+      HTTP\s+(?:401|403|404|500|502|503)
+      \b(?:sudo|ssh|root|passwd|shadow|config|backup|dump)\b
+      \b(?:admin|administrator|dashboard|cpanel|phpmyadmin|webmail|login|signin|access|control|console)\b
+      access\s+denied
+      permission\s+denied
+      internal\s+server\s+error
+      stack\s+trace
+      connection\s+refused
+      database\s+error
+      /admin/login
+      /wp-admin/
+      /shell\.php
+      \.(?:git|svn|hg)/
+      \.env
+      api_key
+      secret_key
+      password\s*=
+      (\d{1,3}\.){3}\d{1,3}:\d{2,5}
+      private_key
+      client_secret
+      token\s*=
+      sessionid\s*=
+      PHPSESSID\s*=
+      JSESSIONID\s*=
+      X-Forwarded-For:
+      User-Agent:\s*(?:sqlmap|nmap|nikto|burp|nessus|zap)
+      debug\s+mode
+      phpinfo\(\)
+      server-status
+      robots\.txt
+      sitemap\.xml
+      \b(?:test|dev|development|staging)\b
+      Elasticsearch\s+error
+      MongoDB\s+error
+      Redis\s+error
+      Uncaught\s+Exception
+      SyntaxError:
+      ReferenceError:
+      TypeError:
+      file not found
+      No such file or directory
+      configuration\s+file
+      credential
+      authorization
+      authentication
+      forbidden
+      unauthorized
+      
+      # Advanced patterns
+      \b(?:mysql|postgres|mongodb|redis|memcached)_password\b
+      \bAWS_(?:ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN)\b
+      \bGOOGLE_(?:API_KEY|APPLICATION_CREDENTIALS)\b
+      \bAZURE_(?:CLIENT_ID|CLIENT_SECRET|TENANT_ID)\b
+      \bDATABASE_URL\s*=
+      \bCONNECTION_STRING\s*=
+      \bJWT_SECRET\b
+      \bENCRYPTION_KEY\b
+      \bPRIVATE_KEY\s*=
+      \bSECRET_KEY_BASE\b
+      \bGITHUB_TOKEN\b
+      \bSLACK_(?:TOKEN|WEBHOOK)\b
+      \bTWILIO_(?:ACCOUNT_SID|AUTH_TOKEN)\b
+      \bSTRIPE_(?:SECRET_KEY|PUBLISHABLE_KEY)\b
+      
+      # Common admin panels
+      /admin(?:panel|istrator)?(?:\.php|\.html|\.asp|\.aspx|/)?
+      /wp-admin/
+      /wp-login\.php
+      /administrator/
+      /phpmyadmin/
+      /adminer\.php
+      /manager/html
+      /console/login
+      /cpanel
+      /webmail
+      /roundcube
+      /phpMyAdmin/
+      /pma/
+      /dbadmin/
+      /jenkins/
+      /grafana/
+      /kibana/
+      /prometheus/
+      
+      # Common debug/info endpoints
+      /\.well-known/
+      /debug/
+      /test/
+      /_profiler/
+      /actuator/
+      /health
+      /metrics
+      /status
+      /info
+      /version
+      /api/swagger
+      /api/docs
+      /graphql
+      /playground
+
+  SESSION HIJACKING:
+    severity: HIGH
+    weight: 4
+    patterns: |
+      Cookie:\s*PHPSESSID=[a-zA-Z0-9]+
+      Cookie:\s*JSESSIONID=[a-zA-Z0-9]+
+      Cookie:\s*sessionid=[a-zA-Z0-9]+
+      Set-Cookie:\s*.*?;(?:Path|Domain|Expires|Max-Age|Secure|HttpOnly)
+      Authorization:\s*Bearer\s+[a-zA-Z0-9\-_.]+
+      X-Auth-Token:\s*[a-zA-Z0-9]+
+      token=[a-zA-Z0-9\-_.]+
+      \b(?:session|cookie|token|jwt)\b\s*=\s*[a-zA-Z0-9\-_.]+
+      sessionId=\s*['"]?\w+['"]?
+      sessionID=\s*['"]?\w+['"]?
+      sid=\s*['"]?\w+['"]?
+      
+      # JWT tokens
+      eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}
+      
+      # Session fixation patterns
+      \bset-cookie\s*:\s*(?:PHPSESSID|JSESSIONID|ASPSESSIONID)[^;]*;\s*(?!.*HttpOnly)
+      \bset-cookie\s*:\s*(?:PHPSESSID|JSESSIONID|ASPSESSIONID)[^;]*;\s*(?!.*Secure)
+      
+      # Cookie theft indicators
+      document\.cookie\s*=
+      document\.cookie\s*\+\s*=
+      fetch\(['"].*?['"],\s*\{[^}]*cookie
+      XMLHttpRequest.*\.setRequestHeader\s*\(\s*['"]Cookie['"]
+      
+      # Session token patterns
+      access_token=[a-zA-Z0-9\-_.]+
+      refresh_token=[a-zA-Z0-9\-_.]+
+      id_token=[a-zA-Z0-9\-_.]+
+      auth_token=[a-zA-Z0-9\-_.]+
+      api_token=[a-zA-Z0-9\-_.]+
+      
+      # OAuth patterns
+      Authorization:\s*OAuth\s+oauth_token=['"]?[a-zA-Z0-9\-_.]+['"]?
+      oauth_consumer_key=['"]?[a-zA-Z0-9\-_.]+['"]?
+      oauth_signature=['"]?[a-zA-Z0-9\-_.%]+['"]?
+      
+      # API key patterns
+      X-API-Key:\s*[a-zA-Z0-9\-_.]+
+      api_key=['"]?[a-zA-Z0-9\-_.]+['"]?
+      apikey=['"]?[a-zA-Z0-9\-_.]+['"]?
+      
+      # Custom auth headers
+      X-Auth(?:orization)?-Token:\s*[a-zA-Z0-9\-_.]+
+      X-Session-Token:\s*[a-zA-Z0-9\-_.]+
+      X-CSRF-Token:\s*[a-zA-Z0-9\-_.]+
+      X-XSRF-TOKEN:\s*[a-zA-Z0-9\-_.]+
+
+  SSRF:
+    severity: HIGH
+    weight: 4
+    patterns: |
+      http://127\.0\.0\.1
+      http://localhost
+      file:///etc/passwd
+      dict://localhost:25
+      gopher://
+      ftp://
+      s3\.amazonaws\.com
+      169\.254\.169\.254
+      http:\/\/metadata\.google\.internal
+      http:\/\/100\.100\.100\.100\/latest\/meta-data
+      internal\s*ip
+      private\s*network
+      x-forwarded-host
+      url\s*=\s*['"]?http.*['"]?
+      image_url=\s*['"]?http.*['"]?
+      webhook_url=\s*['"]?http.*['"]?
+      callback=\s*['"]?http.*['"]?
+      destination=\s*['"]?http.*['"]?
+      
+      # Internal/metadata URLs
+      https?:\/\/(?:127\.0\.0\.1|0\.0\.0\.0|localhost)(?::\d+)?
+      https?:\/\/\[::1\](?::\d+)?
+      (?:http|https|ftp|gopher|dict|file|smb|ldap|ldaps):\/\/169\.254\.169\.254
+      (?:url|image_url|webhook_url|callback|dest|destination)\s*=\s*['"]?https?:\/\/[^\s'"]+['"]?
+      
+      # Advanced SSRF patterns
+      https?:\/\/(?:10|172\.(?:1[6-9]|2[0-9]|3[01])|192\.168)\.\d{1,3}\.\d{1,3}
+      https?:\/\/(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}
+      https?:\/\/\d+\.\d+\.\d+\.\d+@
+      https?:\/\/[^/]*@(?:localhost|127\.0\.0\.1|169\.254\.169\.254)
+      
+      # Cloud metadata endpoints
+      http:\/\/metadata\.google\.internal\/computeMetadata\/v1
+      http:\/\/169\.254\.169\.254\/latest\/meta-data
+      http:\/\/169\.254\.169\.254\/latest\/user-data
+      http:\/\/169\.254\.169\.254\/latest\/dynamic\/instance-identity
+      http:\/\/100\.100\.100\.100\/latest\/meta-data
+      
+      # Protocol smuggling
+      gopher:\/\/127\.0\.0\.1
+      dict:\/\/127\.0\.0\.1
+      file:\/\/\/etc\/passwd
+      ftp:\/\/127\.0\.0\.1
+      tftp:\/\/127\.0\.0\.1
+      ldap:\/\/127\.0\.0\.1
+      
+      # DNS rebinding indicators
+      \.nip\.io
+      \.xip\.io
+      \.sslip\.io
+      
+      # URL encoding bypass
+      http:\/\/2130706433
+      http:\/\/017700000001
+      http:\/\/0x7f\.0x0\.0x0\.0x1
+      http:\/\/0177\.0\.0\.01
+      
+      # Localhost alternatives
+      http:\/\/localtest\.me
+      http:\/\/lvh\.me
+      http:\/\/vcap\.me
+      http:\/\/lacolhost\.com
+      
+      # AWS-specific
+      s3\.(?:amazonaws|aws)\.com
+      \.s3\.(?:amazonaws|aws)\.com
+      s3-(?:us|eu|ap|sa|ca|cn)-[^.]+\.amazonaws\.com
+      
+      # Azure-specific
+      \.blob\.core\.windows\.net
+      \.queue\.core\.windows\.net
+      \.table\.core\.windows\.net
+      
+      # GCP-specific
+      storage\.googleapis\.com
+      \.storage\.googleapis\.com
+      
+      # Docker/K8s
+      http:\/\/docker\.for\.(?:mac|win)\.localhost
+      http:\/\/kubernetes\.default\.svc
+      http:\/\/kubernetes\.default\.svc\.cluster\.local
+
+  RCE:
+    severity: CRITICAL
+    weight: 5
+    patterns: |
+      \b(?:exec|system|shell_exec|passthru|proc_open|popen|pcntl_exec)\s*\(
+      \b(?:os\.system|subprocess\.call|subprocess\.Popen)\s*\(
+      \b(?:Runtime\.getRuntime\(\)\.exec|ProcessBuilder)\s*\(
+      \b(?:eval|Function)\s*\(
+      \b(?:qx|system|backticks|exec)\s*[`'"]
+      nc\s+.*?\s+-e\s+/bin/sh
+      sh\s+.*?\s+-c
+      powershell\.exe\s+-Command
+      cmd\.exe\s+/c
+      mshta\.exe
+      rundll32\.exe
+      \b(?:DLL_PROCESS_ATTACH|DLL_THREAD_ATTACH|DLL_THREAD_DETACH|DLL_PROCESS_DETACH)\b
+      \b(?:systemctl|service|chkconfig)\s+(?:start|stop|restart|enable|disable)
+      \b(?:chmod|chown|wget|curl|ftp|tftp)\s+
+      \b(?:bash|sh)\s+-\s*i\b
+      \b(?:python|perl)\s+\-c\s+["']import os; os.system\(
+      \${jndi:ldap
+      LD_PRELOAD=
+      DYLD_INSERT_LIBRARIES=
+      struts2\.ognl\.ClassResolver\.loadClass
+      deserializeObject
+      ObjectInputStream\.readObject
+      pickle\.loads
+      php:\/\/include
+      
+      # Advanced RCE patterns
+      __import__\(['"]os['"]\)\.system
+      __import__\(['"]subprocess['"]\)\.(?:call|Popen|run)
+      __import__\(['"]pty['"]\)\.spawn
+      
+      # Expression Language injection
+      \$\{7\*7\}
+      \$\{\d+\*\d+\}
+      \$\{Runtime\.getRuntime\(\)\.exec
+      \$\{applicationScope
+      \$\{pageContext
+      
+      # Template injection (SSTI)
+      \{\{config\.items\(\)
+      \{\{''\.class\.mro\(\)
+      \{\{request\.application
+      \{\{self\._TemplateReference__context
+      \{\{cycler\.next\(\)\.class
+      \{\{lipsum\.class
+      \{\{url_for\.globals
+      
+      # Log4Shell
+      \$\{jndi:(?:ldap|rmi|dns|nis|iiop|corba)://
+      \$\{jndi:\$\{lower:
+      \$\{\$\{::-j\}
+      \$\{\$\{env:
+      \$\{\$\{sys:
+      \$\{\$\{java:
+      
+      # Deserialization (Fixed Hex)
+      rO0AB
+      aced0005
+      H4sIA
+      \xac\xed\x00\x05
+      
+      # Framework-specific RCE
+      # Spring
+      class\.module\.classLoader
+      org\.springframework\.context
+      
+      # Struts
+      \(#[^)]+\)
+      %\{#[^}]+\}
+      
+      # Ruby
+      \beval\s*\(
+      \binstance_eval\s*\(
+      \bmodule_eval\s*\(
+      \bclass_eval\s*\(
+      \bsend\s*\(['"]system['"]
+      
+      # Python pickle RCE
+      c__builtin__\n(?:eval|exec|compile)
+      csubprocess\npopen
+      cos\nsystem
+      ccommands\ngetoutput
+      
+      # Java RCE
+      ProcessBuilder\s*\(\s*(?:new\s+)?String\s*\[\s*\]
+      Runtime\.getRuntime\(\)\.exec\s*\(
+      ProcessImpl\.start
+      
+      # Node.js RCE
+      child_process\.exec\s*\(
+      child_process\.spawn\s*\(
+      require\s*\(\s*['"]child_process['"]\s*\)
+      
+      # ASP.NET RCE
+      Process\.Start\s*\(
+      ProcessStartInfo\s*\(
+      Activator\.CreateInstance
+      Type\.GetType\s*\(['"]System\.Diagnostics\.Process
+      
+      # File upload RCE indicators
+      Content-Type:\s*application/x-(?:php|jsp|asp)
+      filename="[^"]*\.(?:php\d?|phtml|asp|aspx|jsp|jspx)
+      <%[^%]*%>
+      <?php
+      <\?=
+
+  DESERIALIZATION:
+    severity: CRITICAL
+    weight: 4
+    patterns: |
+      java\.io\.ObjectInputStream\.readObject
+      php_binary_serialize
+      json_decode\(.*?unserialize
+      YTo[0-9]:
+      O:\d+:" .*?":\d+:\{.*?}
+      python\n(?:c|S|t|i|F|J|B|s|g|p)\d+
+      (\xac\xed\x00\x05|\x73\x72)
+      ysoserial
+      GadgetChain
+      CommonsCollections
+      SpringFramework
+      Fastjson
+      jackson\.databind
+      XStream\.fromXML
+      readUnshared
+      Externalizable
+      ObjectInputFilter
+      
+      # Advanced deserialization patterns
+      # Java serialization magic bytes
+      \xac\xed\x00\x05
+      rO0AB
+      H4sIA
+      
+      # PHP serialization
+      a:\d+:\{
+      O:\d+:"[^"]+"\:\d+:\{
+      s:\d+:"
+      i:\d+;
+      b:[01];
+      N;
+      
+      # Python pickle
+      \x80[\x02-\x05]
+      c__builtin__
+      cposix\nsystem
+      cos\nsystem
+      csubprocess\ncall
+      csubprocess\nPopen
+      
+      # .NET deserialization
+      System\.Runtime\.Serialization
+      BinaryFormatter\.Deserialize
+      SoapFormatter\.Deserialize
+      NetDataContractSerializer
+      ObjectStateFormatter
+      LosFormatter\.Deserialize
+      
+      # Ruby Marshal
+      \x04\x08
+      Marshal\.load
+      Marshal\.restore
+      
+      # Node.js node-serialize
+      _\$\$ND_FUNC\$\$_
+      
+      # Gadget chains indicators
+      CommonsCollections[1-7]
+      Spring[12]
+      C3P0
+      BeanShell1
+      Groovy1
+      JBossInterceptors1
+      Jdk7u21
+      JavassistWeld1
+      MozillaRhino[12]
+      Myfaces[12]
+      ROME
+      Vaadin1
+      Wicket1
+      
+      # Framework-specific
+      # Jackson
+      com\.fasterxml\.jackson\.databind
+      @type
+      enableDefaultTyping
+      
+      # Fastjson
+      @type
+      autoTypeSupport
+      
+      # XStream
+      <dynamicProxyClass>
+      <serialization>
+      
+      # YAML deserialization
+      !!python/object/apply
+      !!python/object/new
+      !!java/object
+      
+      # JSON indicators
+      __type__
+      _class
+      javaClass
+      \$type
+
+  PATH TRAVERSAL:
+    severity: HIGH
+    weight: 3
+    patterns: |
+      \.\./
+      %2e%2e%2f
+      %5c%5c
+      (\.\./){2,}
+      \/etc\/passwd%00
+      \.\\\.\\
+      ..\x00/
+      WEB-INF/web.xml
+      META-INF/context.xml
+      /proc/self/cwd
+      \/var\/www\/html
+      \btmp\b
+      wp-config\.php
+      application\.properties
+      connection\.ini
+      db\.properties
+      file=\.\./
+      path=\.\./
+      dir=\.\./
+      
+      # Advanced traversal techniques
+      # Encoding variations
+      %2e%2e%252f
+      %252e%252e%252f
+      %c0%ae%c0%ae/
+      %c0%ae%c0%ae%c0%af
+      
+      # Unicode normalization
+      \u002e\u002e\u002f
+      \uff0e\uff0e\u2215
+      \uff0e\uff0e\uff0f
+      
+      # Mixed encoding
+      \.%252e/
+      %2e\./
+      \.\.%c0%af
+      
+      # Filter bypass
+      \.\.;/
+      \.\.\/\./
+      \.\.\/\.\/
+      \.\.\/\/
+      \.\.\\
+      
+      # Operating system specific
+      # Windows
+      \.\.\\\.\.\\
+      %5c%5c
+      \.\.%5c
+      file=C:\\
+      
+      # Unix/Linux
+      \.\.\/\.\.\/
+      %2f%2e%2e%2f
+      
+      # Null byte injection
+      \.\.\/\.\.\/etc\/passwd\x00
+      \.\.\/\.\.\/etc\/passwd%00
+      
+      # Case variation
+      \.\.\/\.\.\/ETC\/PASSWD
+      \.\.\/\.\.\/etc\/PASSWD
+      
+      # Common target files
+      # Linux
+      \/etc\/passwd
+      \/etc\/shadow
+      \/etc\/hosts
+      \/etc\/hostname
+      \/etc\/group
+      \/etc\/issue
+      \/etc\/motd
+      \/etc\/resolv\.conf
+      \/etc\/network\/interfaces
+      \/proc\/self\/environ
+      \/proc\/self\/cmdline
+      \/proc\/self\/status
+      \/proc\/version
+      \/proc\/net\/arp
+      \/proc\/net\/route
+      \/proc\/net\/tcp
+      \/root/\.ssh\/authorized_keys
+      \/root/\.ssh\/id_rsa
+      \/home\/[^/]+/\.ssh\/id_rsa
+      \/var\/log\/apache2\/access\.log
+      \/var\/log\/apache2\/error\.log
+      \/var\/log\/nginx\/access\.log
+      \/var\/log\/nginx\/error\.log
+      \/var\/log\/auth\.log
+      \/var\/log\/secure
+      \/var\/log\/syslog
+      \/var\/log\/messages
+      \/var\/www\/html\/\.env
+      
+      # Windows
+      C:\\boot\.ini
+      C:\\autoexec\.bat
+      C:\\config\.sys
+      C:\\Windows\\system32\\config\\sam
+      C:\\Windows\\system32\\config\\system
+      C:\\Windows\\system32\\config\\security
+      C:\\Windows\\system32\\drivers\\etc\\hosts
+      C:\\Windows\\win\.ini
+      C:\\Windows\\system\.ini
+      C:\\inetpub\\wwwroot\\web\.config
+      C:\\xampp\\apache\\conf\\httpd\.conf
+      C:\\xampp\\mysql\\bin\\my\.ini
+      
+      # Application configs
+      \.git\/config
+      \.git\/HEAD
+      \.svn\/entries
+      \.env
+      \.env\.local
+      \.env\.production
+      config\.php
+      config\.inc\.php
+      database\.yml
+      credentials\.yml
+      settings\.py
+      web\.config
+      appsettings\.json
+      
+      # Java/Tomcat
+      WEB-INF\/web\.xml
+      WEB-INF\/classes\/
+      META-INF\/context\.xml
+      META-INF\/MANIFEST\.MF
+
+  INFORMATION DISCLOSURE:
+    severity: MEDIUM
+    weight: 2
+    patterns: |
+      \b(?:api_key|secret_key|private_key|client_secret|access_token|refresh_token)\b
+      password\s*=
+      username\s*=
+      user_id\s*=
+      email\s*=
+      credit_card|cc_number|card_number
+      SSN|social_security_number
+      phone_number|tel
+      license_plate
+      \b(?:confidential|sensitive|internal)\b\s+data
+      stack\s+trace
+      error\s+message
+      debug\s+info
+      phpinfo\(\)
+      server-status
+      robots\.txt
+      sitemap\.xml
+      \.(?:bak|old|tmp|zip|rar|7z|sql|conf|cfg|log|txt|csv|xls|xlsx|doc|docx|pdf)$
+      \[(?:\d{1,3}\.){3}\d{1,3}\]
+      (\b(?:root|admin|sysadmin|administrator)\b:\s*(?:password|pass|pwned|123456))
+      jdbc:mysql://
+      mongodb://
+      redis://
+      ftp://(?:.*?):(?:.*?)@
+      sftp://(?:.*?):(?:.*?)@
+      smb://(?:.*?):(?:.*?)@
+      ssh:\/\/.*?@(?:.*?):(\d+)
+      elastic:\s*password
+      \[\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+\]
+      secret\s+key
+      oauth_token
+      bearer\s+token
+      private\s+repo
+      connection\s+string
+      default\s+password
+      version\s+control\s+system
+      git\s+credential
+      svn\s+authz
+      password_hash
+      encrypt(?:ion|ed|ing)_key
+      jwt\s+secret
+      license\s+key
+      
+      # Cloud credentials
+      \b(?:aws|gcp|azure)_access_key_id\b
+      \baws_secret_access_key\b
+      -----BEGIN\s+PRIVATE\s+KEY-----
+      -----BEGIN\s+RSA\s+PRIVATE\s+KEY-----
+      -----BEGIN\s+EC\s+PRIVATE\s+KEY-----
+      -----BEGIN\s+DSA\s+PRIVATE\s+KEY-----
+      -----BEGIN\s+OPENSSH\s+PRIVATE\s+KEY-----
+      -----BEGIN\s+PGP\s+PRIVATE\s+KEY\s+BLOCK-----
+      
+      # API tokens
+      \bgh[pousr]_[A-Za-z0-9_]{36,}
+      \bglpat-[A-Za-z0-9_-]{20,}
+      \bAKIA[0-9A-Z]{16}
+      \bAIza[0-9A-Za-z_-]{35}
+      \bsk_live_[0-9a-zA-Z]{24,}
+      \bsk_test_[0-9a-zA-Z]{24,}
+      \brk_live_[0-9a-zA-Z]{24,}
+      \bsq0csp-[0-9A-Za-z_-]{43}
+      \bsq0atp-[0-9A-Za-z_-]{22}
+      \bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}
+      \bEAAA[A-Za-z0-9]{140,}
+      \b[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com
+      \bxox[baprs]-[0-9]{10,13}-[0-9]{10,13}-[A-Za-z0-9]{24,}
+      
+      # Database connection strings
+      Server=.*;Database=.*;User Id=.*;Password=.*
+      Host=.*;Port=\d+;Username=.*;Password=.*
+      mongodb(?:\+srv)?:\/\/[^:]+:[^@]+@
+      mysql:\/\/[^:]+:[^@]+@
+      postgresql:\/\/[^:]+:[^@]+@
+      redis:\/\/[^:]+:[^@]+@
+      
+      # Environment variables
+      DB_PASSWORD=
+      DB_USERNAME=
+      DATABASE_URL=
+      REDIS_URL=
+      MONGODB_URI=
+      MYSQL_ROOT_PASSWORD=
+      POSTGRES_PASSWORD=
+      RABBITMQ_DEFAULT_PASS=
+      
+      # Common passwords in code
+      password\s*=\s*['"][^'"]{1,20}['"]
+      pwd\s*=\s*['"][^'"]{1,20}['"]
+      passwd\s*=\s*['"][^'"]{1,20}['"]
+      pass\s*=\s*['"][^'"]{1,20}['"]
+      
+      # PII patterns
+      \b\d{3}-\d{2}-\d{4}\b
+      \b\d{9}\b
+      \b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|3(?:0[0-5]|[68][0-9])[0-9]{11}|6(?:011|5[0-9]{2})[0-9]{12}|(?:2131|1800|35\d{3})\d{11})\b
+      \b[A-Z]{1,2}\d{1,2}\s?\d{1,2}[A-Z]{2}\b
+      
+      # Internal IP disclosure
+      \b(?:10|172\.(?:1[6-9]|2[0-9]|3[01])|192\.168)\.\d{1,3}\.\d{1,3}\b
+      
+      # Version disclosure
+      X-Powered-By:\s*
+      Server:\s*(?:Apache|nginx|IIS|Tomcat|WebLogic|WebSphere)\/[\d\.]+
+      X-AspNet-Version:\s*
+      X-AspNetMvc-Version:\s*
+      
+      # Debug information
+      DEBUG\s*=\s*True
+      development\s+mode
+      RAILS_ENV\s*=\s*development
+      NODE_ENV\s*=\s*development
+      
+      # Backup files
+      \.(?:bak|backup|old|orig|save|swp|~)$
+      ~$
+      \.DS_Store
+      Thumbs\.db
+      
+      # Git exposure
+      \.git\/(?:config|HEAD|index|logs\/HEAD)
+      \.gitignore
+      \.gitmodules
+      
+      # Common sensitive files
+      \.aws\/credentials
+      \.ssh\/(?:id_rsa|id_dsa|id_ecdsa|id_ed25519)
+      \.docker\/config\.json
+      \.kube\/config
+      \.npmrc
+      \.pypirc
+      composer\.json
+      package-lock\.json
+      yarn\.lock
+      Gemfile\.lock
+
+  XXE:
+    severity: HIGH
+    weight: 4
+    patterns: |
+      # Classic XXE
+      <!DOCTYPE[^>]*\[<!ENTITY
+      <!ENTITY\s+\w+\s+SYSTEM
+      <!ENTITY\s+\w+\s+PUBLIC
+      SYSTEM\s+['"]file:\/\/
+      SYSTEM\s+['"]http:\/\/
+      SYSTEM\s+['"]php:\/\/
+      SYSTEM\s+['"]expect:\/\/
+      SYSTEM\s+['"]data:\/\/
+      
+      # Parameter entities
+      <!ENTITY\s+%\s+\w+
+      %\w+;
+      
+      # XXE payloads
+      <!DOCTYPE\s+\w+\s+\[<!ENTITY\s+xxe\s+SYSTEM\s+['"]file:\/\/\/etc\/passwd['"]>
+      <!DOCTYPE\s+\w+\s+\[<!ENTITY\s+xxe\s+SYSTEM\s+['"]http:\/\/
+      
+      # Blind XXE
+      <!ENTITY\s+%\s+file\s+SYSTEM
+      <!ENTITY\s+%\s+eval\s+
+      <!ENTITY\s+%\s+exfil\s+SYSTEM
+      
+      # XXE via SVG
+      <svg[^>]*xmlns:xlink
+      <image[^>]*xlink:href\s*=\s*['"]file:\/\/
+      
+      # XXE via Office files
+      rels\/
+      word\/document\.xml
+      xl\/workbook\.xml
+      
+      # SOAP XXE
+      <soap:Envelope[^>]*>[\s\S]*<!ENTITY
+      
+      # External DTD
+      <!DOCTYPE[^>]*SYSTEM\s+['"]http:\/\/
+      
+      # XML entities
+      &xxe;
+      &xxe
+      &\w+;
+      
+      # PHP wrappers in XXE
+      php:\/\/filter\/
+      php:\/\/input
+      
+      # OOB XXE indicators
+      <!ENTITY\s+%\s+remote\s+SYSTEM
+      <!ENTITY\s+%\s+int\s+['"]<!ENTITY
+
+  LDAP INJECTION:
+    severity: HIGH
+    weight: 3
+    patterns: |
+      # LDAP injection
+      \*\)\(&
+      \*\)\(
+      \)\(&
+      \)\(
+      \*\(\|
+      \|\(
+      \(\|\(
+      \)%00
+      \*\|
+      \|\(uid=\*
+      \(cn=\*\)
+      \(\|\(password=\*
+      \)\(\|
+      \(\&\(
+      admin\)\(&
+      admin\*\)
+      \)\(cn=\*
+      
+      # LDAP filter bypass
+      \*\)\(uid=\*\)\(\|
+      \*\)\(objectClass=\*
+      \)\(cn=\*\)\(\&\(uid=\*
+      
+      # Blind LDAP injection
+      \*\(
+      \)\(
+      \(\&
+      \)\(\|
+      
+      # LDAP attribute injection
+      userPassword=\*
+      unicodePwd=\*
+      dn:\s*cn=
+
+  XPATH INJECTION:
+    severity: HIGH
+    weight: 3
+    patterns: |
+      # XPath injection
+      '\s*or\s*'1'\s*=\s*'1
+      '\s*or\s*1=1\s*or\s*'
+      '\s*and\s*'1'\s*=\s*'2
+      '\]\[
+      '\]\|\/\/\*\['
+      count\(\/\/\*\)
+      string-length\(
+      substring\(
+      
+      # XPath function injection
+      (?:string|number|boolean|name|local-name|namespace-uri|count|sum)\s*\(
+      
+      # XPath axis injection
+      \/\/\*\[@\w+\s*=\s*['"]
+      \[@\w+\]
+      \/descendant::
+      \/ancestor::
+      \/following-sibling::
+      \/preceding-sibling::
+      
+      # Boolean-based
+      '\s*and\s*\d+=\d+\s*and\s*'
+      '\s*or\s*\d+=\d+\s*or\s*'
+      
+      # Out-of-band
+      doc\(['"]http:\/\/
+      document\(['"]http:\/\/
+
+  CRLF INJECTION:
+    severity: MEDIUM
+    weight: 2
+    patterns: |
+      # CRLF injection
+      %0d%0a
+      %0a
+      %0d
+      \r\n
+      \r
+      \n
+      %0d%0aContent-Length:
+      %0d%0aHTTP\/1\.1\s+200
+      %0d%0aLocation:
+      %0d%0aSet-Cookie:
+      
+      # Header injection
+      \r\n\r\n
+      %0d%0a%0d%0a
+      \n\n
+      \r\r
+      
+      # Response splitting
+      %0d%0aContent-Type:\s*text\/html
+      %0d%0a<script>
+      
+      # Log injection
+      \r\n.*(?:admin|root|sudo)
+      %0d%0a.*\[INFO\]
+      %0d%0a.*\[ERROR\]
+
+  TEMPLATE INJECTION:
+    severity: CRITICAL
+    weight: 5
+    patterns: |
+      # Jinja2/Flask
+      \{\{.*config.*\}\}
+      \{\{.*self.*\}\}
+      \{\{.*lipsum.*\}\}
+      \{\{.*cycler.*\}\}
+      \{\{.*joiner.*\}\}
+      \{\{.*namespace.*\}\}
+      \{\{''\.class\.mro\(\)
+      \{\{''\.class\.bases
+      \{\{request\.application
+      \{\{config\.from_pyfile
+      
+      # Twig
+      \{\{_self\.env
+      \{\{dump\(
+      
+      # Freemarker
+      <#assign
+      <#list
+      <#if
+      \.freemarker\.template\.utility\.Execute
+      \.freemarker\.template\.utility\.ObjectConstructor
+      
+      # Velocity
+      #set\(\$
+      #foreach\(\$
+      \$class\.forName
+      
+      # Smarty
+      \{php\}
+      \{literal\}
+      \{if
+      \{foreach
+      
+      # Thymeleaf
+      __\$\{
+      \*\{
+      th:
+      
+      # Pug/Jade
+      \s-\s*var
+      \s!=\s*
+      
+      # ERB (Ruby)
+      <%=.*system
+      <%=.*exec
+      <%=.*eval
+      
+      # Generic SSTI
+      \{\{7\*7\}\}
+      \$\{7\*7\}
+      \<\%=7\*7\%\>
+      \#\{7\*7\}
+      \{\{7\*'7'\}\}
+
+  OPEN REDIRECT:
+    severity: MEDIUM
+    weight: 2
+    patterns: |
+      # Open redirect
+      (?:url|redirect|redir|next|return|returnTo|returnURL|go|target|dest|destination|continue|view|out|to|link|load|file|page|domain|callback|ref|reference)=https?:\/\/
+      (?:url|redirect|redir)=\/\/
+      (?:url|redirect|redir)=%2f%2f
+      (?:url|redirect|redir)=\\\\
+      (?:url|redirect|redir)=\/\\/
+      
+      # JavaScript redirect
+      window\.location=https?:\/\/
+      window\.location\.href=https?:\/\/
+      document\.location=https?:\/\/
+      location\.replace\(['"]https?:\/\/
+      
+      # Meta refresh redirect
+      <meta[^>]*refresh[^>]*url=https?:\/\/
+      
+      # Header injection redirect
+      Location:\s*https?:\/\/(?!(?:localhost|127\.0\.0\.1|\[::1\]))
+      
+      # Protocol handler
+      (?:javascript|data|vbscript):
+      
+      # Double encoding
+      %252f%252f
+      
+      # Bypass patterns
+      (?:url|redirect)=https?:\/\/trusted\.com@attacker\.com
+      (?:url|redirect)=https?:\/\/trusted\.com\.attacker\.com
+      (?:url|redirect)=https?:\/\/attacker\.com%23trusted\.com
+      (?:url|redirect)=https?:\/\/attacker\.com%3ftrusted\.com
+
+  FILE UPLOAD:
+    severity: HIGH
+    weight: 4
+    patterns: |
+      # Dangerous file extensions
+      \.(?:php\d?|phtml|phps|pht|phar)$
+      \.(?:asp|aspx|cer|asa|asax|asmx|ashx|axd|compiled)$
+      \.(?:jsp|jspx|jsw|jsv|jspf)$
+      \.(?:cfm|cfml|cfc)$
+      \.(?:pl|cgi|py|rb|sh|bash)$
+      \.(?:exe|dll|com|bat|cmd|vbs|ps1)$
+      \.(?:svg|xml|xsl|xslt)$
+      \.(?:swf|jar|class)$
+      
+      # Double extensions
+      \.\w+\.(?:php|jsp|asp|aspx)$
+      
+      # Null byte
+      \.php\x00\.jpg$
+      \.php%00\.jpg$
+      
+      # MIME type spoofing indicators
+      Content-Type:\s*image\/(?:jpeg|png|gif)[^;]*\r\n\r\n<\?php
+      Content-Type:\s*image\/svg\+xml[^;]*\r\n\r\n<svg[^>]*onload
+      
+      # Magic bytes mismatch (common shells disguised as images)
+      \xFF\xD8\xFF[\xE0\xE1].*<\?php
+      \x89PNG.*<\?php
+      GIF89a.*<\?php
+      
+      # Webshell patterns in uploads
+      Content-Disposition:[^;]*filename="[^"]*(?:shell|backdoor|cmd|webshell)
+      
+      # Path traversal in filename
+      Content-Disposition:[^;]*filename="[^"]*(?:\.\.|%2e%2e|\.\.%2f)
+      
+      # Archive bombs indicators
+      \.(?:zip|rar|7z|tar|gz|bz2)$
+      Content-Type:\s*application\/(?:zip|x-rar|x-7z-compressed)
+
+  RACE CONDITION:
+    severity: MEDIUM
+    weight: 2
+    patterns: |
+      # Time-of-check time-of-use (TOCTOU)
+      (?:access|stat|fstat|lstat|open|chmod|chown)\s*\([^)]+\)\s*;?\s*(?:if|while|for)
+      
+      # File operation sequences
+      (?:unlink|rmdir|remove)\s*\([^)]+\)\s*;?\s*(?:fopen|file_get_contents|file_put_contents)
+      
+      # Session race condition indicators
+      session_start\(\)\s*;?\s*(?:\$_SESSION\[|session_)
+      
+      # Database race conditions
+      SELECT\s+.*\s+FOR\s+UPDATE
+      BEGIN\s+TRANSACTION
+      COMMIT
+      ROLLBACK
+
+  PROTOTYPE POLLUTION:
+    severity: HIGH
+    weight: 3
+    patterns: |
+      # JavaScript prototype pollution
+      __proto__\[
+      constructor\[
+      prototype\[
+      \['__proto__'\]
+      \["__proto__"\]
+      \[constructor\]
+      \[prototype\]
+      
+      # Nested prototype pollution
+      \w+\.__proto__\.
+      \w+\['__proto__'\]\.
+      \w+\["__proto__"\]\.
+      
+      # JSON-based
+      \{"__proto__":
+      \{'__proto__':
+      "__proto__":
+      '__proto__':
+      "constructor":
+      "prototype":
+      
+      # URL parameter pollution
+      __proto__\[.*\]=
+      constructor\[.*\]=
+      prototype\[.*\]=
+
+  # --- LEGACY PATTERNS FROM ORIGINAL LOGS.PY ---
+  AUTH_FAILURE:
+    severity: HIGH
+    weight: 3
+    patterns: |
+      failed password
+      failure password
+      failed login
+      login failed
+      authentication failure
+      authentication error
+      authentication failed
+      auth failed
+      invalid user
+      illegal user
+      unknown user
+      unknown username
+      bad password
+      wrong password
+      password rejected
+      password mismatch
+      password expired
+      account locked
+      account is locked
+      account disabled
+      account is disabled
+      user not known to the underlying authentication module
+      maximum authentication attempts exceeded
+      too many authentication failures
+      too many failed logins
+      excessive login failures
+      pam_unix\(sshd:auth\): authentication failure
+      PAM authentication failure
+      PAM 2 more authentication failures
+      sshd: Failed password
+      sshd: error: PAM
+      sshd: refused
+      Failed publickey
+      no matching key exchange method found
+      no matching host key type found
+      reverse mapping checking getaddrinfo
+
+  PRIVILEGE_ESCALATION:
+    severity: HIGH
+    weight: 4
+    patterns: |
+      sudo: authentication failure
+      sudo: incorrect password
+      sudo: user is not allowed
+      sudo: command not allowed
+      sudo: not allowed to run sudo
+      sudo: no tty present
+      sudo: no tty present and no askpass program specified
+      FAILED su for
+      FAILED SU
+      su: Authentication failure
+      su: FAILED LOGIN
+      wheel group is required
+      attempt to gain privileges via su
+      user attempted to gain root
+      user attempted to gain administrative privileges
+
+  BRUTE_FORCE:
+    severity: HIGH
+    weight: 3
+    patterns: |
+      possible break in attempt
+      possible break-in attempt
+      repeated login failures
+      multiple failed login attempts
+      maximum number of connections
+      banned by fail2ban
+      fail2ban.actions
+      fail2ban warning
+      password guess from
+      brute force
+      brute-force attack
+      password spray
+      password spraying detected
+      credential stuffing
+      excessive logon failures
+
+  SECURITY_TOOLS:
+    severity: MEDIUM
+    weight: 2
+    patterns: |
+      sqlmap
+      nikto
+      nmap
+      masscan
+      metasploit
+      msfconsole
+      msf exploit
+      burp suite
+      burpsuite
+      burp collaborator
+      owasp zap
+      zap scanner
+      zap-scanner
+      w3af
+      arachni
+      wapiti
+      skipfish
+      acunetix
+      netsparker
+      invicti
+      openvas
+      nessus
+      qualys
+      rapid7
+      appspider
+      gobuster
+      dirb
+      dirbuster
+      feroxbuster
+      ffuf
+      wfuzz
+      hydra
+      thc hydra
+      medusa
+      patator
+      john the ripper
+      hashcat
+      aircrack-ng
+      wireshark
+      whatweb
+      wafw00f
+      tsunami scanner
+      Cobalt Strike
+      CobaltStrike
+      cobalt strike beacon
+      beacon object file
+      malleable C2
+      teamserver
+      Metasploit Framework
+      Meterpreter session
+      meterpreter
+      reverse https payload
+      Empire agent
+      PowerShell Empire
+      PoshC2
+      Sliver
+      Brute Ratel
+      Brute Ratel C4
+      Mythic
+      Havoc C2
+      Havoc framework
+      evil-winrm
+      Responder
+      LLMNR poisoning
+      NBNS poisoning
+      Inveigh
+
+  WEB_ATTACK_LEGACY:
+    severity: HIGH
+    weight: 3
+    patterns: |
+      illegal request
+      illegal character in request
+      request blocked by security rule
+      blocked by rule
+      blocked by web application firewall
+      client denied by server configuration
+      script not found or unable to stat
+      suspicious query string
+      suspicious request
+      malformed request
+      protocol violation
+      invalid method in request line
+      request size limit exceeded
+      user agent suspicious
+
+  MALWARE_INDICATORS:
+    severity: CRITICAL
+    weight: 5
+    patterns: |
+      ransomware
+      crypto locker
+      cryptolocker
+      cryptominer
+      coin miner
+      malware detected
+      virus detected
+      trojan detected
+      backdoor detected
+      remote shell detected
+      suspicious process detected
+      unauthorized process detected
+      process injection detected
+      code injection detected
+      injected code
+      mimikatz
+      powershell -enc
+      powershell.exe -enc
+      powershell.exe -nop
+      powershell -nop -w hidden
+      wscript.exe
+      cscript.exe
+      mshta.exe
+      regsvr32.exe
+      rundll32.exe
+      vssadmin delete shadows
+      wmic shadowcopy delete /nointeractive
+      bitsadmin /transfer
+      exploit attempt detected
+      threat blocked
+      Defender detected
+      antivirus detected
+      EICAR test file
+
+  SYSTEM_SECURITY:
+    severity: MEDIUM
+    weight: 2
+    patterns: |
+      audit\(
+      type=AVC
+      AVC denied
+      avc:  denied
+      SELinux is preventing
+      SELinux denial
+      SELinux denied
+      security context denied
+      type=USER_LOGIN
+      type=USER_AUTH
+      type=USER_ACCT
+      type=USER_CMD
+      type=CRED_ACQ
+      type=CRED_DISP
+      type=USER_ROLE_CHANGE
+      apparmor="DENIED"
+      apparmor denied
+      kernel: audit
+      kernel: security
+
+  NETWORK_SECURITY:
+    severity: MEDIUM
+    weight: 2
+    patterns: |
+      connection refused
+      Connection refused
+      Connection reset by peer
+      Connection timed out
+      connection timeout
+      possible SYN flooding
+      SYN flood
+      UDP flood
+      ICMP flood
+      firewalld: DENIED
+      iptables: DENY
+      nftables: denied
+      packet dropped
+      DROP INPUT
+      DROP OUTPUT
+      Invalid packet
+      invalid state
+      spoofed packet
+      martian source
+      blocked by firewall
+      intrusion detected
+      port scan detected
+      portscan detected
+      DDoS attack
+      denial of service attack
+      rate limit exceeded
+      blacklisted host
+      TLS Error: TLS key negotiation failed
+      TLS key negotiation failed
+      TLS handshake failed
+      TLS handshake error
+      failed to allocate TUN
+      TLS auth failed
+      certificate verify failed
+      invalid SSL certificate
+      self signed certificate
+      self-signed certificate
+      Maximum number of clients reached
+      client disconnected, reason=AUTH_FAILED
+      OpenVPN: authentication failed
+      IPsec SA deleted due to
+      IKE authentication credentials are unacceptable
+      sslv3 alert handshake failure
+
+  WINDOWS_SECURITY:
+    severity: HIGH
+    weight: 3
+    patterns: |
+      Logon Failure
+      logon failure
+      An account failed to log on
+      An account was successfully logged on
+      An account was locked out
+      Account Lockout
+      User Account Locked
+      unknown user name or bad password
+      The password for this user has expired
+      Audit Failure
+      Audit Success
+      STATUS_LOGON_FAILURE
+      STATUS_ACCESS_DENIED
+      STATUS_ACCOUNT_LOCKED_OUT
+      STATUS_ACCOUNT_DISABLED
+      STATUS_PASSWORD_EXPIRED
+      Kerberos pre-authentication failed
+      Kerberos policy error
+      RDP disconnected
+      terminal services logon failed
+      Remote Desktop Services authentication failed
+      Cleared the security event log
+      The security log was cleared
+      Event ID 4625
+      Event ID 4624
+      Event ID 4648
+      Event ID 4672
+      Event ID 4688
+      Event ID 4698
+      Event ID 4720
+      Event ID 4722
+      Event ID 4723
+      Event ID 4724
+      Event ID 4725
+      Event ID 4726
+      Event ID 4732
+      Event ID 4740
+      Event ID 4768
+      Event ID 4769
+      Event ID 4771
+      Event ID 4776
+      Event ID 7045
+      Event ID 1102
+
+  ACTIVE_DIRECTORY:
+    severity: HIGH
+    weight: 4
+    patterns: |
+      crackmapexec
+      cme smb
+      cme winrm
+      impacket
+      wmiexec.py
+      psexec.py
+      smbexec.py
+      secretsdump.py
+      atexec.py
+      GetUserSPNs.py
+      GetNPUsers.py
+      kerbrute
+      password spraying
+      ldapdomaindump
+      bloodhound
+      bloodhound-python
+      neo4j console
+      pass the hash
+      pass-the-hash
+      pass the ticket
+      DCSync attack
+      DCSync request
+      lsadump::dcsync
+      krbtgt hash
+      Golden ticket
+      Silver ticket
+      DCShadow attack
+      SeImpersonatePrivilege
+      SeDebugPrivilege
+      lsass.exe
+      lsass.dmp
+      dumping lsass
+      procdump.exe -ma lsass.exe
+      rundll32.exe comsvcs.dll, MiniDump
+      sekurlsa::logonpasswords
+      sekurlsa::logonpasswords full
+      sekurlsa::ekeys
+      lsadump::lsa
+      lsadump::sam
+      Invoke-Mimikatz
+      Invoke-CredentialInjection
+      ntds.dit
+      ntds.dit dump
+      copy ntds.dit
+      ntdsutil snapshot
+      volume shadow copy ntds
+      vssadmin delete shadows /all /quiet
+      vssadmin delete shadows
+      vssadmin resize shadowstorage
+      wmic shadowcopy delete
+      wbadmin delete catalog
+      bcdedit /set {default} recoveryenabled No
+      bcdedit /set {default} bootstatuspolicy ignoreallfailures
+
+  KUBERNETES_CONTAINER:
+    severity: MEDIUM
+    weight: 2
+    patterns: |
+      Failed to pull image
+      ImagePullBackOff
+      Back-off pulling image
+      Back-off restarting failed container
+      Failed to create pod sandbox
+      forbidden: User
+      forbidden: cannot list resource
+      forbidden: cannot create resource
+      Unauthorized for resource
+      x509: certificate signed by unknown authority
+      x509: certificate has expired
+      x509: certificate is not yet valid
+      http: TLS handshake error
+      networkpolicy denied
+      pod security policy violation
+      seccomp profile denied
+      container entered CrashLoopBackOff
+      container image not signed
+      admission webhook denied the request
+
+  GENERAL_SUSPICIOUS:
+    severity: MEDIUM
+    weight: 2
+    patterns: |
+      security alert
+      security event
+      security violation
+      policy violation
+      potential security breach
+      potential data breach
+      data breach
+      data exfiltration
+      sensitive data exfiltration
+      suspicious activity
+      suspicious behavior
+      intrusion attempt
+      intrusion detected
+      anomaly detected
+      threat detected
+      suspicious outbound connection
+      suspicious inbound connection
+      connection to known malicious host
+      blocked by security policy
+      blocked by policy
+      privilege escalation attempt
+      lateral movement detected
+      credentials dumped
+      suspicious archive created
+      large outbound transfer
+
+  DOCKER_SECURITY:
+    severity: HIGH
+    weight: 4
+    patterns: |
+      docker event: exec_start
+      docker event: kill
+      docker event: oom
+      docker event: die exit_code=(?![0]\b)
+      suspicious docker activity

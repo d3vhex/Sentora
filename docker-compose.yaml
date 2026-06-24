@@ -1,7 +1,7 @@
 services:
   db:
     image: mysql:8.0
-    container_name: zer0vuln-db
+    container_name: sentora-db
     restart: always
     command: [ "--max_connections=500", "--wait_timeout=120", "--interactive_timeout=120" ]
     environment:
@@ -21,7 +21,7 @@ services:
 
   ollama:
     image: ollama/ollama:latest
-    container_name: zer0vuln-ollama
+    container_name: sentora-ollama
     restart: always
     ports:
       - "11434:11434"
@@ -41,7 +41,7 @@ services:
 
   ollama-init:
     image: ollama/ollama:latest
-    container_name: zer0vuln-ollama-init
+    container_name: sentora-ollama-init
     restart: "no"
     depends_on:
       ollama:
@@ -55,7 +55,7 @@ services:
 
   app:
     build: .
-    container_name: zer0vuln-server
+    container_name: sentora-server
     restart: always
     env_file:
       - .env
@@ -75,7 +75,7 @@ services:
 
   ingest:
     build: .
-    container_name: zer0vuln-ingest
+    container_name: sentora-ingest
     restart: always
     command: [ "python", "server.py" ]
     env_file:
@@ -93,7 +93,7 @@ services:
 
   rabbitmq:
     image: rabbitmq:3-management
-    container_name: zer0vuln-rabbitmq
+    container_name: sentora-rabbitmq
     restart: always
     ports:
       - "5672:5672"
@@ -104,7 +104,7 @@ services:
 
   ai-worker-automation:
     build: .
-    container_name: zer0vuln-ai-worker-automation
+    container_name: sentora-ai-worker-automation
     restart: always
     command: [ "python", "ai_worker.py" ]
     env_file:
@@ -124,7 +124,7 @@ services:
 
   ai-worker-manual:
     build: .
-    container_name: zer0vuln-ai-worker-manual
+    container_name: sentora-ai-worker-manual
     restart: always
     command: [ "python", "ai_worker.py" ]
     env_file:
@@ -144,7 +144,7 @@ services:
 
   ai-worker-defensive:
     build: .
-    container_name: zer0vuln-ai-worker-defensive
+    container_name: sentora-ai-worker-defensive
     restart: always
     command: [ "python", "ai_worker.py" ]
     env_file:
@@ -169,11 +169,11 @@ services:
 
   opensearch:
     image: opensearchproject/opensearch:2.12.0
-    container_name: zer0vuln-opensearch
+    container_name: sentora-opensearch
     restart: always
     environment:
-      - cluster.name=zer0vuln-cluster
-      - node.name=zer0vuln-node1
+      - cluster.name=sentora-cluster
+      - node.name=sentora-node1
       - discovery.type=single-node
       - bootstrap.memory_lock=true
       - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
@@ -194,7 +194,7 @@ services:
 
   opensearch-dashboards:
     image: opensearchproject/opensearch-dashboards:2.12.0
-    container_name: zer0vuln-dashboards
+    container_name: sentora-dashboards
     restart: always
     ports:
       - "5601:5601"

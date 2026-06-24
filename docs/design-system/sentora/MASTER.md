@@ -6,7 +6,7 @@
 
 ---
 
-Project: Zer0Vuln
+Project: Sentora
 Category: B2B Service
 
 ---

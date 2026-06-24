@@ -131,7 +131,7 @@ const AdminConfig: React.FC = () => {
             <InputGroup label="SMTP Port" value={emailConfig.smtp_port?.toString()} onChange={val => setEmailConfig({...emailConfig, smtp_port: parseInt(val) || 587})} placeholder="587" />
             <InputGroup label="SMTP User" value={emailConfig.smtp_user} onChange={val => setEmailConfig({...emailConfig, smtp_user: val})} placeholder="user@gmail.com" />
             <InputGroup label="SMTP Password" value={emailConfig.smtp_password} type="password" onChange={val => setEmailConfig({...emailConfig, smtp_password: val})} placeholder="••••••••" />
-            <InputGroup label="Sender Email" value={emailConfig.email_from} onChange={val => setEmailConfig({...emailConfig, email_from: val})} placeholder="alerts@zer0vuln.com" />
+            <InputGroup label="Sender Email" value={emailConfig.email_from} onChange={val => setEmailConfig({...emailConfig, email_from: val})} placeholder="alerts@sentora.com" />
             <InputGroup label="Recipient Email" value={emailConfig.email_to} onChange={val => setEmailConfig({...emailConfig, email_to: val})} placeholder="admin@company.com" />
             
             <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginTop: '8px' }}>

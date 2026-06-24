@@ -59,6 +59,7 @@ class ChangePasswordRequest(BaseModel):
         return v
 
 import asyncio
+import hashlib
 import requests
 import textwrap
 from sanic.exceptions import SanicException
@@ -124,14 +125,14 @@ ENCRYPTED_FIELDS_MAP = {
 
 async def init_hub_db():
     """
-    Ensures that the zer0vuln_hub database and its global tables exist.
+    Ensures that the sentora_hub database and its global tables exist.
     """
     try:
         with sync_mysql_conn() as conn:
             cur = conn.cursor()
             try:
-                cur.execute("CREATE DATABASE IF NOT EXISTS zer0vuln_hub")
-                cur.execute("USE zer0vuln_hub")
+                cur.execute("CREATE DATABASE IF NOT EXISTS sentora_hub")
+                cur.execute("USE sentora_hub")
 
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS hardware_inventory (
@@ -164,7 +165,7 @@ async def init_hub_db():
                 conn.commit()
             finally:
                 cur.close()
-        print("[HubDB] Central database 'zer0vuln_hub' initialized successfully.")
+        print("[HubDB] Central database 'sentora_hub' initialized successfully.")
     except Exception as e:
         print(f"[HubDB] Error initializing central database: {e}")
 
@@ -510,7 +511,7 @@ async def download_agent(request, os_type):
     
     memory_file = io.BytesIO()
     
-    agent_root = pathlib.Path("Zer0Vuln")
+    agent_root = pathlib.Path("Sentora")
     if not agent_root.exists():
         return sanic_json({"ok": False, "error": "Agent source not found"}, status=404)
 
@@ -521,7 +522,7 @@ async def download_agent(request, os_type):
         return sanic_json({
             "ok": False,
             "error": f"Agent binary '{exe_name}' is not built. "
-                     f"Run Zer0Vuln/build_agent.{'ps1' if os_type=='windows' else 'sh'} "
+                     f"Run Sentora/build_agent.{'ps1' if os_type=='windows' else 'sh'} "
                      f"to produce it before enrolling agents."
         }, status=503)
 
@@ -551,7 +552,7 @@ if %errorlevel% neq 0 (
     exit /b
 )
 
-echo [*] Starting Zer0Vuln Agent Database (Docker)...
+echo [*] Starting Sentora Agent Database (Docker)...
 if exist "docker-compose.yml" (
     docker compose up -d
 )
@@ -562,8 +563,8 @@ echo cd /d "%%~dp0" >> run_agent.bat
 :: Prevent Python from trying to format %%COMPUTERNAME%%, just let batch handle it
 echo "main.exe" -a "Agent-%%COMPUTERNAME%%" -s "{server_ip}" >> run_agent.bat
 
-echo [*] Installing Zer0Vuln Agent Background Task...
-set TASK_NAME=Zer0VulnAgent
+echo [*] Installing Sentora Agent Background Task...
+set TASK_NAME=SentoraAgent
 set BIN_PATH="%~dp0run_agent.bat"
 
 :: Stop and delete old Scheduled Task if it exists
@@ -592,20 +593,20 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-echo "[*] Starting Zer0Vuln Agent Database (Docker)..."
+echo "[*] Starting Sentora Agent Database (Docker)..."
 if command -v docker >/dev/null 2>&1; then
     docker compose up -d || docker-compose up -d
 else
     echo "[!] Docker is not installed. Database cannot be started."
 fi
 
-echo "[*] Installing Zer0Vuln Agent Service..."
+echo "[*] Installing Sentora Agent Service..."
 chmod +x main
 
-SERVICE_FILE="/etc/systemd/system/zer0vuln-agent.service"
+SERVICE_FILE="/etc/systemd/system/sentora-agent.service"
 cat > $SERVICE_FILE << EOF
 [Unit]
-Description=Zer0Vuln Agent
+Description=Sentora Agent
 After=network.target docker.service
 
 [Service]
@@ -619,8 +620,8 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable zer0vuln-agent
-systemctl start zer0vuln-agent
+systemctl enable sentora-agent
+systemctl start sentora-agent
 
 echo "[+] Setup Complete! The Agent is now running in the background."
 """
@@ -632,7 +633,7 @@ echo "[+] Setup Complete! The Agent is now running in the background."
         body=memory_file.getvalue(),
         content_type="application/zip",
         headers={
-            "Content-Disposition": f"attachment; filename=Zer0Vuln-Agent-{os_type}.zip",
+            "Content-Disposition": f"attachment; filename=Sentora-Agent-{os_type}.zip",
             "Access-Control-Expose-Headers": "Content-Disposition"
         }
     )
@@ -918,7 +919,7 @@ async def agent_bootstrap(request):
 
 def _render_linux_install(server_url: str, server_ip: str, token: str) -> str:
     return f"""#!/usr/bin/env bash
-# Zer0Vuln Agent — Token-Based Installer
+# Sentora Agent — Token-Based Installer
 set -euo pipefail
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -929,11 +930,11 @@ fi
 TOKEN="{token}"
 SERVER_URL="{server_url}"
 SERVER_IP="{server_ip}"
-INSTALL_DIR="/opt/zer0vuln-agent"
+INSTALL_DIR="/opt/sentora-agent"
 HOSTNAME_VAL="$(hostname)"
 OS_TYPE="linux"
 
-echo "[*] Zer0Vuln Agent Installer"
+echo "[*] Sentora Agent Installer"
 echo "[*] Server : $SERVER_URL"
 echo "[*] Host   : $HOSTNAME_VAL"
 
@@ -990,10 +991,10 @@ cat > "$INSTALL_DIR/config.json" <<EOF
 EOF
 chmod 600 "$INSTALL_DIR/config.json"
 
-SERVICE_FILE="/etc/systemd/system/zer0vuln-agent.service"
+SERVICE_FILE="/etc/systemd/system/sentora-agent.service"
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=Zer0Vuln Agent
+Description=Sentora Agent
 After=network.target
 
 [Service]
@@ -1009,29 +1010,29 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable zer0vuln-agent
-systemctl restart zer0vuln-agent
+systemctl enable sentora-agent
+systemctl restart sentora-agent
 
 rm -f agent.zip
-echo "[+] Zer0Vuln Agent installed and running as: $AGENT_NAME"
+echo "[+] Sentora Agent installed and running as: $AGENT_NAME"
 """
 
 
 def _render_windows_install(server_url: str, server_ip: str, token: str) -> str:
-    return f"""# Zer0Vuln Agent - Token-Based Installer (Windows)
+    return f"""# Sentora Agent - Token-Based Installer (Windows)
 & {{
     $ErrorActionPreference = "Stop"
     $Token     = "{token}"
     $ServerUrl = "{server_url}"
     $ServerIp  = "{server_ip}"
-    $InstallDir = "C:\\Program Files\\Zer0Vuln-Agent"
+    $InstallDir = "C:\\Program Files\\Sentora-Agent"
     $Hostname  = $env:COMPUTERNAME
     $OsType    = "windows"
-    $LogPath   = Join-Path $env:TEMP "zer0vuln-install.log"
+    $LogPath   = Join-Path $env:TEMP "sentora-install.log"
     Start-Transcript -Path $LogPath -Force | Out-Null
 
     try {{
-        Write-Host "[*] Zer0Vuln Agent Installer" -ForegroundColor Cyan
+        Write-Host "[*] Sentora Agent Installer" -ForegroundColor Cyan
         Write-Host "[*] Server : $ServerUrl"
         Write-Host "[*] Host   : $Hostname"
         Write-Host "[*] Log    : $LogPath"
@@ -1094,10 +1095,10 @@ def _render_windows_install(server_url: str, server_ip: str, token: str) -> str:
         if (Test-Path $existingExe) {{
             Write-Host "[*] Stopping previous agent to release main.exe..." -ForegroundColor Cyan
             try {{
-                $prevTask = Get-ScheduledTask -TaskName "Zer0VulnAgent" -ErrorAction SilentlyContinue
+                $prevTask = Get-ScheduledTask -TaskName "SentoraAgent" -ErrorAction SilentlyContinue
                 if ($prevTask) {{
-                    Stop-ScheduledTask -TaskName "Zer0VulnAgent" -ErrorAction SilentlyContinue
-                    Unregister-ScheduledTask -TaskName "Zer0VulnAgent" -Confirm:$false -ErrorAction SilentlyContinue
+                    Stop-ScheduledTask -TaskName "SentoraAgent" -ErrorAction SilentlyContinue
+                    Unregister-ScheduledTask -TaskName "SentoraAgent" -Confirm:$false -ErrorAction SilentlyContinue
                 }}
             }} catch {{}}
             try {{
@@ -1124,7 +1125,7 @@ def _render_windows_install(server_url: str, server_ip: str, token: str) -> str:
         }} catch {{
             Write-Host "[!] Failed to extract agent.zip: $($_.Exception.Message)" -ForegroundColor Red
             Write-Host "    The previous agent may still be locking main.exe." -ForegroundColor Yellow
-            Write-Host "    Manually stop it and retry: Stop-ScheduledTask -TaskName Zer0VulnAgent; Get-Process main | Stop-Process -Force" -ForegroundColor Yellow
+            Write-Host "    Manually stop it and retry: Stop-ScheduledTask -TaskName SentoraAgent; Get-Process main | Stop-Process -Force" -ForegroundColor Yellow
             return
         }}
 
@@ -1146,15 +1147,15 @@ def _render_windows_install(server_url: str, server_ip: str, token: str) -> str:
         # BOM-less UTF-8.
         [System.IO.File]::WriteAllText($ConfigPath, $Config, (New-Object System.Text.UTF8Encoding $false))
 
-        # Bootstrap the agent's local postgres. Zer0Vuln/docker-compose.yml is
-        # shipped inside the zip and defines the `zer0vuln-db-agent` container
+        # Bootstrap the agent's local postgres. Sentora/docker-compose.yml is
+        # shipped inside the zip and defines the `sentora-db-agent` container
         # on localhost:5432 — modules/db.py hard-connects to that. Without it
         # every insert_record/fetch_unsent raises "connection refused".
         $composePath = Join-Path $InstallDir "docker-compose.yml"
         if (Test-Path $composePath) {{
             if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {{
                 Write-Host "[!] Docker not found on PATH. Install Docker Desktop and retry." -ForegroundColor Red
-                Write-Host "    The agent needs a local postgres (zer0vuln-db-agent) to store its state." -ForegroundColor Yellow
+                Write-Host "    The agent needs a local postgres (sentora-db-agent) to store its state." -ForegroundColor Yellow
                 return
             }}
             Write-Host "[*] Starting local agent database (postgres on :5432)..." -ForegroundColor Cyan
@@ -1186,10 +1187,10 @@ def _render_windows_install(server_url: str, server_ip: str, token: str) -> str:
             }}
             if (-not $dbReady) {{
                 Write-Host "[!] Postgres did not become reachable within 60s." -ForegroundColor Red
-                Write-Host "    Check: docker logs zer0vuln-db-agent" -ForegroundColor Yellow
+                Write-Host "    Check: docker logs sentora-db-agent" -ForegroundColor Yellow
                 return
             }}
-            Write-Host "[+] Agent database ready (zer0vuln-db-agent)." -ForegroundColor Green
+            Write-Host "[+] Agent database ready (sentora-db-agent)." -ForegroundColor Green
         }} else {{
             Write-Host "[!] docker-compose.yml missing in $InstallDir — agent will crash on DB connect." -ForegroundColor Red
             return
@@ -1199,7 +1200,7 @@ def _render_windows_install(server_url: str, server_ip: str, token: str) -> str:
         # console app — it does not implement the Windows Service Control
         # Protocol, so sc.exe create + Start-Service silently fails. Scheduled
         # Task runs the binary as SYSTEM at every boot and we kick it off now.
-        $taskName = "Zer0VulnAgent"
+        $taskName = "SentoraAgent"
         $exePath  = Join-Path $InstallDir "main.exe"
         $workDir  = $InstallDir
 
@@ -1252,7 +1253,7 @@ def _render_windows_install(server_url: str, server_ip: str, token: str) -> str:
         }}
 
         Remove-Item -Path "agent.zip" -Force -ErrorAction SilentlyContinue
-        Write-Host "[+] Zer0Vuln Agent installed and running as: $AgentName" -ForegroundColor Green
+        Write-Host "[+] Sentora Agent installed and running as: $AgentName" -ForegroundColor Green
         Write-Host "    Task   : $taskName (PID $($proc.Id))"
         Write-Host "    Config : $ConfigPath"
         Write-Host "    Log    : $InstallDir\\agent.log"
@@ -2131,7 +2132,7 @@ class _NoOpBootstrapClient:
 
     def validate_or_exit(self):
         self.get_fernet_key()
-        print("[+] Zer0Vuln Community Edition — local key initialised.")
+        print("[+] Sentora Community Edition — local key initialised.")
 
 
 bootstrap_client = _NoOpBootstrapClient()
@@ -2904,36 +2905,139 @@ async def trigger_defensive_scan(request, agent):
 # SOAR Hub and either approves (→ real SOAR action is queued) or rejects
 # (→ recorded and hidden from pending list). No retention timer — proposals
 # live until decided.
+#
+# Every approve/reject decision is written to shadow_audit_chain, a
+# hash-chained append-only table that lets you prove a decision was not
+# tampered with after the fact (useful for compliance audits).
+
+_CHAIN_DDL = """
+CREATE TABLE IF NOT EXISTS shadow_audit_chain (
+    id            INT AUTO_INCREMENT PRIMARY KEY,
+    shadow_id     INT NOT NULL,
+    action        VARCHAR(64)  NOT NULL,
+    target        VARCHAR(512) NOT NULL,
+    decision      VARCHAR(16)  NOT NULL,
+    decided_by    VARCHAR(128) NOT NULL,
+    decided_at    VARCHAR(32)  NOT NULL,
+    note          TEXT,
+    prev_hash     CHAR(64)     NOT NULL,
+    row_hash      CHAR(64)     NOT NULL,
+    INDEX idx_shadow_id (shadow_id)
+)
+"""
+
+async def _chain_init(cnx):
+    cur = await cnx.cursor()
+    try:
+        await cur.execute(_CHAIN_DDL)
+        await cnx.commit()
+    finally:
+        await cur.close()
+
+
+async def _chain_append(cnx, shadow_id: int, action: str, target: str,
+                         decision: str, decided_by: str, note: str = '') -> str:
+    await _chain_init(cnx)
+    cur = await cnx.cursor(aiomysql.DictCursor)
+    try:
+        await cur.execute(
+            "SELECT row_hash FROM shadow_audit_chain ORDER BY id DESC LIMIT 1"
+        )
+        last = await cur.fetchone()
+        prev_hash = last['row_hash'] if last else ('0' * 64)
+
+        decided_at_str = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        payload = f"{shadow_id}|{action}|{target}|{decision}|{decided_by}|{decided_at_str}|{prev_hash}"
+        row_hash = hashlib.sha256(payload.encode()).hexdigest()
+
+        await cur.execute(
+            """
+            INSERT INTO shadow_audit_chain
+                (shadow_id, action, target, decision, decided_by, decided_at, note, prev_hash, row_hash)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (shadow_id, action, target, decision, decided_by, decided_at_str, note or '', prev_hash, row_hash),
+        )
+        await cnx.commit()
+    finally:
+        await cur.close()
+    return row_hash
+
+
+async def _chain_verify(cnx) -> dict:
+    cur = await cnx.cursor(aiomysql.DictCursor)
+    try:
+        await cur.execute("SHOW TABLES LIKE 'shadow_audit_chain'")
+        if not await cur.fetchone():
+            return {"valid": True, "entries": 0, "note": "chain not yet initialized"}
+        await cur.execute("SELECT * FROM shadow_audit_chain ORDER BY id ASC")
+        rows = await cur.fetchall()
+    finally:
+        await cur.close()
+
+    if not rows:
+        return {"valid": True, "entries": 0}
+
+    prev_hash = '0' * 64
+    for i, row in enumerate(rows):
+        da = row['decided_at']
+        da_str = da.strftime('%Y-%m-%dT%H:%M:%SZ') if hasattr(da, 'strftime') else str(da)
+        payload = (
+            f"{row['shadow_id']}|{row['action']}|{row['target']}|"
+            f"{row['decision']}|{row['decided_by']}|{da_str}|{row['prev_hash']}"
+        )
+        expected = hashlib.sha256(payload.encode()).hexdigest()
+        if row['row_hash'] != expected or row['prev_hash'] != prev_hash:
+            return {
+                "valid": False,
+                "entries": len(rows),
+                "tampered_at_position": i + 1,
+                "chain_id": row['id'],
+                "shadow_id": row['shadow_id'],
+            }
+        prev_hash = row['row_hash']
+
+    return {"valid": True, "entries": len(rows), "last_hash": prev_hash}
 
 @require_permission("read_telemetry")
 @app.route("/<agent>/shadow/pending", methods=["GET"])
 async def list_shadow_pending(request, agent):
-    """Return pending shadow proposals for one agent."""
-    db_name = _agent_db_name(agent)
+    """Return pending shadow proposals for one agent, enriched with prior-execution context."""
     try:
         async with agent_conn(agent) as cnx:
             cur = await cnx.cursor(aiomysql.DictCursor)
             try:
                 await cur.execute(
                     """
-                    SELECT id, timestamp, source_file, critical_summary, source_data,
-                           proposed_action, proposed_target, shadow_status,
-                           shadow_decided_at, shadow_decided_by, created_at
-                    FROM ai_analysis_results
-                    WHERE source_file = 'AI_DEFENSIVE_SHADOW'
-                      AND shadow_status = 'pending'
-                    ORDER BY id DESC
+                    SELECT a.id, a.timestamp, a.source_file, a.critical_summary, a.source_data,
+                           a.proposed_action, a.proposed_target, a.shadow_status,
+                           a.shadow_decided_at, a.shadow_decided_by, a.created_at,
+                           (SELECT COUNT(*) FROM automations au
+                            WHERE LOWER(au.action) = LOWER(a.proposed_action)
+                              AND au.target = a.proposed_target) AS ctx_prev_count,
+                           (SELECT MAX(au.updated_at) FROM automations au
+                            WHERE LOWER(au.action) = LOWER(a.proposed_action)
+                              AND au.target = a.proposed_target) AS ctx_last_seen,
+                           (SELECT au.status FROM automations au
+                            WHERE LOWER(au.action) = LOWER(a.proposed_action)
+                              AND au.target = a.proposed_target
+                            ORDER BY au.updated_at DESC LIMIT 1) AS ctx_last_status
+                    FROM ai_analysis_results a
+                    WHERE a.source_file = 'AI_DEFENSIVE_SHADOW'
+                      AND a.shadow_status = 'pending'
+                    ORDER BY a.id DESC
                     LIMIT 200
                     """
                 )
-                rows = await cur.fetchall()
+                rows = list(await cur.fetchall())
             finally:
                 await cur.close()
         for r in rows:
             r['agent'] = agent
-            for k in ('created_at', 'timestamp', 'shadow_decided_at'):
+            for k in ('created_at', 'timestamp', 'shadow_decided_at', 'ctx_last_seen'):
                 if r.get(k) and hasattr(r[k], 'isoformat'):
                     r[k] = r[k].isoformat()
+            r['ctx_prev_count'] = int(r.get('ctx_prev_count') or 0)
         return sanic_json({"success": True, "results": rows})
     except Exception as e:
         if "doesn't exist" in str(e).lower() or "1146" in str(e):
@@ -2964,20 +3068,31 @@ async def list_shadow_pending_all(request):
                     try:
                         await cur.execute(
                             """
-                            SELECT id, timestamp, source_file, critical_summary, source_data,
-                                   proposed_action, proposed_target, shadow_status,
-                                   shadow_decided_at, shadow_decided_by, created_at
-                            FROM ai_analysis_results
-                            WHERE source_file = 'AI_DEFENSIVE_SHADOW'
-                              AND shadow_status = 'pending'
-                            ORDER BY id DESC LIMIT 100
+                            SELECT a.id, a.timestamp, a.source_file, a.critical_summary, a.source_data,
+                                   a.proposed_action, a.proposed_target, a.shadow_status,
+                                   a.shadow_decided_at, a.shadow_decided_by, a.created_at,
+                                   (SELECT COUNT(*) FROM automations au
+                                    WHERE LOWER(au.action) = LOWER(a.proposed_action)
+                                      AND au.target = a.proposed_target) AS ctx_prev_count,
+                                   (SELECT MAX(au.updated_at) FROM automations au
+                                    WHERE LOWER(au.action) = LOWER(a.proposed_action)
+                                      AND au.target = a.proposed_target) AS ctx_last_seen,
+                                   (SELECT au.status FROM automations au
+                                    WHERE LOWER(au.action) = LOWER(a.proposed_action)
+                                      AND au.target = a.proposed_target
+                                    ORDER BY au.updated_at DESC LIMIT 1) AS ctx_last_status
+                            FROM ai_analysis_results a
+                            WHERE a.source_file = 'AI_DEFENSIVE_SHADOW'
+                              AND a.shadow_status = 'pending'
+                            ORDER BY a.id DESC LIMIT 100
                             """
                         )
                         for r in await cur.fetchall():
                             r['agent'] = ag
-                            for k in ('created_at', 'timestamp', 'shadow_decided_at'):
+                            for k in ('created_at', 'timestamp', 'shadow_decided_at', 'ctx_last_seen'):
                                 if r.get(k) and hasattr(r[k], 'isoformat'):
                                     r[k] = r[k].isoformat()
+                            r['ctx_prev_count'] = int(r.get('ctx_prev_count') or 0)
                             out.append(r)
                     finally:
                         await cur.close()
@@ -2988,6 +3103,51 @@ async def list_shadow_pending_all(request):
                 continue
         out.sort(key=lambda x: x.get('created_at') or '', reverse=True)
         return sanic_json({"success": True, "results": out})
+    except Exception as e:
+        return sanic_json({"success": False, "error": str(e)}, status=500)
+
+
+@require_permission("read_telemetry")
+@app.route("/<agent>/shadow/chain/verify", methods=["GET"])
+async def verify_shadow_chain(request, agent):
+    """Verify the cryptographic hash chain for one agent's shadow audit log."""
+    try:
+        async with agent_conn(agent) as cnx:
+            result = await _chain_verify(cnx)
+        result['agent'] = agent
+        return sanic_json({"success": True, **result})
+    except Exception as e:
+        return sanic_json({"success": False, "error": str(e)}, status=500)
+
+
+@require_permission("read_telemetry")
+@app.route("/shadow/chain/verify", methods=["GET"])
+async def verify_shadow_chain_global(request):
+    """Verify shadow audit chain integrity across all agents."""
+    try:
+        def get_agent_names():
+            with sync_mysql_conn() as conn:
+                cursor = conn.cursor()
+                try:
+                    cursor.execute("SHOW DATABASES")
+                    return [d[0].replace('_db', '') for d in cursor.fetchall() if d[0].endswith('_db')]
+                finally:
+                    cursor.close()
+
+        agents = await asyncio.to_thread(get_agent_names)
+        results = []
+        all_valid = True
+        for ag in agents:
+            try:
+                async with agent_conn(ag) as cnx:
+                    r = await _chain_verify(cnx)
+                r['agent'] = ag
+                results.append(r)
+                if not r.get('valid', True):
+                    all_valid = False
+            except Exception:
+                continue
+        return sanic_json({"success": True, "all_valid": all_valid, "agents": results})
     except Exception as e:
         return sanic_json({"success": False, "error": str(e)}, status=500)
 
@@ -3039,6 +3199,7 @@ async def approve_shadow(request, agent, insight_id):
             comment=f"Shadow approved by {actor}: insight#{insight_id}",
         )
 
+        chain_hash = ''
         async with agent_conn(agent) as cnx:
             cur = await cnx.cursor()
             try:
@@ -3056,6 +3217,7 @@ async def approve_shadow(request, agent, insight_id):
                 await cnx.commit()
             finally:
                 await cur.close()
+            chain_hash = await _chain_append(cnx, insight_id, action, target, 'approved', actor)
 
         return sanic_json({
             "success": True,
@@ -3064,6 +3226,7 @@ async def approve_shadow(request, agent, insight_id):
             "target": target,
             "dispatched": bool(soar_result.get('ok')),
             "soar_result": soar_result,
+            "chain_hash": chain_hash,
         })
     except Exception as e:
         return sanic_json({"success": False, "error": str(e)}, status=500)
@@ -3084,10 +3247,24 @@ async def reject_shadow(request, agent, insight_id):
         if not actor:
             actor = request.headers.get('X-Forwarded-User') or 'operator'
 
+        action_for_chain = ''
+        target_for_chain = ''
         async with agent_conn(agent) as cnx:
-            cur = await cnx.cursor()
+            cur = await cnx.cursor(aiomysql.DictCursor)
             try:
                 await cur.execute(
+                    "SELECT proposed_action, proposed_target FROM ai_analysis_results WHERE id = %s",
+                    (insight_id,),
+                )
+                meta = await cur.fetchone()
+                action_for_chain = (meta or {}).get('proposed_action') or ''
+                target_for_chain = (meta or {}).get('proposed_target') or ''
+            finally:
+                await cur.close()
+
+            cur2 = await cnx.cursor()
+            try:
+                await cur2.execute(
                     """
                     UPDATE ai_analysis_results
                     SET shadow_status = 'rejected',
@@ -3098,10 +3275,13 @@ async def reject_shadow(request, agent, insight_id):
                     """,
                     (actor, actor, (f' ({note})' if note else ''), insight_id),
                 )
-                affected = cur.rowcount
+                affected = cur2.rowcount
                 await cnx.commit()
             finally:
-                await cur.close()
+                await cur2.close()
+
+            if affected and action_for_chain:
+                await _chain_append(cnx, insight_id, action_for_chain, target_for_chain, 'rejected', actor, note)
 
         if not affected:
             return sanic_json({"success": False, "error": "not found or already finalized"}, status=404)
@@ -4805,12 +4985,12 @@ async def change_password(request):
 async def trigger_restart(request, agent):
     try:
         if is_soar_enabled():
-            resp = await call_agent_soar(agent, "restart_service", "zer0vuln-agent", comment="Restart from UI", background_queue=True)
+            resp = await call_agent_soar(agent, "restart_service", "sentora-agent", comment="Restart from UI", background_queue=True)
             cnx = await connect_db_for_agent(agent)
             cursor = await cnx.cursor()
             await cursor.execute(
                 "INSERT INTO soar_actions (action, target, status, comment) VALUES (%s, %s, %s, %s)",
-                ("restart_service", "zer0vuln-agent", "SUCCESS" if resp.get("ok") else "FAILED", "Restart from UI")
+                ("restart_service", "sentora-agent", "SUCCESS" if resp.get("ok") else "FAILED", "Restart from UI")
             )
             await cnx.commit()
             await cursor.close(); await cnx.close()
@@ -4824,12 +5004,12 @@ async def trigger_restart(request, agent):
 async def trigger_reload_auth(request, agent):
     try:
         if is_soar_enabled():
-            resp = await call_agent_soar(agent, "reload_auth", "zer0vuln-agent", comment="Auth reload from UI", background_queue=True)
+            resp = await call_agent_soar(agent, "reload_auth", "sentora-agent", comment="Auth reload from UI", background_queue=True)
             cnx = await connect_db_for_agent(agent)
             cursor = await cnx.cursor()
             await cursor.execute(
                 "INSERT INTO soar_actions (action, target, status, comment) VALUES (%s, %s, %s, %s)",
-                ("reload_auth", "zer0vuln-agent", "SUCCESS" if resp.get("ok") else "FAILED", "Auth reload from UI")
+                ("reload_auth", "sentora-agent", "SUCCESS" if resp.get("ok") else "FAILED", "Auth reload from UI")
             )
             await cnx.commit()
             await cursor.close(); await cnx.close()
@@ -5328,7 +5508,7 @@ async def periodic_threat_intel_update():
                 {"type": "hash", "value": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "source": "MalwareDB", "severity": "CRITICAL", "description": "Empty file hash (test)"}
             ]
             
-            async with aiomysql.create_pool(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, db="zer0vuln_hub", autocommit=True) as pool:
+            async with aiomysql.create_pool(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, db="sentora_hub", autocommit=True) as pool:
                 async with pool.acquire() as conn:
                     async with conn.cursor() as cur:
                         for ioc in mock_iocs:
@@ -5350,7 +5530,7 @@ async def periodic_threat_intel_update():
 @require_permission("read_telemetry")
 @app.route("/threat-intel")
 async def get_threat_intel(request):
-    async with aiomysql.create_pool(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, db="zer0vuln_hub", autocommit=True) as pool:
+    async with aiomysql.create_pool(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, db="sentora_hub", autocommit=True) as pool:
         async with pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute("SELECT * FROM threat_intel ORDER BY created_at DESC")
@@ -5364,7 +5544,7 @@ async def get_compliance_report(request):
     Generates a simple compliance score based on recent telemetry.
     """
     try:
-        async with aiomysql.create_pool(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, db="zer0vuln_hub", autocommit=True) as pool:
+        async with aiomysql.create_pool(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, db="sentora_hub", autocommit=True) as pool:
             async with pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
                     await cur.execute("SELECT COUNT(*) as count FROM vulnerabilities_report")
@@ -5400,7 +5580,7 @@ async def get_assets(request):
     Returns consolidated hardware inventory.
     """
     try:
-        async with aiomysql.create_pool(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, db="zer0vuln_hub", autocommit=True) as pool:
+        async with aiomysql.create_pool(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, db="sentora_hub", autocommit=True) as pool:
             async with pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
                     await cur.execute("SELECT * FROM hardware_inventory ORDER BY timestamp DESC")
@@ -7343,7 +7523,7 @@ async def search_logs_api(request):
             "sort": [{"@timestamp": {"order": "desc"}}]
         }
     
-    index_mask = f"zer0vuln-logs-{table.replace('_', '-')}" if table != "*" else "zer0vuln-logs-*"
+    index_mask = f"sentora-logs-{table.replace('_', '-')}" if table != "*" else "sentora-logs-*"
     
     resp = os_utils.search_logs(query_body, index_mask=index_mask)
     if not resp:

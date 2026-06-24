@@ -18,10 +18,10 @@ client = OpenSearch(
 async def index_log(agent: str, table: str, item: dict):
     """
     Index a single log entry into OpenSearch.
-    Index name pattern: zer0vuln-logs-<table_name>
+    Index name pattern: sentora-logs-<table_name>
     """
     try:
-        index_name = f"zer0vuln-logs-{table.replace('_', '-')}"
+        index_name = f"sentora-logs-{table.replace('_', '-')}"
         
         doc = dict(item)
         doc["agent_name"] = agent
@@ -39,7 +39,7 @@ async def index_log(agent: str, table: str, item: dict):
         print(f"[OpenSearch] Error indexing log: {e}")
         return None
 
-def search_logs(query_body: dict, index_mask: str = "zer0vuln-logs-*"):
+def search_logs(query_body: dict, index_mask: str = "sentora-logs-*"):
     """
     Search logs in OpenSearch.
     """

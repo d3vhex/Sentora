@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a defect in Zer0Vuln Community Edition.
+description: Report a defect in Sentora Community Edition.
 title: "[Bug] "
 labels: ["bug", "triage"]
 body:
@@ -14,7 +14,7 @@ body:
     id: version
     attributes:
       label: Version
-      description: Commit SHA, release tag, or `docker image inspect zer0vuln-server-app`
+      description: Commit SHA, release tag, or `docker image inspect sentora-server-app`
       placeholder: e.g. v1.0.0 or 7fac513
     validations:
       required: true

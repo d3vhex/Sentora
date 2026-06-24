@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Zer0Vuln Agent — Token-Based Installer (Linux)
+# Sentora Agent — Token-Based Installer (Linux)
 #
 # Usage:
 #   sudo ./deploy.sh --token <ENROLLMENT_TOKEN> --server <SERVER_URL>
@@ -17,7 +17,7 @@ NC='\033[0m'
 usage() {
     echo "Usage: sudo $0 --token <TOKEN> --server <SERVER_URL>"
     echo "  --token, -t   Enrollment token issued by the server"
-    echo "  --server, -s  Server base URL (e.g. https://zer0vuln.example.com)"
+    echo "  --server, -s  Server base URL (e.g. https://sentora.example.com)"
     echo "  --name        Optional agent name (default: hostname)"
     exit 1
 }
@@ -45,7 +45,7 @@ fi
 
 SERVER_URL="${SERVER_URL%/}"
 SERVER_IP="$(echo "$SERVER_URL" | sed -E 's|https?://([^:/]+).*|\1|')"
-INSTALL_DIR="/opt/zer0vuln-agent"
+INSTALL_DIR="/opt/sentora-agent"
 
 echo -e "${YELLOW}[*] Registering with $SERVER_URL ...${NC}"
 REG_RESP="$(curl -fsSL -X POST "$SERVER_URL/api/agents/register" \
@@ -91,10 +91,10 @@ cat > "$INSTALL_DIR/config.json" <<EOF
 EOF
 chmod 600 "$INSTALL_DIR/config.json"
 
-SERVICE_NAME="zer0vuln-agent"
+SERVICE_NAME="sentora-agent"
 cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
-Description=Zer0Vuln Agent
+Description=Sentora Agent
 After=network.target
 
 [Service]
@@ -113,4 +113,4 @@ systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
 systemctl restart "$SERVICE_NAME"
 
-echo -e "${GREEN}[+] Zer0Vuln Agent installed and running as: $AGENT_NAME${NC}"
+echo -e "${GREEN}[+] Sentora Agent installed and running as: $AGENT_NAME${NC}"
