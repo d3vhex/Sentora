@@ -161,6 +161,7 @@ def get_hardware_inventory():
                     insert_record_enc("hardware_inventory", {
                         "type": "pnp",
                         "name": item.get("FriendlyName"),
+                        "product_id": item.get("InstanceId", "N/A"),
                         "serial_number": item.get("InstanceId", "N/A"),
                         "status": "active"
                     })
