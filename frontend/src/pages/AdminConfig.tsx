@@ -29,18 +29,57 @@ const AdminConfig: React.FC = () => {
   });
   const [loading, setLoading] = useState(false);
 
+  type EmailTemplate = {
+    id?: number;
+    template_name: string;
+    subject_template: string;
+    body_template: string;
+  };
+  const [templates, setTemplates] = useState<EmailTemplate[]>([]);
+  const [editingTemplate, setEditingTemplate] = useState<EmailTemplate | null>(null);
+  const [templateDefaultName, setTemplateDefaultName] = useState('Critical Alerts (default)');
+
   useEffect(() => {
     fetchConfigs();
   }, []);
 
+  const handleSaveTemplate = async () => {
+    if (!editingTemplate) return;
+    try {
+      const res = await adminService.saveEmailTemplate(editingTemplate);
+      alert(res.message || 'Template saved.');
+      setEditingTemplate(null);
+      fetchConfigs();
+    } catch (err: any) {
+      alert(err?.response?.data?.message || 'Failed to save template.');
+    }
+  };
+
+  const handleDeleteTemplate = async (t: EmailTemplate) => {
+    if (!t.id) return;
+    if (!window.confirm(`Delete template "${t.template_name}"?`)) return;
+    try {
+      const res = await adminService.deleteEmailTemplate(t.id);
+      alert(res.message || 'Template deleted.');
+      fetchConfigs();
+    } catch (err: any) {
+      alert(err?.response?.data?.message || 'Failed to delete template.');
+    }
+  };
+
   const fetchConfigs = async () => {
     setLoading(true);
     try {
-      const [email, ai, ldap] = await Promise.all([
+      const [email, ai, ldap, tmpl] = await Promise.all([
         adminService.getEmailConfig(),
         adminService.getAiConfig('server'),
-        adminService.getLdapConfig()
+        adminService.getLdapConfig(),
+        adminService.getEmailTemplates().catch(() => null),
       ]);
+      if (tmpl?.status === 'success') {
+        setTemplates(tmpl.templates || []);
+        if (tmpl.default_name) setTemplateDefaultName(tmpl.default_name);
+      }
       
       if (email) {
         setEmailConfig({
@@ -143,6 +182,131 @@ const AdminConfig: React.FC = () => {
               <Save size={18} /> Save Email Config
             </button>
           </div>
+        </div>
+
+        {/* Email Templates — the bodies the alert mails actually use. There
+            was no way to see or edit these outside the database, so the
+            per-agent override the dispatcher looks for was unusable. */}
+        <div style={{ backgroundColor: 'var(--card-bg)', border: '1px solid var(--border-color)', borderRadius: '12px', padding: '32px', gridColumn: 'span 2' }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px', flexWrap: 'wrap', gap: '12px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+              <Mail color="var(--accent-secondary)" />
+              <h3 style={{ fontSize: '1.25rem' }}>Alert Mail Templates</h3>
+            </div>
+            <button
+              onClick={() => setEditingTemplate({ template_name: '', subject_template: '', body_template: '' })}
+              style={{ backgroundColor: 'rgba(59,130,246,0.1)', color: 'var(--accent-secondary)', padding: '8px 14px', borderRadius: '8px', fontWeight: 600, fontSize: '0.8125rem' }}
+            >
+              + New Template
+            </button>
+          </div>
+          <p style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)', marginBottom: '20px', lineHeight: 1.6 }}>
+            Critical-alert mail looks for a template named <code>Critical Alerts - Agent: &lt;name&gt;</code> and
+            falls back to <code>{templateDefaultName}</code> when the agent has none of its own.
+            Placeholders <code>{'{{agent}}'}</code> and <code>{'{{body}}'}</code> are substituted at send time.
+          </p>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            {templates.map(t => (
+              <div key={t.id} style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '16px',
+                padding: '14px 16px', borderRadius: '8px', border: '1px solid var(--border-color)',
+                backgroundColor: 'rgba(0,0,0,0.15)',
+              }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontWeight: 600, fontSize: '0.9375rem', display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                    {t.template_name}
+                    {t.template_name === templateDefaultName && (
+                      <span style={{ fontSize: '0.65rem', fontWeight: 700, padding: '2px 8px', borderRadius: '4px', backgroundColor: 'rgba(16,185,129,0.12)', color: 'var(--accent-success)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                        Fallback
+                      </span>
+                    )}
+                  </div>
+                  <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '4px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {t.subject_template}
+                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
+                  <button onClick={() => setEditingTemplate({ ...t })} style={{ padding: '6px 12px', borderRadius: '6px', border: '1px solid var(--border-color)', color: 'var(--text-primary)', fontSize: '0.75rem', fontWeight: 600 }}>
+                    Edit
+                  </button>
+                  <button
+                    onClick={() => handleDeleteTemplate(t)}
+                    disabled={t.template_name === templateDefaultName}
+                    title={t.template_name === templateDefaultName
+                      ? 'This is the fallback every agent without its own template uses'
+                      : 'Delete this template'}
+                    style={{
+                      padding: '6px 12px', borderRadius: '6px', fontSize: '0.75rem', fontWeight: 600,
+                      color: t.template_name === templateDefaultName ? 'var(--text-secondary)' : 'var(--accent-color)',
+                      backgroundColor: t.template_name === templateDefaultName ? 'transparent' : 'rgba(239,68,68,0.1)',
+                      cursor: t.template_name === templateDefaultName ? 'not-allowed' : 'pointer',
+                    }}
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+            ))}
+            {templates.length === 0 && (
+              <p style={{ fontSize: '0.875rem', color: 'var(--text-secondary)', padding: '20px', textAlign: 'center' }}>
+                No templates yet. Alert mail cannot be sent without one.
+              </p>
+            )}
+          </div>
+
+          {editingTemplate && (
+            <div style={{ marginTop: '20px', padding: '20px', borderRadius: '10px', border: '1px solid var(--border-neon)', backgroundColor: 'var(--bg-color)' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                <InputGroup
+                  label="Template Name"
+                  value={editingTemplate.template_name}
+                  onChange={val => setEditingTemplate({ ...editingTemplate, template_name: val })}
+                  placeholder="Critical Alerts - Agent: WIN-01"
+                />
+                <InputGroup
+                  label="Subject"
+                  value={editingTemplate.subject_template}
+                  onChange={val => setEditingTemplate({ ...editingTemplate, subject_template: val })}
+                  placeholder="[Sentora] Critical alerts on {{agent}}"
+                />
+                <div>
+                  <label style={{ fontSize: '0.75rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em', color: 'var(--text-secondary)', display: 'block', marginBottom: '8px' }}>
+                    Body
+                  </label>
+                  <textarea
+                    value={editingTemplate.body_template}
+                    onChange={e => setEditingTemplate({ ...editingTemplate, body_template: e.target.value })}
+                    spellCheck={false}
+                    placeholder={'Agent: {{agent}}\n\n{{body}}'}
+                    style={{
+                      width: '100%', height: '160px', backgroundColor: 'rgba(0,0,0,0.3)',
+                      border: '1px solid var(--border-color)', borderRadius: '8px', padding: '14px',
+                      color: 'white', fontFamily: 'monospace', fontSize: '0.8125rem',
+                      lineHeight: 1.6, outline: 'none', resize: 'vertical',
+                    }}
+                  />
+                </div>
+                <div style={{ display: 'flex', gap: '12px' }}>
+                  <button onClick={() => setEditingTemplate(null)} style={{ flex: 1, padding: '12px', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'white', fontWeight: 600 }}>
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleSaveTemplate}
+                    disabled={!editingTemplate.template_name.trim() || !editingTemplate.subject_template.trim() || !editingTemplate.body_template.trim()}
+                    style={{
+                      flex: 1, padding: '12px', borderRadius: '8px', color: 'white', fontWeight: 700,
+                      display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px',
+                      backgroundColor: (!editingTemplate.template_name.trim() || !editingTemplate.subject_template.trim() || !editingTemplate.body_template.trim())
+                        ? 'var(--border-color)' : 'var(--accent-secondary)',
+                    }}
+                  >
+                    <Save size={16} /> Save Template
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* AI Config */}

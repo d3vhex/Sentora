@@ -136,6 +136,10 @@ export const agentService = {
   deleteAutomation: (agent: string, id: number) => api.delete(`/${agent}/automations/${id}`).then(res => res.data),
   
   getAllAlerts: () => api.get('/all_alerts').then(res => res.data),
+  // Counts, per agent, with explicit coverage. Was "/api/compliance/report",
+  // which returned a score that mapped to no framework and pinned to zero on
+  // an ordinary fleet.
+  getExposureReport: () => api.get('/api/exposure/report').then(res => res.data),
   getServerResources: () => api.get('/server/resources').then(res => res.data),
   getGlobalStats: () => api.get('/api/global/stats').then(res => res.data),
   runManualAnalysis: (agent: string, limit: number = 100) => api.post(`/analyze-logs/${agent}`, { limit }).then(res => res.data),
@@ -161,6 +165,13 @@ export const adminService = {
   
   getEmailConfig: () => api.get('/email-config').then(res => res.data),
   saveEmailConfig: (data: any) => api.post('/email-config', data).then(res => res.data),
+
+  // Alert mail bodies. dispatch_critical_alerts() looks up a per-agent name
+  // ("Critical Alerts - Agent: WIN-01") and falls back to the default row, so
+  // this is where both the fallback and any per-agent override are edited.
+  getEmailTemplates: () => api.get('/email-templates').then(res => res.data),
+  saveEmailTemplate: (data: any) => api.post('/email-templates', data).then(res => res.data),
+  deleteEmailTemplate: (id: number) => api.delete(`/email-templates/${id}`).then(res => res.data),
   
   getAiConfig: (agent: string) => api.get(`/ai-config/${agent}`).then(res => res.data.config),
   updateAiConfig: (agent: string, data: any) => api.post(`/ai-config/${agent}`, data).then(res => res.data),

@@ -108,6 +108,7 @@ from ai.utils import load_ai_config, is_critical_log, save_ai_results
 from security import session as session_store
 from security import ssrf
 from core import config_validation
+from core import threat_feeds
 
 # Cookies are only marked Secure when the platform is actually served over
 # TLS; a Secure cookie on a plain-http lab deployment is silently dropped by
@@ -263,15 +264,17 @@ async def init_email_templates_table():
                         updated_at TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """)
-                # Seed the one template dispatch_critical_alerts asks for by
-                # name, so critical-alert mail works without the operator
-                # having to discover the required template_name first.
+                # `dispatch_critical_alerts` looks up a per-agent template name
+                # ("Critical Alerts - Agent: WIN-01"), so without this generic
+                # fallback an operator would have to create one row per
+                # enrolled endpoint before any alert mail went out — with a log
+                # line as the only symptom of not having done so.
                 cur.execute("""
                     INSERT IGNORE INTO email_templates
                         (template_name, subject_template, body_template)
                     VALUES (%s, %s, %s)
                 """, (
-                    "critical_alerts",
+                    DEFAULT_ALERT_TEMPLATE,
                     "[Sentora] Critical alerts on {{agent}}",
                     "Agent: {{agent}}\n\n{{body}}\n\n-- Sentora",
                 ))
@@ -1844,7 +1847,19 @@ async def verify_auth_wiring(app):
         # Diagnostics must never be what stops the server from booting.
         print(f"[Auth] Wiring self-check skipped: {e}")
 
-def send_email(template_name: str, context: dict) -> bool:
+DEFAULT_ALERT_TEMPLATE = "Critical Alerts (default)"
+
+
+def send_email(template_name: str, context: dict, fallback: str | None = None) -> bool:
+    """Send a templated mail.
+
+    `dispatch_critical_alerts` names its template per agent
+    ("Critical Alerts - Agent: WIN-01"), so an operator would have to hand-create
+    one row for every enrolled endpoint before any alert mail went out — and the
+    only symptom of not having done so was a line in the server log. `fallback`
+    keeps the per-agent override working while letting a generic template cover
+    the agents nobody has customised.
+    """
     config = get_mail_config()
     if not config['enabled']:
         print("[!] Email not enabled or configured")
@@ -1856,11 +1871,17 @@ def send_email(template_name: str, context: dict) -> bool:
             try:
                 cursor.execute("SELECT * FROM email_templates WHERE template_name = %s", (template_name,))
                 template = cursor.fetchone()
+                if not template and fallback:
+                    cursor.execute("SELECT * FROM email_templates WHERE template_name = %s", (fallback,))
+                    template = cursor.fetchone()
+                    if template:
+                        print(f"[i] Template '{template_name}' not found; using '{fallback}'.")
             finally:
                 cursor.close()
 
         if not template:
-            print(f"[!] Template '{template_name}' not found.")
+            print(f"[!] Template '{template_name}' not found"
+                  + (f" (fallback '{fallback}' missing too)." if fallback else "."))
             return False
 
         subject = render_template(template['subject_template'], context)
@@ -1914,7 +1935,8 @@ def dispatch_critical_alerts(agent: str, limit: int = 100) -> int:
 
                 if lines:
                     body = f"Critical Alerts from Agent: {agent}\n\n" + '\n'.join(lines)
-                    send_email(f'Critical Alerts - Agent: {agent}', {"body": body, "agent": agent})
+                    send_email(f'Critical Alerts - Agent: {agent}', {"body": body, "agent": agent},
+                               fallback=DEFAULT_ALERT_TEMPLATE)
                     cursor.executemany("UPDATE events_alert SET sent = TRUE WHERE id = %s", [(i,) for i in ids])
                     conn.commit()
                     print(f"[+] Processed {len(lines)} critical alerts for agent {agent}")
@@ -4075,6 +4097,102 @@ async def send_critical_alerts_agent(request, agent):
             "message": f"Error sending critical alerts for agent {agent}: {str(e)}"
         }, status=500)
 
+@app.get("/email-templates")
+@require_permission("set_email_config")
+async def list_email_templates(request):
+    """Templates with their bodies, for the editor.
+
+    `/<agent>/notifications/templates` returns names only and exists for the
+    playbook node picker. Editing content needs the whole row, and until now
+    there was no way to see or change one outside the database.
+    """
+    try:
+        async with userdb_conn() as cnx:
+            cur = await cnx.cursor(dictionary=True)
+            try:
+                await cur.execute(
+                    "SELECT id, template_name, subject_template, body_template, updated_at "
+                    "FROM email_templates ORDER BY template_name"
+                )
+                rows = await cur.fetchall()
+            finally:
+                await cur.close()
+        return sanic_json(
+            {"status": "success", "templates": rows, "default_name": DEFAULT_ALERT_TEMPLATE},
+            dumps=lambda o: pyjson.dumps(o, ensure_ascii=False, cls=CustomEncoder),
+        )
+    except Exception as e:
+        return sanic_json({"status": "error", "message": str(e)}, status=500)
+
+
+@app.post("/email-templates")
+@require_permission("set_email_config")
+async def upsert_email_template(request):
+    """Create or replace a template, keyed on its name."""
+    data = request.json or {}
+    name = (data.get("template_name") or "").strip()
+    subject = (data.get("subject_template") or "").strip()
+    body = (data.get("body_template") or "").strip()
+
+    missing = [f for f, v in (("template_name", name), ("subject_template", subject),
+                              ("body_template", body)) if not v]
+    if missing:
+        return sanic_json(
+            {"status": "error", "message": f"Missing required field(s): {', '.join(missing)}"},
+            status=400,
+        )
+
+    try:
+        async with userdb_conn() as cnx:
+            cur = await cnx.cursor()
+            try:
+                await cur.execute(
+                    """INSERT INTO email_templates (template_name, subject_template, body_template)
+                       VALUES (%s, %s, %s)
+                       ON DUPLICATE KEY UPDATE
+                           subject_template = VALUES(subject_template),
+                           body_template = VALUES(body_template)""",
+                    (name, subject, body),
+                )
+                await cnx.commit()
+            finally:
+                await cur.close()
+        await audit_log(request, "EMAIL_TEMPLATE_SAVE", name, "")
+        return sanic_json({"status": "success", "message": f"Template '{name}' saved."})
+    except Exception as e:
+        return sanic_json({"status": "error", "message": str(e)}, status=500)
+
+
+@app.delete("/email-templates/<template_id:int>")
+@require_permission("set_email_config")
+async def delete_email_template(request, template_id):
+    try:
+        async with userdb_conn() as cnx:
+            cur = await cnx.cursor()
+            try:
+                await cur.execute("SELECT template_name FROM email_templates WHERE id = %s", (template_id,))
+                row = await cur.fetchone()
+                if not row:
+                    return sanic_json({"status": "error", "message": "Template not found"}, status=404)
+                name = row[0]
+                # Deleting the fallback would silently stop alert mail for every
+                # agent that has no template of its own.
+                if name == DEFAULT_ALERT_TEMPLATE:
+                    return sanic_json({
+                        "status": "error",
+                        "message": f"'{name}' is the fallback used when an agent has no template of "
+                                   f"its own. Edit it instead of deleting it.",
+                    }, status=400)
+                await cur.execute("DELETE FROM email_templates WHERE id = %s", (template_id,))
+                await cnx.commit()
+            finally:
+                await cur.close()
+        await audit_log(request, "EMAIL_TEMPLATE_DELETE", name, "")
+        return sanic_json({"status": "success", "message": f"Template '{name}' deleted."})
+    except Exception as e:
+        return sanic_json({"status": "error", "message": str(e)}, status=500)
+
+
 @require_permission("set_email_config")
 @require_permission("manage_system")
 @app.route("/email-config", methods=["GET"])
@@ -6056,38 +6174,108 @@ async def trigger_agent_vuln_scan(request, agent):
     except Exception as e:
         return sanic_json({"ok": False, "error": str(e)}, status=500)
 
+MOCK_INDICATORS_TO_PURGE = [
+    # Seeded by the previous mock updater. The empty-string SHA-256 was
+    # labelled CRITICAL malware: matching against it would flag every empty
+    # file on every endpoint. The two IPs were illustrative, not sourced.
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "185.220.101.5",
+    "45.146.165.37",
+]
+
+
+async def purge_mock_threat_intel():
+    """Delete the hardcoded indicators the old updater wrote.
+
+    Removing them from the code is not enough — they are already in every
+    deployment's database, and the empty-hash row is an active false-positive
+    source. Matched on source too, so an operator who has legitimately added
+    one of these addresses by hand keeps it.
+    """
+    try:
+        with sync_mysql_conn("sentora_hub") as conn:
+            cur = conn.cursor()
+            try:
+                placeholders = ",".join(["%s"] * len(MOCK_INDICATORS_TO_PURGE))
+                cur.execute(
+                    f"""DELETE FROM threat_intel
+                         WHERE value IN ({placeholders})
+                           AND source IN ('TorExitNode', 'BruteForceList', 'MalwareDB')""",
+                    MOCK_INDICATORS_TO_PURGE,
+                )
+                removed = cur.rowcount
+                conn.commit()
+            finally:
+                cur.close()
+        if removed:
+            print(f"[ThreatIntel] Purged {removed} mock indicator(s) from the previous seeder.")
+    except Exception as e:
+        print(f"[ThreatIntel] Could not purge mock indicators: {e}")
+
+
 async def periodic_threat_intel_update():
+    """Refresh indicators from real feeds, hourly.
+
+    This used to insert three hardcoded rows. See core/threat_feeds.py for
+    what replaced it and how to point it at an internal mirror.
     """
-    Background worker to fetch IoCs from a mock threat intel source.
-    In production, this would call actual APIs (AlienVault, MISP, etc).
-    """
+    await purge_mock_threat_intel()
+
     while True:
         try:
-            print("[ThreatIntel] Refreshing IoCs...")
-            
-            mock_iocs = [
-                {"type": "ip", "value": "185.220.101.5", "source": "TorExitNode", "severity": "MEDIUM", "description": "Known Tor exit node"},
-                {"type": "ip", "value": "45.146.165.37", "source": "BruteForceList", "severity": "HIGH", "description": "SSH Brute force source"},
-                {"type": "hash", "value": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "source": "MalwareDB", "severity": "CRITICAL", "description": "Empty file hash (test)"}
-            ]
-            
-            async with aiomysql.create_pool(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, db="sentora_hub", autocommit=True) as pool:
-                async with pool.acquire() as conn:
-                    async with conn.cursor() as cur:
-                        for ioc in mock_iocs:
-                            await cur.execute(
-                                """
-                                INSERT INTO threat_intel (type, value, source, severity, description)
-                                VALUES (%s, %s, %s, %s, %s)
-                                ON DUPLICATE KEY UPDATE severity=%s, description=%s
-                                """,
-                                (ioc["type"], ioc["value"], ioc["source"], ioc["severity"], ioc["description"], ioc["severity"], ioc["description"])
+            if threat_feeds.mode() == "off":
+                print("[ThreatIntel] Disabled (THREAT_INTEL_MODE=off).")
+            else:
+                indicators, errors = await asyncio.to_thread(threat_feeds.fetch_all)
+
+                for err in errors:
+                    print(f"[ThreatIntel] feed error — {err}")
+
+                if indicators:
+                    def _write():
+                        with sync_mysql_conn("sentora_hub") as conn:
+                            cur = conn.cursor()
+                            try:
+                                cur.execute(
+                                    "ALTER TABLE threat_intel ADD COLUMN last_seen "
+                                    "TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP"
+                                )
+                            except Exception:
+                                pass  # already present
+                            cur.executemany(
+                                """INSERT INTO threat_intel
+                                       (type, value, source, severity, description, last_seen)
+                                   VALUES (%s, %s, %s, %s, %s, NOW())
+                                   ON DUPLICATE KEY UPDATE
+                                       source = VALUES(source),
+                                       severity = VALUES(severity),
+                                       description = VALUES(description),
+                                       last_seen = NOW()""",
+                                [(i.type, i.value, i.source, i.severity, i.description)
+                                 for i in indicators],
                             )
-            
-            print(f"[ThreatIntel] Successfully updated {len(mock_iocs)} IoCs.")
+                            written = cur.rowcount
+                            # Indicators that stopped appearing in the feeds.
+                            # An IP that hosted a C2 last quarter usually
+                            # belongs to someone else now.
+                            cur.execute(
+                                "DELETE FROM threat_intel "
+                                "WHERE source LIKE 'abuse.ch/%%' "
+                                "AND last_seen < (NOW() - INTERVAL %s DAY)",
+                                (threat_feeds.STALE_AFTER_DAYS,),
+                            )
+                            stale = cur.rowcount
+                            conn.commit()
+                            return written, stale
+
+                    written, stale = await asyncio.to_thread(_write)
+                    print(f"[ThreatIntel] {len(indicators)} indicator(s) from "
+                          f"{len(threat_feeds.enabled_feeds())} feed(s); pruned {stale} stale.")
+                elif not errors:
+                    print("[ThreatIntel] Feeds returned no indicators.")
         except Exception as e:
-            print(f"[ThreatIntel] Error: {e}")
-            
+            print(f"[ThreatIntel] Refresh failed: {e}")
+
         await asyncio.sleep(3600)
 
 @require_permission("read_telemetry")
@@ -6114,27 +6302,38 @@ async def get_threat_intel(request):
         return sanic_json({"status": "error", "message": str(e)}, status=500)
 
 @require_permission("read_telemetry")
-@app.route("/api/compliance/report")
-async def get_compliance_report(request):
-    """Compliance score derived from vulnerability and FIM telemetry.
+@app.route("/api/exposure/report", name="exposure_report")
+# Kept so anything already pointing at the old path keeps working. The name is
+# wrong for what it returns, which is why it is not the primary route.
+@app.route("/api/compliance/report", name="compliance_report_legacy")
+async def get_exposure_report(request):
+    """Fleet exposure: unpatched packages and recent file-integrity changes.
 
-    This queried `sentora_hub.vulnerabilities_report` and `sentora_hub.fim_data`,
-    neither of which exists — `init_hub_db()` only creates hardware_inventory
-    and threat_intel there. Both tables are per-agent (`<agent>_db`), so the
-    endpoint was written against a central aggregation that was never built.
+    This was `/api/compliance/report` and returned
+    `100 - (vulns * 2) - (fim * 5)` as a "compliance score". That is not
+    compliance — it maps to no framework, so it cannot be shown to an auditor;
+    it does not scale with fleet size, so ten vulnerabilities on one agent and
+    ten across fifty score identically; and at fifty vulnerabilities it pins to
+    zero, which is an ordinary state for a real fleet. A number nobody can
+    define is a number nobody can act on.
 
-    Creating the two tables empty in sentora_hub would have silenced the 500
-    while making the report permanently answer "EXCELLENT / 100" — a
-    compliance figure computed from nothing. It aggregates across agent
-    databases instead, which is where the data actually is.
+    It also queried `sentora_hub` for two tables that only exist per-agent, so
+    it had never returned anything but a 500. Creating them empty there would
+    have made it answer EXCELLENT/100 forever.
+
+    What is reported now is only what is actually measured: counts, per agent,
+    with explicit coverage. No score.
+
+    Severity breakdown is deliberately absent — `vulnerabilities_report` has no
+    severity column and its fields are encrypted at rest, so any grading would
+    have to be invented here.
     """
     try:
         agents = await _list_agent_names_sync()
 
-        vuln_count = 0
-        fim_count = 0
-        scanned: list[str] = []
+        per_agent: list[dict] = []
         unreachable: list[str] = []
+        totals = {"vulnerabilities": 0, "fim_changed": 0, "fim_new": 0, "fim_deleted": 0}
 
         for agent in agents:
             try:
@@ -6143,48 +6342,58 @@ async def get_compliance_report(request):
                     try:
                         await cur.execute("SELECT COUNT(*) FROM vulnerabilities_report")
                         row = await cur.fetchone()
-                        vuln_count += int(row[0]) if row else 0
+                        vulns = int(row[0]) if row else 0
 
+                        # Grouped rather than summed: "12 files changed" and
+                        # "12 files deleted" are very different mornings.
                         await cur.execute(
-                            "SELECT COUNT(*) FROM fim_data "
-                            "WHERE status != 'baseline' AND last_seen > NOW() - INTERVAL 1 DAY"
+                            "SELECT status, COUNT(*) FROM fim_data "
+                            "WHERE status IS NOT NULL AND status <> 'baseline' "
+                            "AND last_seen > NOW() - INTERVAL 1 DAY "
+                            "GROUP BY status"
                         )
-                        row = await cur.fetchone()
-                        fim_count += int(row[0]) if row else 0
+                        fim_rows = await cur.fetchall() or []
                     finally:
                         await cur.close()
-                scanned.append(agent)
+
+                fim = {str(s).lower(): int(c) for s, c in fim_rows}
+                entry = {
+                    "agent": agent,
+                    "vulnerabilities": vulns,
+                    "fim_changed": fim.get("changed", 0),
+                    "fim_new": fim.get("new", 0),
+                    "fim_deleted": fim.get("deleted", 0),
+                }
+                per_agent.append(entry)
+                for key in totals:
+                    totals[key] += entry[key]
             except Exception as e:
                 # A newly-enrolled agent may not have provisioned these tables
-                # yet. Skipping it is correct, but the caller has to be told —
-                # a score computed over half the fleet is not a fleet score.
-                print(f"[compliance] skipped {agent}: {e}")
+                # yet. Skipping is correct; hiding it is not — a total over
+                # half the fleet is not a fleet total.
+                print(f"[exposure] skipped {agent}: {e}")
                 unreachable.append(agent)
 
-        score = max(0, 100 - (vuln_count * 2) - (fim_count * 5))
-        status = ("EXCELLENT" if score > 90 else "GOOD" if score > 75
-                  else "WARNING" if score > 50 else "CRITICAL")
+        # Worst first: the operator wants to know where to start.
+        per_agent.sort(key=lambda a: (a["vulnerabilities"], a["fim_changed"]), reverse=True)
 
         return sanic_json({
-            "score": score,
-            "status": status,
-            "checks": {
-                "vulnerabilities": vuln_count,
-                "recent_fim_changes": fim_count,
-                # False when the score does not cover the whole fleet, so the
-                # UI can mark the figure as partial instead of presenting it
-                # as authoritative.
-                "valid": len(scanned) == len(agents) and bool(agents),
-            },
+            "status": "success",
+            "totals": totals,
+            "agents": per_agent,
             "coverage": {
                 "agents_total": len(agents),
-                "agents_scanned": len(scanned),
+                "agents_scanned": len(per_agent),
                 "agents_unreachable": unreachable,
+                # False when the numbers do not cover the whole fleet, so the
+                # UI can mark them partial rather than authoritative.
+                "complete": bool(agents) and not unreachable,
             },
+            "window": "fim counts cover the last 24 hours",
             "timestamp": datetime.now().isoformat(),
         })
     except Exception as e:
-        return sanic_json({"error": str(e)}, status=500)
+        return sanic_json({"status": "error", "message": str(e)}, status=500)
 
 @require_permission("read_telemetry")
 @app.route("/api/assets")
@@ -7519,7 +7728,8 @@ async def playbook_execute_real(request, agent):
                     raw_ctx = pyjson.loads(_render_with_ctx(ctx_str, ctx)) if ctx_str.strip().startswith("{") else {"body": _render_with_ctx(ctx_str, ctx)}
                 except Exception:
                     raw_ctx = {"body": _render_with_ctx(ctx_str, ctx)}
-                ok = send_email(_render_with_ctx(tname, ctx), raw_ctx)
+                ok = send_email(_render_with_ctx(tname, ctx), raw_ctx,
+                                fallback=DEFAULT_ALERT_TEMPLATE)
                 step["result"] = "sent" if ok else "failed"
                 step["ok"] = bool(ok)
                 timeline.append(step); continue

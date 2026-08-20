@@ -56,8 +56,12 @@ CREATE TABLE IF NOT EXISTS email_templates (
     updated_at TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- dispatch_critical_alerts() looks up a per-agent template name
+-- ("Critical Alerts - Agent: WIN-01"). This generic row is the fallback
+-- send_email() uses when no agent-specific template has been created, so
+-- alert mail works out of the box instead of failing with a log line.
 INSERT IGNORE INTO email_templates (template_name, subject_template, body_template)
-VALUES ('critical_alerts',
+VALUES ('Critical Alerts (default)',
         '[Sentora] Critical alerts on {{agent}}',
         'Agent: {{agent}}\n\n{{body}}\n\n-- Sentora');
 

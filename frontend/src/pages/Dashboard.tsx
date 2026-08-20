@@ -19,6 +19,7 @@ const Dashboard: React.FC = () => {
   const [aiInsights, setAiInsights] = useState<any[]>([]);
   const [allInsights, setAllInsights] = useState<any[]>([]);
   const [dbStatus, setDbStatus] = useState<any>(null);
+  const [exposure, setExposure] = useState<any>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -30,14 +31,16 @@ const Dashboard: React.FC = () => {
   const fetchData = async () => {
     setLoading(true);
     try {
-      const [agentList, allAlerts, serverRes, gStats, aiRes, dbRes] = await Promise.all([
+      const [agentList, allAlerts, serverRes, gStats, aiRes, dbRes, expRes] = await Promise.all([
         agentService.getAgents(),
         agentService.getAllAlerts(),
         agentService.getServerResources(),
         agentService.getGlobalStats(),
         agentService.getCustom('/api/ai-insights/all'),
         agentService.getCustom('/db-status').catch(() => null),
+        agentService.getExposureReport().catch(() => null),
       ]);
+      setExposure(expRes);
       setAgents(agentList || []);
       setAlerts(allAlerts || []);
       setResources(serverRes);
@@ -268,7 +271,69 @@ const Dashboard: React.FC = () => {
             </div>
           </div>
           
-          <Link to="/ai-analysis" className="card" style={{ 
+          {/* Fleet Exposure — counts, not a score. The endpoint behind this
+              used to return "compliance: 100 - vulns*2 - fim*5", which pinned
+              to zero on any real fleet and mapped to no framework. */}
+          <div className="card" style={{ padding: '24px' }}>
+            <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: '20px', gap: '12px' }}>
+              <h3 style={{ fontSize: '1.125rem', fontWeight: 700 }}>Fleet Exposure</h3>
+              <span style={{ fontSize: '0.7rem', color: 'var(--text-secondary)' }}>FIM: last 24h</span>
+            </div>
+
+            {!exposure || exposure.status !== 'success' ? (
+              <p style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)' }}>
+                Exposure data unavailable.
+              </p>
+            ) : (
+              <>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginBottom: '16px' }}>
+                  <ExposureStat
+                    label="Vulnerabilities"
+                    value={exposure.totals?.vulnerabilities ?? 0}
+                    tone={exposure.totals?.vulnerabilities > 0 ? 'warn' : 'ok'}
+                  />
+                  <ExposureStat
+                    label="Files changed"
+                    value={exposure.totals?.fim_changed ?? 0}
+                    tone={exposure.totals?.fim_changed > 0 ? 'warn' : 'ok'}
+                  />
+                  <ExposureStat
+                    label="Files added"
+                    value={exposure.totals?.fim_new ?? 0}
+                    tone="neutral"
+                  />
+                  <ExposureStat
+                    label="Files deleted"
+                    value={exposure.totals?.fim_deleted ?? 0}
+                    tone={exposure.totals?.fim_deleted > 0 ? 'bad' : 'ok'}
+                  />
+                </div>
+
+                {/* Worst agents first — where to start, not just how bad. */}
+                {(exposure.agents || []).slice(0, 3).map((a: any) => (
+                  <div key={a.agent} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.75rem', padding: '6px 0', borderTop: '1px solid var(--border-color)' }}>
+                    <span style={{ color: 'var(--text-primary)', fontWeight: 600 }}>{a.agent}</span>
+                    <span style={{ color: 'var(--text-secondary)' }}>
+                      {a.vulnerabilities} vulns · {a.fim_changed + a.fim_new + a.fim_deleted} file events
+                    </span>
+                  </div>
+                ))}
+
+                {/* Partial numbers must say so. A total over half the fleet is
+                    not a fleet total. */}
+                {exposure.coverage && !exposure.coverage.complete && (
+                  <p style={{ fontSize: '0.7rem', color: 'var(--accent-warning)', marginTop: '12px', lineHeight: 1.5 }}>
+                    Partial: {exposure.coverage.agents_scanned} of {exposure.coverage.agents_total} agents scanned
+                    {exposure.coverage.agents_unreachable?.length
+                      ? ` (no data from ${exposure.coverage.agents_unreachable.join(', ')})`
+                      : ''}
+                  </p>
+                )}
+              </>
+            )}
+          </div>
+
+          <Link to="/ai-analysis" className="card" style={{
             borderColor: 'var(--border-color)', 
             padding: '24px', 
             display: 'flex', 
@@ -291,6 +356,21 @@ const Dashboard: React.FC = () => {
           </Link>
         </div>
       </div>
+    </div>
+  );
+};
+
+const ExposureStat: React.FC<{ label: string; value: number; tone: 'ok' | 'warn' | 'bad' | 'neutral' }> = ({ label, value, tone }) => {
+  const color = value === 0
+    ? 'var(--text-secondary)'
+    : tone === 'bad' ? 'var(--accent-color)'
+      : tone === 'warn' ? 'var(--accent-warning)'
+        : tone === 'ok' ? 'var(--accent-success)'
+          : 'var(--text-primary)';
+  return (
+    <div>
+      <div style={{ fontSize: '1.5rem', fontWeight: 800, color, lineHeight: 1.2 }}>{value}</div>
+      <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: '2px' }}>{label}</div>
     </div>
   );
 };
