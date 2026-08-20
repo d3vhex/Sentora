@@ -112,7 +112,16 @@ cd Sentora-Community-Edition
 
 # .env holds your local secrets. Never commit it.
 cp .env.example .env
-# Edit .env: at minimum change DB_PASSWORD.
+
+# Generate the machine-generated secrets (FERNET_KEY, RABBITMQ_PASSWORD,
+# AGENT_SHARED_SECRET, OPENSEARCH_PASSWORD). Safe to re-run — it never
+# overwrites a value that is already set.
+python scripts/init_secrets.py
+
+# Then set DB_PASSWORD by hand. Compose refuses to start without it.
+# On an existing deployment, rotate it with scripts/rotate_db_password.py
+# instead — MySQL fixes the root password at first init, so editing .env
+# alone locks the app out rather than changing the account.
 
 # Build the agent binary once. The server serves it via
 # /api/agent/download/{linux,windows}; skipping this means agents can't be
@@ -143,16 +152,27 @@ and registers itself as a scheduled task / systemd unit.
 
 ## Services in the compose
 
-| Service | Port | Purpose |
-| :--- | :--- | :--- |
-| `app` | `:8000` | REST API + React UI |
-| `ingest` | `:5001` | TCP log collector (the agent sends here) |
-| `db` | `:3307` | MySQL 8.0 (host port; 3306 inside the network) |
-| `rabbitmq` | `:5672` / `:15672` | Job queue + management UI |
-| `ollama` | `:11434` | Local LLM runtime |
-| `opensearch` | `:9200` | Full-text log search |
-| `opensearch-dashboards` | `:5601` | Optional Kibana-style explorer |
-| `ai-worker-{automation,manual,defensive}` |   | LLM analysis workers |
+| Service | Port | Reachable from | Purpose |
+| :--- | :--- | :--- | :--- |
+| `app` | `:8000` | anywhere | REST API + React UI |
+| `ingest` | `:5001` | anywhere | TCP log collector (the agent sends here) |
+| `db` | `:3307` | localhost | MySQL 8.0 (3306 inside the network) |
+| `rabbitmq` | `:5672` / `:15672` | localhost | Job queue + management UI |
+| `ollama` | `:11434` | localhost | Local LLM runtime |
+| `opensearch` | `:9200` | localhost | Full-text log search |
+| `opensearch-dashboards` | `:5601` | localhost | Optional Kibana-style explorer |
+| `ai-worker-{automation,manual,defensive}` |   | — | LLM analysis workers |
+
+Only `app` and `ingest` listen on all interfaces. The rest bind to
+`BIND_ADDR` (default `127.0.0.1`), because none of them authenticate in the
+default configuration — OpenSearch runs with its security plugin disabled and
+Dashboards is an unauthenticated view of every collected log. Expose one by
+putting it behind the same reverse proxy and auth as `app`, not by widening
+`BIND_ADDR`.
+
+The "Open Dashboards" button in Log Explorer links to port 5601 on the
+server's hostname, so it works from the host itself; remote operators need
+that reverse proxy.
 
 ---
 
@@ -219,6 +239,55 @@ verdicts before unleashing real `BLOCK_IP` / `ISOLATE_HOST` etc.
 ---
 
 ## Security notes
+
+### Authentication
+
+The UI authenticates with a server-side session: login issues an opaque token
+in an `HttpOnly` cookie, and `userdb.sessions` is the authority. Only the
+SHA-256 of the token is stored, so a database dump yields nothing presentable.
+
+Two clocks apply, both configurable in `.env`:
+
+| Setting | Default | Meaning |
+| :--- | :--- | :--- |
+| `SESSION_IDLE_MINUTES` | `60` | Session dies this long after its last request |
+| `SESSION_ABSOLUTE_HOURS` | `12` | Hard ceiling regardless of activity |
+| `SESSION_COOKIE_SECURE` | `0` | Set to `1` once TLS terminates in front of the app |
+| `SESSION_COOKIE_SAMESITE` | `Lax` | `Lax` blocks the cross-site POST/XHR that CSRF needs |
+
+Sessions are revoked immediately on password change, admin password reset,
+role change and account deletion — an admin removing someone's access no
+longer leaves their open tab working.
+
+Every route is **deny-by-default**: without a valid session a request is
+rejected before the handler runs. The exceptions are the login endpoint, the
+SPA shell, static assets, and the agent-facing endpoints, which authenticate
+with `X-Agent-Key` or an enrollment token instead.
+
+`X-User-ID` is still sent by the frontend, but it is no longer identity — the
+server validates it against the session and rejects a mismatch. Because
+browsers cannot attach custom headers to cross-site requests without a CORS
+preflight, requiring it on state-changing requests backs up `SameSite` as a
+second CSRF control.
+
+Route protection is declared with `@require_permission(...)` and enforced by
+middleware through a registry, so it applies regardless of which side of
+`@app.route` the decorator sits on. The boot log prints the tally:
+
+```
+[Auth] Routes: <n> permission-gated, <n> session-only, <n> public.
+```
+
+If that line reports `0 permission-gated`, RBAC is not being enforced — treat
+it as an outage.
+
+### CORS
+
+`CORS_ORIGINS` defaults to empty. In the normal deployment this app serves the
+SPA itself, so requests are same-origin and no entry is needed. A wildcard is
+rejected outright: browsers refuse `Access-Control-Allow-Origin: *` on any
+request carrying cookies. Split-origin deployments must list explicit origins
+and set `SESSION_COOKIE_SAMESITE=None` with `SESSION_COOKIE_SECURE=1`.
 
 ### Default secrets
 

@@ -1,9 +1,46 @@
+# Secrets — `COPY . /app` would otherwise bake these into every layer of the
+# image, where anyone who can pull it can read them back out. Compose supplies
+# the same values at runtime via `env_file`, so nothing needs them at build
+# time.
+.env
+.env.*
+!.env.example
+data/
+*.pem
+
+# Note: certs/ is deliberately NOT excluded. app.py's optional TLS defaults to
+# certs/server.{crt,key}, and the bundled pair is the public self-signed dev
+# cert documented in the README — it grants no trust. Supply real certs by
+# mounting them over certs/ or by pointing TLS_CERT / TLS_KEY elsewhere.
+
+# Build output and dependencies (rebuilt inside the image)
 node_modules/
 frontend/node_modules/
 frontend/dist/
-ollama/
-.agent/
 __pycache__/
-.git/
-*.exe
+*.py[cod]
+.venv/
+venv/
+
+# Local model weights — gigabytes, and re-pulled by ollama-init
+ollama/
+models/
+*.gguf
 *.bin
+*.onnx
+
+# Not needed at runtime. docs/ alone carries ~28 MB of pptx/pdf.
+.git/
+.github/
+docs/
+tests/
+.pytest_cache/
+CONTRIBUTING.md
+SECURITY.md
+
+# Local tooling
+.agent/
+.claude/
+.idea/
+.vscode/
+*.exe
