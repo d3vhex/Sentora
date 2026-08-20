@@ -107,6 +107,7 @@ app.static("/vite.svg", "./frontend/dist/vite.svg", name="frontend_logo")
 from ai.utils import load_ai_config, is_critical_log, save_ai_results
 from security import session as session_store
 from security import ssrf
+from core import config_validation
 
 # Cookies are only marked Secure when the platform is actually served over
 # TLS; a Secure cookie on a plain-http lab deployment is silently dropped by
@@ -3854,20 +3855,59 @@ async def get_agent_config_proxy(request, agent, cfg_type):
         return sanic_json({"status": "error", "message": str(e)}, status=500)
 
 @require_permission("manage_agent")
+@app.post("/<agent>/config/<cfg_type>/validate")
+async def validate_agent_config(request, agent, cfg_type):
+    """Check a config without pushing it, so the editor can lint as you type."""
+    data = request.json or {}
+    issues = config_validation.validate(cfg_type, data.get("content", ""))
+    return sanic_json({
+        "status": "success",
+        "valid": not config_validation.blocking(issues),
+        "issues": [i.to_dict() for i in issues],
+    })
+
+
+@require_permission("manage_agent")
 @app.route("/<agent>/config/<cfg_type>", methods=["POST"])
 async def set_agent_config_proxy(request, agent, cfg_type):
-    """Proxy request to agent to set a YAML config file"""
-    if cfg_type not in ["rules", "log_paths", "file_scan"]:
+    """Validate a YAML config, then push it to the agent.
+
+    This forwarded the request body unread. A typo therefore reached the
+    sensor, where it surfaced as the agent quietly not detecting things any
+    more — nothing in the UI looked wrong, which is the worst way for a
+    security tool to fail. Nothing reaches an endpoint now unless it parses,
+    has the right shape, and has regexes that actually compile.
+    """
+    if cfg_type not in config_validation.CONFIG_TYPES:
         return sanic_json({"status": "error", "message": "Invalid config type"}, status=400)
+
+    data = request.json or {}
+    content = data.get("content", "")
+
+    issues = config_validation.validate(cfg_type, content)
+    errors = config_validation.blocking(issues)
+    if errors:
+        await audit_log(request, "CONFIG_PUSH_REJECTED", f"{agent}/{cfg_type}",
+                        f"{len(errors)} blocking issue(s)")
+        return sanic_json({
+            "status": "error",
+            "message": f"Config rejected: {len(errors)} problem(s) found. Nothing was sent to the agent.",
+            "issues": [i.to_dict() for i in issues],
+        }, status=400)
 
     try:
         base = await _get_agent_http_base(agent)
         keys = await _get_agent_keys(agent)
         url = f"{base}/config/{cfg_type}"
-        data = request.json or {}
 
         resp = await asyncio.to_thread(_try_agent_request, "POST", url, keys, data, 5)
-        return sanic_json(resp.json(), status=resp.status_code)
+        await audit_log(request, "CONFIG_PUSH", f"{agent}/{cfg_type}",
+                        f"{len(content)} bytes, {len(issues)} warning(s)")
+        body = resp.json()
+        # Warnings survive a successful push so the operator still sees them.
+        if isinstance(body, dict) and issues:
+            body["issues"] = [i.to_dict() for i in issues]
+        return sanic_json(body, status=resp.status_code)
     except Exception as e:
         return sanic_json({"status": "error", "message": str(e)}, status=500)
 

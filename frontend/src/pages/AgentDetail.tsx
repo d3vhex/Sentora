@@ -71,6 +71,10 @@ const AgentDetail: React.FC = () => {
   const [configType, setConfigType] = useState('rules');
   const [configContent, setConfigContent] = useState('');
   const [configLoading, setConfigLoading] = useState(false);
+  const [configIssues, setConfigIssues] = useState<ConfigIssue[]>([]);
+  const [configChecking, setConfigChecking] = useState(false);
+  const [configStatus, setConfigStatus] = useState<{ ok: boolean; message: string } | null>(null);
+  const configTextareaRef = React.useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     if (agentName) {
@@ -128,14 +132,44 @@ const AgentDetail: React.FC = () => {
     }
   };
 
+  // Lint as you type, debounced. The server owns the rules — duplicating them
+  // in the browser would mean two implementations drifting apart, and the
+  // browser's copy being the one operators trust.
+  useEffect(() => {
+    if (!agentName || activeTab !== 'config' || !configContent.trim()) {
+      setConfigIssues([]);
+      return;
+    }
+    const t = setTimeout(async () => {
+      setConfigChecking(true);
+      try {
+        const res = await agentService.validateAgentConfig(agentName, configType, configContent);
+        setConfigIssues(res.issues || []);
+      } catch {
+        setConfigIssues([]);   // lint is advisory; the save still validates
+      } finally {
+        setConfigChecking(false);
+      }
+    }, 600);
+    return () => clearTimeout(t);
+  }, [configContent, configType, agentName, activeTab]);
+
   const handleSaveConfig = async () => {
     if (!agentName) return;
     setConfigLoading(true);
+    setConfigStatus(null);
     try {
-      await agentService.setAgentYamlConfig(agentName, configType, configContent);
-      alert("Configuration updated successfully!");
-    } catch (err) {
-      alert("Failed to update configuration. Ensure agent is reachable.");
+      const res = await agentService.setAgentYamlConfig(agentName, configType, configContent);
+      setConfigIssues(res.issues || []);
+      setConfigStatus({ ok: true, message: res.message || 'Configuration pushed to the agent.' });
+    } catch (err: any) {
+      // A 400 carries the validation issues; nothing reached the agent.
+      const body = err?.response?.data;
+      setConfigIssues(body?.issues || []);
+      setConfigStatus({
+        ok: false,
+        message: body?.message || 'Failed to update configuration. Ensure the agent is reachable.',
+      });
     } finally {
       setConfigLoading(false);
     }
@@ -374,34 +408,82 @@ const AgentDetail: React.FC = () => {
                 <ConfigTypeButton label="Paths" active={configType === 'log_paths'} onClick={() => setConfigType('log_paths')} />
                 <ConfigTypeButton label="Scan" active={configType === 'file_scan'} onClick={() => setConfigType('file_scan')} />
               </div>
-              <button 
-                onClick={handleSaveConfig}
-                disabled={configLoading}
-                style={{ backgroundColor: 'var(--accent-secondary)', color: 'white', padding: '10px 20px', borderRadius: '8px', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px', opacity: configLoading ? 0.5 : 1 }}
-              >
-                {configLoading ? <RefreshCw size={18} className="animate-spin" /> : <Save size={18} />}
-                Save
-              </button>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                {configChecking && (
+                  <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>Checking…</span>
+                )}
+                {!configChecking && configContent.trim() && (
+                  <ConfigVerdict issues={configIssues} />
+                )}
+                <button
+                  onClick={handleSaveConfig}
+                  disabled={configLoading || configIssues.some(i => i.severity === 'error')}
+                  title={
+                    configIssues.some(i => i.severity === 'error')
+                      ? 'Fix the errors below first — a broken config stops the sensor detecting anything'
+                      : 'Push this config to the agent'
+                  }
+                  style={{
+                    backgroundColor: configIssues.some(i => i.severity === 'error')
+                      ? 'var(--border-color)' : 'var(--accent-secondary)',
+                    color: 'white', padding: '10px 20px', borderRadius: '8px', fontWeight: 700,
+                    display: 'flex', alignItems: 'center', gap: '8px',
+                    opacity: configLoading ? 0.5 : 1,
+                    cursor: configIssues.some(i => i.severity === 'error') ? 'not-allowed' : 'pointer',
+                  }}
+                >
+                  {configLoading ? <RefreshCw size={18} className="animate-spin" /> : <Save size={18} />}
+                  Save
+                </button>
+              </div>
             </div>
+
+            {configStatus && (
+              <div style={{
+                marginBottom: '16px', padding: '12px 14px', borderRadius: '8px', fontSize: '0.8125rem',
+                backgroundColor: configStatus.ok ? 'rgba(16,185,129,0.08)' : 'rgba(239,68,68,0.08)',
+                border: `1px solid ${configStatus.ok ? 'rgba(16,185,129,0.25)' : 'rgba(239,68,68,0.25)'}`,
+                color: configStatus.ok ? 'var(--accent-success)' : '#fca5a5',
+              }}>
+                {configStatus.message}
+              </div>
+            )}
+
+            <ConfigIssueList
+              issues={configIssues}
+              onJump={(line) => {
+                // Put the caret on the offending line so the operator lands on
+                // it instead of counting rows in a 2000-line rules file.
+                const ta = configTextareaRef.current;
+                if (!ta) return;
+                const offset = configContent.split('\n').slice(0, line - 1).join('\n').length;
+                ta.focus();
+                ta.setSelectionRange(offset, offset);
+                const lineHeight = 22;
+                ta.scrollTop = Math.max(0, (line - 4) * lineHeight);
+              }}
+            />
+
             <div style={{ position: 'relative' }}>
-              <textarea 
+              <textarea
+                ref={configTextareaRef}
                 value={configContent}
                 onChange={e => setConfigContent(e.target.value)}
                 spellCheck={false}
-                style={{ 
-                  width: '100%', 
-                  height: '600px', 
-                  backgroundColor: 'var(--bg-color)', 
-                  border: '1px solid var(--border-color)', 
-                  borderRadius: 'var(--radius-md)', 
-                  padding: '24px', 
-                  color: 'white', 
-                  fontFamily: 'monospace', 
+                style={{
+                  width: '100%',
+                  height: '600px',
+                  backgroundColor: 'var(--bg-color)',
+                  border: `1px solid ${configIssues.some(i => i.severity === 'error') ? 'rgba(239,68,68,0.4)' : 'var(--border-color)'}`,
+                  borderRadius: 'var(--radius-md)',
+                  padding: '24px',
+                  color: 'white',
+                  fontFamily: 'monospace',
                   fontSize: '0.875rem',
                   lineHeight: '1.6',
                   outline: 'none',
                   resize: 'none'
-                }} 
+                }}
               />
             </div>
           </div>
@@ -993,6 +1075,67 @@ const AlertsTab: React.FC<{ rows: AlertRow[] }> = ({ rows }) => {
           </tbody>
         </table>
       </div>
+    </div>
+  );
+};
+
+export type ConfigIssue = { line: number | null; message: string; severity: 'error' | 'warning' };
+
+const ConfigVerdict: React.FC<{ issues: ConfigIssue[] }> = ({ issues }) => {
+  const errs = issues.filter(i => i.severity === 'error').length;
+  const warns = issues.length - errs;
+  const [color, bg, label] =
+    errs > 0 ? ['#ef4444', 'rgba(239,68,68,0.10)', `${errs} error${errs > 1 ? 's' : ''}`]
+      : warns > 0 ? ['#f59e0b', 'rgba(245,158,11,0.10)', `${warns} warning${warns > 1 ? 's' : ''}`]
+        : ['#10b981', 'rgba(16,185,129,0.10)', 'Valid'];
+
+  return (
+    <span style={{
+      padding: '4px 10px', borderRadius: '6px', fontSize: '0.7rem', fontWeight: 700,
+      color, backgroundColor: bg, border: `1px solid ${color}33`,
+      textTransform: 'uppercase', letterSpacing: '0.04em', whiteSpace: 'nowrap',
+    }}>
+      {label}
+    </span>
+  );
+};
+
+const ConfigIssueList: React.FC<{ issues: ConfigIssue[]; onJump: (line: number) => void }> = ({ issues, onJump }) => {
+  if (!issues.length) return null;
+  // Errors first: they are what blocks the save.
+  const ordered = [...issues].sort((a, b) =>
+    (a.severity === b.severity ? (a.line ?? 0) - (b.line ?? 0) : a.severity === 'error' ? -1 : 1));
+
+  return (
+    <div style={{
+      marginBottom: '16px', border: '1px solid var(--border-color)', borderRadius: '8px',
+      overflow: 'hidden', maxHeight: '200px', overflowY: 'auto',
+    }} className="custom-scrollbar">
+      {ordered.map((issue, i) => {
+        const isError = issue.severity === 'error';
+        return (
+          <div
+            key={i}
+            onClick={() => issue.line && onJump(issue.line)}
+            style={{
+              display: 'flex', alignItems: 'flex-start', gap: '10px',
+              padding: '8px 12px', fontSize: '0.8125rem',
+              borderTop: i === 0 ? 'none' : '1px solid var(--border-color)',
+              backgroundColor: isError ? 'rgba(239,68,68,0.05)' : 'rgba(245,158,11,0.04)',
+              cursor: issue.line ? 'pointer' : 'default',
+            }}
+            title={issue.line ? 'Jump to this line' : undefined}
+          >
+            <span style={{
+              fontFamily: 'monospace', fontSize: '0.75rem', fontWeight: 700, minWidth: '52px',
+              color: isError ? '#ef4444' : '#f59e0b',
+            }}>
+              {issue.line ? `L${issue.line}` : '—'}
+            </span>
+            <span style={{ color: 'var(--text-primary)', lineHeight: 1.5 }}>{issue.message}</span>
+          </div>
+        );
+      })}
     </div>
   );
 };
