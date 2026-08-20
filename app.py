@@ -80,7 +80,15 @@ ENV_PATH = pathlib.Path(".env")
 if ENV_PATH.exists():
     load_dotenv(dotenv_path=ENV_PATH)
 
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+# A credentialed request cannot use a wildcard origin: the browser rejects
+# `Access-Control-Allow-Origin: *` outright whenever cookies are attached. In
+# the normal deployment this app serves the SPA itself, so requests are
+# same-origin and no CORS entry is needed at all — hence the empty default.
+if "*" in CORS_ORIGINS:
+    print("[!] CORS_ORIGINS='*' is incompatible with cookie authentication and was ignored. "
+          "List explicit origins if the UI is served from a different host.")
+    CORS_ORIGINS = [o for o in CORS_ORIGINS if o != "*"]
 DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
 DB_USER = os.getenv("DB_USER", "root")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "my-secret-pw")
@@ -91,12 +99,29 @@ app = Sanic("SIEMLoggerAPI")
 app.config.RESPONSE_TIMEOUT = 600
 app.config.REQUEST_TIMEOUT = 600
 app.config.WORKER_ACK_TIMEOUT = 60.0
-CORS(app, origins=CORS_ORIGINS)
+CORS(app, origins=CORS_ORIGINS, supports_credentials=True)
 
 app.static("/assets", "./frontend/dist/assets", name="frontend_assets")
 app.static("/vite.svg", "./frontend/dist/vite.svg", name="frontend_logo")
 
 from ai.utils import load_ai_config, is_critical_log, save_ai_results
+from security import session as session_store
+from security import ssrf
+
+# Cookies are only marked Secure when the platform is actually served over
+# TLS; a Secure cookie on a plain-http lab deployment is silently dropped by
+# the browser and nobody can log in. Set SESSION_COOKIE_SECURE=1 in .env once
+# you terminate TLS in front of the app.
+SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE", "0").lower() in ("1", "true", "yes", "on")
+
+# 'Lax' blocks the cookie on cross-site POST/XHR, which is the CSRF case that
+# matters, while staying compatible with normal same-origin use. 'Strict' is
+# available for deployments that want it; 'None' requires Secure and exists
+# only for split-origin setups.
+SESSION_COOKIE_SAMESITE = os.getenv("SESSION_COOKIE_SAMESITE", "Lax").strip().capitalize()
+if SESSION_COOKIE_SAMESITE not in ("Lax", "Strict", "None"):
+    print(f"[!] Invalid SESSION_COOKIE_SAMESITE={SESSION_COOKIE_SAMESITE!r}; falling back to 'Lax'.")
+    SESSION_COOKIE_SAMESITE = "Lax"
 
 AGENT_SHARED_SECRET = os.getenv("AGENT_SHARED_SECRET", "") or os.getenv("AGENT_SHARED_SECRET", "")
 
@@ -215,10 +240,25 @@ async def init_enrollment_tables():
     except Exception as e:
         print(f"[Enrollment] Error initializing tables: {e}")
 
+async def init_session_table():
+    """Ensure the `sessions` table exists in userdb (idempotent migration)."""
+    try:
+        with sync_mysql_conn("userdb") as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(session_store.CREATE_TABLE_SQL)
+                conn.commit()
+            finally:
+                cur.close()
+        print("[Session] Table ready in userdb.")
+    except Exception as e:
+        print(f"[Session] Error initializing table: {e}")
+
 @app.listener("main_process_start")
 async def setup_hub(app):
     await init_hub_db()
     await init_enrollment_tables()
+    await init_session_table()
 
 
 def is_soar_enabled() -> bool:
@@ -454,6 +494,18 @@ def _as_bool(val):
     return False
 
 def load_or_create_fernet_from_env():
+    """Resolve the server-side Fernet key, which protects at-rest columns.
+
+    Normally supplied as `FERNET_KEY` in the environment (compose passes it
+    through from .env). The fallback generates one and writes it back to .env
+    so it survives a restart — but the container runs as a non-root user and
+    /app is not writable, so that path only works for a bare-metal dev run.
+
+    Generating a key we cannot persist would be the worst outcome: every
+    restart would produce a different key and silently render previously
+    encrypted values unreadable. So a failed write is fatal and says exactly
+    what to do about it.
+    """
     key_b64 = os.getenv("FERNET_KEY")
     if key_b64:
         return Fernet(key_b64.encode())
@@ -463,10 +515,21 @@ def load_or_create_fernet_from_env():
     key_b64 = vals.get("FERNET_KEY")
     if not key_b64:
         key_b64 = Fernet.generate_key().decode()
-        if not ENV_PATH.exists():
-            ENV_PATH.touch()
-        set_key(str(ENV_PATH), "FERNET_KEY", key_b64)
-        ensure_permissions(ENV_PATH)
+        try:
+            if not ENV_PATH.exists():
+                ENV_PATH.touch()
+            set_key(str(ENV_PATH), "FERNET_KEY", key_b64)
+            ensure_permissions(ENV_PATH)
+            print(f"[+] Generated FERNET_KEY and persisted it to {ENV_PATH.resolve()}")
+        except OSError as e:
+            raise SystemExit(
+                f"[FATAL] No FERNET_KEY set and it could not be persisted to "
+                f"{ENV_PATH} ({e}).\n"
+                f"        Add a key to your .env — compose passes it through:\n"
+                f"          FERNET_KEY={key_b64}\n"
+                f"        Losing this key makes existing encrypted columns "
+                f"unreadable, so store it somewhere you can restore from."
+            ) from e
 
     return Fernet(key_b64.encode())
 
@@ -477,7 +540,7 @@ import io
 
 @app.get("/api/agent/download/<os_type>")
 async def download_agent(request, os_type):
-    user_id = int(request.headers.get("X-User-ID", 0))
+    user_id = current_user_id(request)
     provided_key = request.headers.get("X-Agent-Key") or request.args.get("key")
     agent_key = request.headers.get("X-Agent-Key") or request.args.get("agent_key")
 
@@ -680,7 +743,7 @@ async def _validate_agent_auth(request) -> str | None:
 @app.post("/api/agents/enroll")
 async def enroll_agent(request):
     """Create a one-time enrollment token (authenticated, requires manage_agent)."""
-    user_id = int(request.headers.get("X-User-ID", 0) or 0)
+    user_id = current_user_id(request)
     if not user_id or not await user_has_permission(user_id, "manage_agent"):
         return sanic_json({"status": "error", "message": "Unauthorized"}, status=403)
 
@@ -745,7 +808,7 @@ async def enroll_agent(request):
 @app.get("/api/agents/enrollments")
 async def list_enrollments(request):
     """List recent enrollment tokens (authed)."""
-    user_id = int(request.headers.get("X-User-ID", 0) or 0)
+    user_id = current_user_id(request)
     if not user_id or not await user_has_permission(user_id, "manage_agent"):
         return sanic_json({"status": "error", "message": "Unauthorized"}, status=403)
 
@@ -775,7 +838,7 @@ async def list_enrollments(request):
 
 @app.delete("/api/agents/enrollments/<token_id:int>")
 async def revoke_enrollment(request, token_id):
-    user_id = int(request.headers.get("X-User-ID", 0) or 0)
+    user_id = current_user_id(request)
     if not user_id or not await user_has_permission(user_id, "manage_agent"):
         return sanic_json({"status": "error", "message": "Unauthorized"}, status=403)
     try:
@@ -1391,7 +1454,7 @@ async def get_user_permissions(user_id: int) -> list:
 
 @app.route("/user/permissions", methods=["GET"])
 async def fetch_my_permissions(request):
-    user_id = int(request.headers.get("X-User-ID", 0))
+    user_id = current_user_id(request)
     if not user_id:
         return sanic_json({"status": "error", "message": "Not authenticated"}, status=401)
     perms = await get_user_permissions(user_id)
@@ -1422,10 +1485,12 @@ async def user_has_permission(user_id: int, permission_name: str) -> bool:
 
 
 async def audit_log(request, action: str, resource: str, details: str = ""):
-    print(f"[DEBUG] audit_log called for action: {action}, resource: {resource}")
-    user_id = int(request.headers.get("X-User-ID", 0))
-    username = "Anonymous"
-    
+    # Attributed from the session, not from a client-supplied header — an
+    # audit trail an attacker can sign with someone else's name is worse than
+    # no audit trail, because it reads as authoritative.
+    user_id = current_user_id(request)
+    username = current_username(request)
+
     xff = request.headers.get("x-forwarded-for")
     if xff:
         ip = xff.split(",")[0].strip()
@@ -1435,22 +1500,14 @@ async def audit_log(request, action: str, resource: str, details: str = ""):
     try:
         cnx = await connect_userdb()
         cursor = await cnx.cursor()
-        
-        if user_id > 0:
-            await cursor.execute("SELECT username FROM users WHERE id = %s", (user_id,))
-            row = await cursor.fetchone()
-            if row:
-                username = row[0]
-        
-        print(f"[DEBUG] audit_log: inserting action={action} for user={username}")
+
         await cursor.execute("""
             INSERT INTO audit_logs (user_id, username, action, resource, details, ip_address)
             VALUES (%s, %s, %s, %s, %s, %s)
         """, (user_id, username, action, resource, details, ip))
-        
+
         await cnx.commit()
         await cursor.close(); await cnx.close()
-        print(f"[DEBUG] audit_log: successful insertion")
 
         try:
             asyncio.create_task(os_utils.index_log(
@@ -1470,22 +1527,278 @@ async def audit_log(request, action: str, resource: str, details: str = ""):
     except Exception as e:
         print(f"[!] Audit log failure: {e}")
 
+# ---------------------------------------------------------------------------
+# Authentication / authorization
+#
+# Identity comes from an HttpOnly session cookie, never from a client-supplied
+# header. `X-User-ID` is still sent by the frontend and still validated, but
+# only as an assertion that must MATCH the session — a mismatch is a hard 401.
+# That check is not redundant: browsers cannot attach custom headers to
+# cross-site requests without a CORS preflight, so requiring the header also
+# makes the session cookie unusable for CSRF.
+# ---------------------------------------------------------------------------
+
+# Handlers reachable without a session. Everything else is deny-by-default.
+_PUBLIC_HANDLERS = {
+    # Login endpoint and the SPA shell (the SPA routes to /login on its own).
+    "login", "logout", "health_check", "serve_root", "serve_index",
+    # Agent-facing endpoints. These carry X-Agent-Key or an enrollment token
+    # (and the automation-poll pair currently carries nothing — tracked as
+    # follow-up work). The session layer must not be what gates agent traffic,
+    # or every enrolled endpoint stops reporting the moment this ships.
+    "download_agent", "register_agent", "agent_bootstrap",
+    "deploy_agent_linux", "deploy_agent_windows",
+    "get_pending_automations_for_agent",
+    "report_automation_result", "report_automation_result_by_id",
+}
+
+# Static assets must load before anyone can log in. Matched on path because
+# Sanic's internal static handler name varies across versions.
+_PUBLIC_PATH_PREFIXES = ("/assets/", "/vite.svg", "/favicon.ico")
+
+# Path-shaped mirror of _PUBLIC_HANDLERS, used only as the backstop in
+# `authenticate` when a route's handler cannot be resolved. Kept deliberately
+# narrow: it covers login and agent traffic, not the SPA catch-all, so a
+# failure here is a visibly broken UI rather than a silent bypass.
+_PUBLIC_EXACT_PATHS = {
+    "/login", "/logout", "/health",
+    "/api/agents/register", "/api/agents/bootstrap",
+    "/api/agent/deploy/linux", "/api/agent/deploy/windows",
+}
+_AGENT_PATH_SUFFIXES = ("/automations/pending", "/automations/report")
+
+
+def _is_public_path(path: str) -> bool:
+    if path in _PUBLIC_EXACT_PATHS or path.startswith(_PUBLIC_PATH_PREFIXES):
+        return True
+    if path.startswith("/api/agent/download/"):
+        return True
+    if path.endswith(_AGENT_PATH_SUFFIXES):
+        return True
+    return bool(re.fullmatch(r"/automations/\d+/report", path))
+
+# Permissions required per route, keyed by handler __qualname__. A set rather
+# than a single value because four routes stack two decorators, and stacked
+# decorators mean "all of these", not "the outermost one".
+_PERMISSION_REQUIREMENTS: dict[str, set[str]] = {}
+
+
 def require_permission(permission_name):
+    """Declare the permission a route requires.
+
+    Records the requirement in `_PERMISSION_REQUIREMENTS` *and* returns a
+    guarding wrapper. Both halves matter, because the two decorator orderings
+    do not behave the same way:
+
+        @require_permission("x")     |    @app.route("/p")
+        @app.route("/p")             |    @require_permission("x")
+        async def h(...)             |    async def h(...)
+
+    In the left form `app.route` registers the *bare* handler before this
+    decorator ever runs, so the wrapper below is built but never called — which
+    is how 85 routes in this file ended up silently unguarded. The registry is
+    consulted by the `authenticate` middleware via the handler's __qualname__,
+    which @wraps preserves, so enforcement is now identical either way.
+
+    Prefer the right-hand form in new code: the wrapper is the cheaper check
+    when it does run.
+    """
     def decorator(func):
+        _PERMISSION_REQUIREMENTS.setdefault(func.__qualname__, set()).add(permission_name)
+
         @wraps(func)
         async def wrapper(request, *args, **kwargs):
-            try:
-                user_id = int(request.headers.get("X-User-ID", 0))  
-                if not await user_has_permission(user_id, permission_name):
+            # The middleware already resolved this; skip the duplicate query.
+            if not getattr(request.ctx, "permission_checked", False):
+                if not await user_has_permission(current_user_id(request), permission_name):
                     return sanic_json({
                         "status": "error",
                         "message": f"Permission denied: '{permission_name}' required"
                     }, status=403)
-                return await func(request, *args, **kwargs)
-            except Exception as e:
-                raise e
+            return await func(request, *args, **kwargs)
+
+        # @wraps copies __qualname__, so this is the same key — the setdefault
+        # above already holds it. Restated for the case where a future change
+        # makes the wrapper's qualname differ.
+        _PERMISSION_REQUIREMENTS.setdefault(wrapper.__qualname__, set()).add(permission_name)
         return wrapper
     return decorator
+
+
+def current_user(request) -> dict | None:
+    """The authenticated user for this request, or None."""
+    return getattr(request.ctx, "user", None)
+
+
+def current_user_id(request) -> int:
+    user = current_user(request)
+    return int(user["user_id"]) if user else 0
+
+
+def current_username(request) -> str:
+    user = current_user(request)
+    return user["username"] if user else "Anonymous"
+
+
+def _unauthorized(message: str):
+    return sanic_json({"status": "error", "message": message}, status=401)
+
+
+async def revoke_user_sessions(user_id: int, reason: str = "") -> int:
+    """Kill every live session for a user.
+
+    Called whenever the credential or the privileges a session was issued
+    against change — password reset, role change, account deletion. Without
+    this an admin can revoke someone's access and still have their old browser
+    tab working until the idle timeout.
+    """
+    if not user_id:
+        return 0
+    try:
+        async with userdb_conn() as cnx:
+            cur = await cnx.cursor()
+            try:
+                killed = await session_store.revoke_for_user(cur, int(user_id))
+                await cnx.commit()
+            finally:
+                await cur.close()
+        if killed:
+            print(f"[Session] Revoked {killed} session(s) for user {user_id} ({reason})")
+        return killed
+    except Exception as e:
+        print(f"[!] Session revoke failed for user {user_id}: {e}")
+        return 0
+
+
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+@app.on_request
+async def authenticate(request):
+    """Resolve the session cookie, then gate the request.
+
+    Runs after routing, so `request.route` already names the handler we are
+    about to call. Returning a response here short-circuits that handler.
+    """
+    request.ctx.user = None
+    request.ctx.session_token = None
+    request.ctx.permission_checked = False
+
+    # CORS preflight carries no cookies by design.
+    if request.method == "OPTIONS":
+        return None
+
+    if request.path.startswith(_PUBLIC_PATH_PREFIXES):
+        return None
+
+    # Resolved before the public-route check on purpose: `download_agent` is
+    # public at this layer but still reads the session to decide whether the
+    # caller is an operator or an enrolled agent.
+    raw_token = request.cookies.get(session_store.SESSION_COOKIE)
+    if raw_token:
+        try:
+            async with userdb_conn() as cnx:
+                cur = await cnx.cursor(dictionary=True)
+                try:
+                    row = await session_store.load(cur, raw_token)
+                    if row:
+                        request.ctx.user = row
+                        request.ctx.session_token = raw_token
+                        if await session_store.touch(cur, row["token_hash"], row["last_seen_at"]):
+                            await cnx.commit()
+                finally:
+                    await cur.close()
+        except Exception as e:
+            print(f"[!] Session lookup failed: {e}")
+
+    user = request.ctx.user
+
+    route = getattr(request, "route", None)
+    handler = getattr(route, "handler", None) if route else None
+    handler_name = getattr(handler, "__qualname__", "")
+
+    # Public routes are exempt from everything below. This has to come before
+    # the X-User-ID check: the browser keeps `userId` in localStorage and the
+    # axios interceptor attaches it to /login too, so enforcing the header
+    # first would make an expired session impossible to log back in from.
+    if handler_name in _PUBLIC_HANDLERS:
+        return None
+
+    # Backstop for the case where the router did not attach a resolved route to
+    # the request. Everything below is deny-by-default, so without this a Sanic
+    # release that changes when `request.route` is populated would lock
+    # operators out of the login page rather than let anything through.
+    if not handler_name and _is_public_path(request.path):
+        return None
+
+    if not user:
+        return _unauthorized("Authentication required")
+
+    # `X-User-ID` is no longer identity — it is an assertion checked against
+    # the session. SameSite is the primary CSRF control; requiring the header
+    # on state-changing requests is the second layer, and the one that still
+    # holds if SameSite is ever relaxed to None for a split-origin deployment.
+    asserted = request.headers.get("X-User-ID")
+    if asserted is None:
+        if request.method not in _SAFE_METHODS:
+            return _unauthorized("X-User-ID header required on state-changing requests")
+    else:
+        try:
+            asserted_id = int(asserted)
+        except (TypeError, ValueError):
+            return _unauthorized("Malformed X-User-ID header")
+        if asserted_id != int(user["user_id"]):
+            return _unauthorized("X-User-ID does not match the active session")
+
+    required = _PERMISSION_REQUIREMENTS.get(handler_name)
+    if required:
+        uid = int(user["user_id"])
+        for permission in sorted(required):
+            if not await user_has_permission(uid, permission):
+                return sanic_json({
+                    "status": "error",
+                    "message": f"Permission denied: '{permission}' required"
+                }, status=403)
+        request.ctx.permission_checked = True
+
+    return None
+
+
+@app.before_server_start
+async def verify_auth_wiring(app):
+    """Report the auth posture of every route at boot.
+
+    The bug this replaces was invisible precisely because nothing ever
+    inspected the result of wiring `@require_permission` up: 85 routes looked
+    guarded in the source and were not. Printing the tally at startup means a
+    regression shows up in the very first lines of the container log.
+    """
+    try:
+        guarded = public = session_only = 0
+        unknown: list[str] = []
+
+        for route in app.router.routes:
+            name = getattr(getattr(route, "handler", None), "__qualname__", "")
+            if not name:
+                unknown.append("/" + "/".join(getattr(route, "parts", ())))
+            elif name in _PUBLIC_HANDLERS:
+                public += 1
+            elif name in _PERMISSION_REQUIREMENTS:
+                guarded += 1
+            else:
+                session_only += 1
+
+        print(
+            f"[Auth] Routes: {guarded} permission-gated, {session_only} session-only, "
+            f"{public} public."
+        )
+        if not _PERMISSION_REQUIREMENTS:
+            print("[Auth] FATAL: permission registry is empty — every route is session-only.")
+        if unknown:
+            print(f"[Auth] WARNING: {len(unknown)} route(s) with an unresolvable handler: {unknown[:5]}")
+    except Exception as e:
+        # Diagnostics must never be what stops the server from booting.
+        print(f"[Auth] Wiring self-check skipped: {e}")
 
 def send_email(template_name: str, context: dict) -> bool:
     config = get_mail_config()
@@ -2410,8 +2723,7 @@ async def create_role(request):
     data = request.json or {}
     role_name = data.get("role_name")
     
-    admin_id = request.headers.get("X-User-ID")
-    created_by = "System"
+    created_by = current_username(request)
 
     if not role_name:
         return sanic_json({
@@ -2428,12 +2740,6 @@ async def create_role(request):
     try:
         cnx = await connect_userdb()
         cursor = await cnx.cursor()
-
-        if admin_id:
-            await cursor.execute("SELECT username FROM users WHERE id = %s", (admin_id,))
-            admin_row = await cursor.fetchone()
-            if admin_row:
-                created_by = admin_row[0]
 
         await cursor.execute("SELECT id FROM roles WHERE role_name = %s", (role_name,))
         if await cursor.fetchone():
@@ -2487,18 +2793,11 @@ async def create_user(request):
                 
         return sanic_json({"status": "error", "message": f"Invalid input: {str(e)}"}, status=400)
     
-    admin_id = request.headers.get("X-User-ID")
-    created_by = "System"
+    created_by = current_username(request)
 
     try:
         cnx = await connect_userdb()
         cursor = await cnx.cursor()
-
-        if admin_id:
-            await cursor.execute("SELECT username FROM users WHERE id = %s", (admin_id,))
-            admin_row = await cursor.fetchone()
-            if admin_row:
-                created_by = admin_row[0]
 
         allowed_roles = await get_allowed_roles()
         if role not in allowed_roles:
@@ -2548,7 +2847,9 @@ async def create_user(request):
 async def update_user_role(request, user_id):
     data = request.json or {}
     new_role = data.get("role")
-    updated_by = data.get("updated_by")
+    # Was taken from the request body, so the caller chose whose name went in
+    # the audit column. Same class of bug as the old X-User-ID header.
+    updated_by = current_username(request)
 
     allowed_roles = await get_allowed_roles()
     if new_role not in allowed_roles:
@@ -2596,11 +2897,15 @@ async def update_user_role(request, user_id):
         await cursor.close()
         await cnx.close()
 
+        # Their live sessions were issued against the old role, so drop them
+        # rather than let a demoted user keep the privileges until timeout.
+        await revoke_user_sessions(int(user_id), "role changed")
+
         await audit_log(request, "UPDATE_USER_ROLE", username, f"Updated role to {new_role}")
 
         return sanic_json({
             "status": "success",
-            "message": f"User '{username}' role updated to '{new_role}' successfully."
+            "message": f"User '{username}' role updated to '{new_role}'. Their active sessions were ended."
         })
 
     except Exception as e:
@@ -2622,24 +2927,30 @@ async def admin_reset_password(request, user_id):
         }, status=400)
 
     try:
+        # This wrote `new_password` straight into the column. Besides storing
+        # the password in the clear, it also locked the account out: `login`
+        # runs bcrypt.checkpw against the stored value, which raises on
+        # anything that isn't a bcrypt hash.
+        hashed = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
         cnx = await connect_userdb()
         cursor = await cnx.cursor()
-        
-        await cursor.execute("UPDATE users SET password = %s WHERE id = %s", (new_password, user_id))
+
+        await cursor.execute("UPDATE users SET password = %s WHERE id = %s", (hashed, user_id))
         await cnx.commit()
         await cursor.close(); await cnx.close()
-        
+
+        await revoke_user_sessions(int(user_id), "password reset by admin")
+
         await audit_log(request, "RESET_PASSWORD", user_id, f"Password reset for user ID {user_id}")
 
-        return sanic_json({"status": "success", "message": "User password reset successfully."})
+        return sanic_json({"status": "success", "message": "User password reset. Their active sessions were ended."})
     except Exception as e:
         return sanic_json({"status": "error", "message": str(e)}, status=500)
 
 @require_permission("manage_users")
 @app.route("/users/<user_id>", methods=["DELETE"])
 async def delete_user(request, user_id):
-    admin_id = request.headers.get("X-User-ID")
-    
     try:
         target_uid = int(user_id)
     except (ValueError, TypeError):
@@ -2667,6 +2978,8 @@ async def delete_user(request, user_id):
         await cursor.execute("DELETE FROM users WHERE id = %s", (user_id,))
         await cnx.commit()
         await cursor.close(); await cnx.close()
+
+        await revoke_user_sessions(target_uid, "account deleted")
 
         await audit_log(request, "DELETE_USER", username, f"Deleted user ID {user_id}")
 
@@ -2938,7 +3251,7 @@ async def _chain_init(cnx):
 async def _chain_append(cnx, shadow_id: int, action: str, target: str,
                          decision: str, decided_by: str, note: str = '') -> str:
     await _chain_init(cnx)
-    cur = await cnx.cursor(aiomysql.DictCursor)
+    cur = await cnx.cursor(dictionary=True)
     try:
         await cur.execute(
             "SELECT row_hash FROM shadow_audit_chain ORDER BY id DESC LIMIT 1"
@@ -2965,7 +3278,7 @@ async def _chain_append(cnx, shadow_id: int, action: str, target: str,
 
 
 async def _chain_verify(cnx) -> dict:
-    cur = await cnx.cursor(aiomysql.DictCursor)
+    cur = await cnx.cursor(dictionary=True)
     try:
         await cur.execute("SHOW TABLES LIKE 'shadow_audit_chain'")
         if not await cur.fetchone():
@@ -3005,7 +3318,7 @@ async def list_shadow_pending(request, agent):
     """Return pending shadow proposals for one agent, enriched with prior-execution context."""
     try:
         async with agent_conn(agent) as cnx:
-            cur = await cnx.cursor(aiomysql.DictCursor)
+            cur = await cnx.cursor(dictionary=True)
             try:
                 await cur.execute(
                     """
@@ -3064,7 +3377,7 @@ async def list_shadow_pending_all(request):
         for ag in agents:
             try:
                 async with agent_conn(ag) as cnx:
-                    cur = await cnx.cursor(aiomysql.DictCursor)
+                    cur = await cnx.cursor(dictionary=True)
                     try:
                         await cur.execute(
                             """
@@ -3158,7 +3471,7 @@ async def approve_shadow(request, agent, insight_id):
     """Approve a pending shadow proposal → dispatch the proposed SOAR action."""
     try:
         async with agent_conn(agent) as cnx:
-            cur = await cnx.cursor(aiomysql.DictCursor)
+            cur = await cnx.cursor(dictionary=True)
             try:
                 await cur.execute(
                     """
@@ -3250,7 +3563,7 @@ async def reject_shadow(request, agent, insight_id):
         action_for_chain = ''
         target_for_chain = ''
         async with agent_conn(agent) as cnx:
-            cur = await cnx.cursor(aiomysql.DictCursor)
+            cur = await cnx.cursor(dictionary=True)
             try:
                 await cur.execute(
                     "SELECT proposed_action, proposed_target FROM ai_analysis_results WHERE id = %s",
@@ -3385,7 +3698,7 @@ async def get_all_ai_insights(request):
         for agent in agents:
             try:
                 async with agent_conn(agent) as cnx:
-                    acur = await cnx.cursor(aiomysql.DictCursor)
+                    acur = await cnx.cursor(dictionary=True)
                     try:
                         await acur.execute("""
                             SELECT TABLE_NAME
@@ -4406,6 +4719,92 @@ async def validate_automation_target(request, agent):
         return sanic_json({"ok": False, "error": str(e)}, status=500)
 
 
+def _set_session_cookie(resp, raw_token: str):
+    """Attach the session cookie.
+
+    Sanic 23.3+ exposes `add_cookie()`; older releases only have the mapping
+    API. `sanic` is unpinned in requirements.txt, so support both.
+    """
+    add = getattr(resp.cookies, "add_cookie", None)
+    if add is not None:
+        add(
+            session_store.SESSION_COOKIE, raw_token,
+            path="/", httponly=True, samesite=SESSION_COOKIE_SAMESITE,
+            secure=SESSION_COOKIE_SECURE,
+            max_age=session_store.cookie_max_age(),
+        )
+        return
+    resp.cookies[session_store.SESSION_COOKIE] = raw_token
+    c = resp.cookies[session_store.SESSION_COOKIE]
+    c["path"] = "/"
+    c["httponly"] = True
+    c["samesite"] = SESSION_COOKIE_SAMESITE
+    c["secure"] = SESSION_COOKIE_SECURE
+    c["max-age"] = session_store.cookie_max_age()
+
+
+def _clear_session_cookie(resp):
+    delete = getattr(resp.cookies, "delete_cookie", None)
+    if delete is not None:
+        # `secure` must mirror what _set_session_cookie used. Sanic's
+        # delete_cookie defaults it to True, and a Secure deletion cookie
+        # delivered over plain http is dropped by the browser — so on an
+        # http deployment the cookie would survive logout. The session is
+        # revoked server-side either way, but leaving a live-looking cookie
+        # in the browser is not a state worth shipping.
+        delete(session_store.SESSION_COOKIE, path="/", secure=SESSION_COOKIE_SECURE)
+        return
+    resp.cookies[session_store.SESSION_COOKIE] = ""
+    resp.cookies[session_store.SESSION_COOKIE]["max-age"] = 0
+
+
+async def _issue_session(request, *, user_id: int, username: str,
+                         role: str | None, auth_type: str) -> str:
+    async with userdb_conn() as cnx:
+        cur = await cnx.cursor()
+        try:
+            raw = await session_store.create(
+                cur,
+                user_id=user_id, username=username, role=role,
+                auth_type=auth_type, ip=_client_ip(request),
+                user_agent=request.headers.get("User-Agent"),
+            )
+            await cnx.commit()
+        finally:
+            await cur.close()
+    return raw
+
+
+async def _upsert_ldap_user(username: str, role: str) -> int:
+    """Give an LDAP identity a local `users` row.
+
+    Sessions, RBAC and audit attribution all key off the same integer id, so an
+    LDAP login needs one too — before this, the LDAP branch returned a user
+    object with no `id` at all and the frontend threw on `user.id.toString()`.
+    The password column gets an unusable placeholder: `bcrypt.checkpw` raises
+    on it, which the local branch already treats as "fall through to LDAP".
+    """
+    async with userdb_conn() as cnx:
+        cur = await cnx.cursor()
+        try:
+            await cur.execute("SELECT id FROM users WHERE username = %s LIMIT 1", (username,))
+            row = await cur.fetchone()
+            if row:
+                await cur.execute("UPDATE users SET role = %s WHERE id = %s", (role, row[0]))
+                await cnx.commit()
+                return int(row[0])
+            await cur.execute(
+                "INSERT INTO users (username, password, role, created_by) VALUES (%s, %s, %s, 'ldap')",
+                (username, "!ldap-no-local-password", role),
+            )
+            await cnx.commit()
+            await cur.execute("SELECT id FROM users WHERE username = %s LIMIT 1", (username,))
+            row = await cur.fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            await cur.close()
+
+
 @app.route("/login", methods=["GET", "POST"])
 async def login(request):
     if request.method == "GET":
@@ -4429,7 +4828,7 @@ async def login(request):
         cnx = await connect_userdb()
         cursor = await cnx.cursor()
         await cursor.execute(
-            "SELECT id, username, password, created_at FROM users WHERE username = %s LIMIT 1",
+            "SELECT id, username, password, created_at, role FROM users WHERE username = %s LIMIT 1",
             (username,),
         )
         row = await cursor.fetchone()
@@ -4437,13 +4836,17 @@ async def login(request):
         await cnx.close()
 
         if row:
-            user_id, db_username, db_password, created_at = row
+            user_id, db_username, db_password, created_at, db_role = row
             if bcrypt.checkpw(password.encode('utf-8'), db_password.encode('utf-8')):
                 await log_login_attempt(username, "local", "success", "", ip)
 
                 print(f"[+] Local login successful for user: {username}")
                 user_perms = await get_user_permissions(user_id)
-                return response.json({
+                raw_token = await _issue_session(
+                    request, user_id=user_id, username=db_username,
+                    role=db_role, auth_type="local",
+                )
+                resp = response.json({
                     "status": "success",
                     "message": "Login successful (local).",
                     "user": {
@@ -4451,10 +4854,14 @@ async def login(request):
                         "username": db_username,
                         "created_at": created_at.strftime("%Y-%m-%d %H:%M:%S") if hasattr(created_at, 'strftime') else str(created_at),
                         "auth_type": "local",
-                        "role": "admin" if db_username == "admin" else "user",
+                        # Was hardcoded to `"admin" if username == "admin"`,
+                        # which silently ignored the role column.
+                        "role": db_role,
                         "permissions": user_perms
                     }
                 })
+                _set_session_cookie(resp, raw_token)
+                return resp
             else:
                 await log_login_attempt(username, "local", "failure", "Invalid local password", ip)
                 print(f"[-] Local password mismatch for user: {username}")
@@ -4537,16 +4944,24 @@ async def login(request):
 
                 await log_login_attempt(username, "ldap", "success", "", ip)
                 user_perms = await get_role_permissions(app_role)
-                return response.json({
+                ldap_uid = await _upsert_ldap_user(username, app_role)
+                raw_token = await _issue_session(
+                    request, user_id=ldap_uid, username=username,
+                    role=app_role, auth_type="ldap",
+                )
+                resp = response.json({
                     "status": "success",
                     "message": "Login successful (LDAP).",
                     "user": {
+                        "id": ldap_uid,
                         "username": username,
                         "auth_type": "ldap",
                         "role": app_role,
                         "permissions": user_perms
                     }
                 })
+                _set_session_cookie(resp, raw_token)
+                return resp
 
             except LDAPSocketOpenError as e:
                 if attempt == max_retries - 1:
@@ -4560,6 +4975,31 @@ async def login(request):
 
     await log_login_attempt(username, "combined", "failure", "All methods failed", ip)
     return response.json({"status": "error", "message": "Invalid username or password."}, status=401)
+
+
+@app.post("/logout")
+async def logout(request):
+    """Revoke the current session server-side and clear the cookie.
+
+    Public so that a request carrying an already-dead session still clears the
+    browser's cookie instead of bouncing off the 401 in `authenticate`.
+    """
+    raw_token = request.cookies.get(session_store.SESSION_COOKIE)
+    if raw_token:
+        try:
+            async with userdb_conn() as cnx:
+                cur = await cnx.cursor()
+                try:
+                    await session_store.revoke(cur, raw_token)
+                    await cnx.commit()
+                finally:
+                    await cur.close()
+        except Exception as e:
+            print(f"[!] Logout revoke failed: {e}")
+
+    resp = sanic_json({"status": "success", "message": "Logged out."})
+    _clear_session_cookie(resp)
+    return resp
 
 
 
@@ -4644,18 +5084,11 @@ async def update_role(request, role_id):
     new_role_name = data.get("role_name")
     permissions = data.get("permissions", [])
     
-    admin_id = request.headers.get("X-User-ID")
-    updated_by = "System"
+    updated_by = current_username(request)
 
     try:
         cnx = await connect_userdb()
         cursor = await cnx.cursor()
-
-        if admin_id:
-            await cursor.execute("SELECT username FROM users WHERE id = %s", (admin_id,))
-            admin_row = await cursor.fetchone()
-            if admin_row:
-                updated_by = admin_row[0]
 
         await cursor.execute("SELECT role_name FROM roles WHERE id = %s", (role_id,))
         result = await cursor.fetchone()
@@ -4957,6 +5390,18 @@ async def change_password(request):
     except Exception as e:
         return sanic_json({"status": "error", "message": f"Invalid input: {str(e)}"}, status=400)
 
+    # The username used to come from the request body, so anyone who knew
+    # another account's current password could rotate it out from under them.
+    # Self-service means self: bind to the session.
+    session_user = current_user(request)
+    if not session_user:
+        return _unauthorized("Authentication required")
+    if username != session_user["username"]:
+        return sanic_json(
+            {"status": "error", "message": "You can only change your own password."},
+            status=403,
+        )
+
     try:
         cnx = await connect_userdb()
         cursor = await cnx.cursor()
@@ -4967,7 +5412,7 @@ async def change_password(request):
             return sanic_json({"status": "error", "message": "No user found"}, status=404)
 
         db_password = row[0]
-        if not bcrypt.verify(current_password, db_password):
+        if not bcrypt.checkpw(current_password.encode('utf-8'), db_password.encode('utf-8')):
             await cursor.close(); await cnx.close()
             return sanic_json({"status": "error", "message": "Current password is wrong"}, status=401)
 
@@ -4975,7 +5420,18 @@ async def change_password(request):
         await cursor.execute("UPDATE users SET password = %s WHERE username = %s", (new_hashed, username))
         await cnx.commit()
         await cursor.close(); await cnx.close()
-        return sanic_json({"status": "success", "message": "Password changed successfully."})
+
+        # Includes this browser's own session: changing a password should end
+        # every session that was issued against the old one.
+        await revoke_user_sessions(int(session_user["user_id"]), "password changed")
+
+        resp = sanic_json({
+            "status": "success",
+            "message": "Password changed. Please sign in again.",
+            "reauth_required": True,
+        })
+        _clear_session_cookie(resp)
+        return resp
 
     except Exception as e:
         return sanic_json({"status": "error", "message": f"Database Error: {e}"}, status=500)
@@ -5434,8 +5890,27 @@ async def setup_background_tasks(app, _):
         app.add_task(periodic_soar_automation_check())
         app.add_task(periodic_threat_intel_update())
         app.add_task(periodic_vuln_scan())
+        app.add_task(periodic_session_purge())
     else:
         pass
+
+
+async def periodic_session_purge():
+    """Drop expired/revoked session rows hourly so the table stays bounded."""
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            async with userdb_conn() as cnx:
+                cur = await cnx.cursor()
+                try:
+                    removed = await session_store.purge_expired(cur)
+                    await cnx.commit()
+                finally:
+                    await cur.close()
+            if removed:
+                print(f"[Session] Purged {removed} expired session row(s).")
+        except Exception as e:
+            print(f"[!] Session purge failed: {e}")
 
 
 VULN_SCAN_INTERVAL = int(os.getenv("VULN_SCAN_INTERVAL", "1800"))
@@ -6753,46 +7228,78 @@ async def validate_playbook(request, agent):
 
 
 @app.post("/_proxy/http")
+@require_permission("manage_system")
 async def http_proxy(request):
+    """Proxy a UI-originated HTTP request (works around CORS on third-party
+    endpoints used by playbook nodes).
+
+    Inert until `PROXY_ALLOWED_HOSTS` names destinations. Every request is
+    checked by `security.ssrf.check_target` first — scheme, host allowlist,
+    and the resolved address — and both the outbound and returned headers are
+    filtered. See that module for the reasoning behind each layer.
     """
-    UI'den gelen HTTP request'leri proxy'ler (CORS bypass için).
-    ⚠️ GÜVENLİK RİSKİ: Production'da whitelist kullan!
-    """
-    try:
-        data = request.json or {}
-        url = data.get("url")
-        method = data.get("method", "GET").upper()
-        headers = data.get("headers", {})
-        body = data.get("body")
-        timeout = int(data.get("timeout", 30))
-        
-        if not url:
-            return sanic_json({"error": "URL required"}, status=400)
-        
-        
-        def _make_request():
-            import requests
-            return requests.request(
-                method=method,
-                url=url,
-                headers=headers,
-                data=body if method not in ["GET", "HEAD"] else None,
-                timeout=timeout
-            )
-        
-        resp = await asyncio.to_thread(_make_request)
-        
-        return HTTPResponse(
-            body=resp.content,
-            status=resp.status_code,
-            headers=dict(resp.headers),
-            content_type=resp.headers.get("Content-Type", "application/octet-stream")
+    data = request.json or {}
+    url = data.get("url")
+
+    method = (data.get("method") or "GET").upper()
+    if method not in ssrf.ALLOWED_METHODS:
+        return sanic_json({"error": f"Method not allowed: {method}"}, status=400)
+
+    error = ssrf.check_target(url)
+    if error:
+        # Denials are audit-logged: a burst of them is somebody probing the
+        # proxy, and that is worth being able to see after the fact.
+        await audit_log(request, "PROXY_DENIED", str(url)[:255], error)
+        return sanic_json({"error": error}, status=403)
+
+    headers = ssrf.clean_request_headers(data.get("headers"))
+    body = data.get("body")
+    timeout = ssrf.clamp_timeout(data.get("timeout", 15))
+    max_bytes = ssrf.max_response_bytes()
+
+    await audit_log(request, "PROXY_REQUEST", str(url)[:255], f"{method} timeout={timeout}s")
+
+    def _make_request():
+        return requests.request(
+            method=method,
+            url=url,
+            headers=headers,
+            data=body if method not in ("GET", "HEAD") else None,
+            timeout=timeout,
+            # An allowlisted host answering 302 -> 169.254.169.254 would walk
+            # straight past every check above, so hops are not followed. The
+            # caller gets the redirect response and can re-submit the target,
+            # which puts it back through validation.
+            allow_redirects=False,
+            stream=True,
         )
-    
+
+    try:
+        resp = await asyncio.to_thread(_make_request)
     except requests.Timeout:
         return sanic_json({"error": "Request timeout"}, status=504)
     except Exception as e:
-        return sanic_json({"error": str(e)}, status=500)
+        return sanic_json({"error": str(e)}, status=502)
+
+    try:
+        # Read one byte past the cap so an oversized body is detectable
+        # without buffering the whole thing. decode_content undoes any
+        # transport compression, since the framing headers are dropped below.
+        content = await asyncio.to_thread(resp.raw.read, max_bytes + 1, decode_content=True)
+    except Exception as e:
+        return sanic_json({"error": f"Failed reading response: {e}"}, status=502)
+    finally:
+        await asyncio.to_thread(resp.close)
+
+    if len(content) > max_bytes:
+        return sanic_json({"error": f"Response exceeds {max_bytes} bytes"}, status=502)
+
+    return HTTPResponse(
+        body=content,
+        status=resp.status_code,
+        headers=ssrf.clean_response_headers(resp.headers),
+        content_type=resp.headers.get("Content-Type", "application/octet-stream"),
+    )
 
 
 
@@ -7356,6 +7863,7 @@ async def drop_database(request, db_name):
 
 
 @app.websocket("/vnc-proxy/<agent>")
+@require_permission("read_telemetry")
 async def vnc_proxy(request, ws, agent):
     """Browser ↔ agent VNC/screen relay.
 

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { NavLink, Link, useNavigate } from 'react-router-dom';
+import { NavLink, Link } from 'react-router-dom';
 import { 
   LayoutDashboard, 
   ShieldAlert, 
@@ -54,14 +54,14 @@ const SidebarLink: React.FC<{ to: string, icon: React.ReactNode, label: string }
 };
 
 const Sidebar: React.FC<SidebarProps> = ({ isOpen }) => {
-  const navigate = useNavigate();
   const user = authService.getUser();
   const [showPasswordModal, setShowPasswordModal] = useState(false);
   const [passwordData, setPasswordData] = useState({ current_password: '', new_password: '', confirm_password: '' });
 
-  const handleLogout = () => {
-    authService.logout();
-    navigate('/login');
+  const handleLogout = async () => {
+    // logout() now revokes the session server-side before redirecting, so it
+    // has to be awaited — and it performs the redirect itself.
+    await authService.logout();
   };
 
   const handleChangePassword = async (e: React.FormEvent) => {
@@ -76,9 +76,13 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen }) => {
         current_password: passwordData.current_password,
         new_password: passwordData.new_password
       });
-      alert("Password changed successfully!");
       setShowPasswordModal(false);
       setPasswordData({ current_password: '', new_password: '', confirm_password: '' });
+      // The server revokes every session issued against the old password,
+      // this browser's included, so staying on the page would just 401.
+      alert("Password changed. Please sign in again.");
+      localStorage.clear();
+      window.location.href = '/login';
     } catch (err: any) {
       alert(err.response?.data?.message || "Failed to change password");
     }

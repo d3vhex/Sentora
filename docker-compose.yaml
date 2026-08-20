@@ -1,19 +1,43 @@
+# Port-binding policy
+# -------------------
+# Only two services are meant to be reachable from outside the host: `app`
+# (the UI/API) and `ingest` (the agent's TCP channel). Everything else binds
+# to ${BIND_ADDR}, which defaults to 127.0.0.1 — reachable for local debugging
+# and `docker exec`, not from the LAN.
+#
+# This matters because most of these services have no authentication at all in
+# the default configuration: OpenSearch runs with DISABLE_SECURITY_PLUGIN, and
+# OpenSearch Dashboards is an unauthenticated window onto every log the
+# platform has collected. Publishing them on 0.0.0.0 hands over the fleet's
+# telemetry to anyone who can route to the box.
+#
+# To expose one deliberately, put it behind the same reverse proxy and auth as
+# `app` rather than setting BIND_ADDR=0.0.0.0.
+
 services:
   db:
     image: mysql:8.0
     container_name: sentora-db
     restart: always
+    # no-new-privileges is applied only to the images built from this repo.
+    # The upstream mysql / opensearch / rabbitmq entrypoints drop privileges
+    # during startup, and hardening those is not worth an untested boot
+    # failure — they are unreachable from outside the host either way.
     command: [ "--max_connections=500", "--wait_timeout=120", "--interactive_timeout=120" ]
     environment:
-      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-my-secret-pw}
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
     ports:
-      - "3307:3306"
+      - "${BIND_ADDR:-127.0.0.1}:3307:3306"
     volumes:
       - ./init_userdb.sql:/docker-entrypoint-initdb.d/1-init_userdb.sql
       - ./init.sql:/docker-entrypoint-initdb.d/2-init.sql
       - mysql_data:/var/lib/mysql
     healthcheck:
-      test: [ "CMD-SHELL", "mysqladmin ping -h localhost -u root -p$${DB_PASSWORD:-my-secret-pw}" ]
+      # Expanded by the shell *inside* the db container, so it has to name a
+      # variable that exists there. It previously read $${DB_PASSWORD}, which
+      # is only set on the host — it fell through to the literal default and
+      # so only ever matched when DB_PASSWORD was left at that default.
+      test: [ "CMD-SHELL", "mysqladmin ping -h localhost -u root -p\"$$MYSQL_ROOT_PASSWORD\"" ]
       interval: 10s
       timeout: 10s
       retries: 20
@@ -24,7 +48,7 @@ services:
     container_name: sentora-ollama
     restart: always
     ports:
-      - "11434:11434"
+      - "${BIND_ADDR:-127.0.0.1}:11434:11434"
     volumes:
       - ./ollama:/root/.ollama
     environment:
@@ -57,12 +81,17 @@ services:
     build: .
     container_name: sentora-server
     restart: always
+    security_opt:
+      - no-new-privileges:true
     env_file:
       - .env
     environment:
       OLLAMA_BASE_URL: http://ollama:11434/api
       OLLAMA_MODEL: llama3.2:3b
       WORKERS: 1
+      # core/mq.py falls back to guest:guest when this is unset, which would
+      # silently break publishing the moment the broker credentials change.
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-sentora}:${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set in .env}@rabbitmq/
     depends_on:
       db:
         condition: service_healthy
@@ -71,18 +100,38 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - /:/host_disk:ro
+      # The agent Fernet key lives here (data/fernet.key). Without a volume it
+      # was regenerated on every `docker compose down && up`, which silently
+      # made all previously encrypted agent telemetry unreadable. Back this
+      # volume up — there is no key rotation path.
+      - sentora_data:/app/data
+    # The whole host filesystem used to be bind-mounted here as
+    # `/:/host_disk:ro`, so that the dashboard could show one disk-usage
+    # percentage. That handed /etc/shadow, every SSH key and every other
+    # container's volume to anything that achieved code execution in this
+    # container. `_server_disk_percent()` falls back to the container's own
+    # filesystem when /host_disk is absent, so the gauge still works — it now
+    # reports the container's view rather than the host's.
+    #
+    # If you need the host figure, mount something narrow that lives on the
+    # host root filesystem; statvfs reports the whole filesystem's stats from
+    # any path on it, so no directory contents need to be exposed:
+    #   volumes:
+    #     - /etc/hostname:/host_disk:ro
 
   ingest:
     build: .
     container_name: sentora-ingest
     restart: always
+    security_opt:
+      - no-new-privileges:true
     command: [ "python", "server.py" ]
     env_file:
       - .env
     environment:
       OLLAMA_BASE_URL: http://ollama:11434/api
       OLLAMA_MODEL: llama3.2:3b
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-sentora}:${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set in .env}@rabbitmq/
     depends_on:
       db:
         condition: service_healthy
@@ -96,16 +145,18 @@ services:
     container_name: sentora-rabbitmq
     restart: always
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      - "${BIND_ADDR:-127.0.0.1}:5672:5672"
+      - "${BIND_ADDR:-127.0.0.1}:15672:15672"
     environment:
-      RABBITMQ_DEFAULT_USER: guest
-      RABBITMQ_DEFAULT_PASS: guest
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-sentora}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set in .env}
 
   ai-worker-automation:
     build: .
     container_name: sentora-ai-worker-automation
     restart: always
+    security_opt:
+      - no-new-privileges:true
     command: [ "python", "ai_worker.py" ]
     env_file:
       - .env
@@ -113,7 +164,7 @@ services:
       - WORKER_TYPE=automation
       - OLLAMA_BASE_URL=http://ollama:11434/api
       - OLLAMA_MODEL=llama3.2:3b
-      - RABBITMQ_URL=amqp://guest:guest@rabbitmq/
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-sentora}:${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set in .env}@rabbitmq/
     depends_on:
       db:
         condition: service_healthy
@@ -126,6 +177,8 @@ services:
     build: .
     container_name: sentora-ai-worker-manual
     restart: always
+    security_opt:
+      - no-new-privileges:true
     command: [ "python", "ai_worker.py" ]
     env_file:
       - .env
@@ -133,7 +186,7 @@ services:
       - WORKER_TYPE=manual
       - OLLAMA_BASE_URL=http://ollama:11434/api
       - OLLAMA_MODEL=llama3.2:3b
-      - RABBITMQ_URL=amqp://guest:guest@rabbitmq/
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-sentora}:${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set in .env}@rabbitmq/
     depends_on:
       db:
         condition: service_healthy
@@ -146,6 +199,8 @@ services:
     build: .
     container_name: sentora-ai-worker-defensive
     restart: always
+    security_opt:
+      - no-new-privileges:true
     command: [ "python", "ai_worker.py" ]
     env_file:
       - .env
@@ -153,7 +208,7 @@ services:
       - WORKER_TYPE=defensive
       - OLLAMA_BASE_URL=http://ollama:11434/api
       - OLLAMA_MODEL=llama3.2:3b
-      - RABBITMQ_URL=amqp://guest:guest@rabbitmq/
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-sentora}:${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set in .env}@rabbitmq/
       # AI_SHADOW_MODE=1 makes the defensive worker stage proposals
       # ('AI_DEFENSIVE_SHADOW' with shadow_status='pending') instead of
       # dispatching real SOAR actions. Operator approves/rejects from the
@@ -178,6 +233,11 @@ services:
       - bootstrap.memory_lock=true
       - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
       - DISABLE_INSTALL_DEMO_CONFIG=true
+      # No authentication on the cluster. Acceptable only because the port is
+      # bound to BIND_ADDR and nothing outside the compose network reaches it.
+      # Enabling the security plugin means issuing node/client certs and
+      # teaching core/opensearch.py to present them — worth doing before this
+      # is ever exposed beyond the host.
       - DISABLE_SECURITY_PLUGIN=true
     ulimits:
       memlock:
@@ -187,8 +247,8 @@ services:
         soft: 65536
         hard: 65536
     ports:
-      - "9200:9200"
-      - "9600:9600"
+      - "${BIND_ADDR:-127.0.0.1}:9200:9200"
+      - "${BIND_ADDR:-127.0.0.1}:9600:9600"
     volumes:
       - opensearch_data:/usr/share/opensearch/data
 
@@ -197,7 +257,12 @@ services:
     container_name: sentora-dashboards
     restart: always
     ports:
-      - "5601:5601"
+      # Unauthenticated read access to every collected log. The "Open
+      # Dashboards" button in Log Explorer links to port 5601 on the server's
+      # hostname, so that button only works from the host itself unless you
+      # deliberately publish this — which should be through an authenticating
+      # reverse proxy, not by widening BIND_ADDR.
+      - "${BIND_ADDR:-127.0.0.1}:5601:5601"
     environment:
       - 'OPENSEARCH_HOSTS=["http://opensearch:9200"]'
       - "DISABLE_SECURITY_DASHBOARDS_PLUGIN=true"
@@ -207,3 +272,4 @@ services:
 volumes:
   mysql_data:
   opensearch_data:
+  sentora_data:

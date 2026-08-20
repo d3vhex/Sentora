@@ -53,10 +53,16 @@ const Deployment: React.FC = () => {
     return { 'X-User-ID': userId, 'Content-Type': 'application/json' };
   };
 
+  // These calls use raw fetch rather than the shared axios client, so they
+  // need the session cookie opted in explicitly. Without it the requests are
+  // anonymous and the server 401s them.
+  const authFetch = (url: string, init: RequestInit = {}) =>
+    fetch(url, { ...init, credentials: 'include', headers: authHeaders() });
+
   const loadEnrollments = async () => {
     setLoadingList(true);
     try {
-      const r = await fetch(`${API_BASE_URL}/api/agents/enrollments`, { headers: authHeaders() });
+      const r = await authFetch(`${API_BASE_URL}/api/agents/enrollments`);
       const data = await r.json();
       if (r.ok && data.status === 'success') {
         setEnrollments(data.enrollments || []);
@@ -76,9 +82,8 @@ const Deployment: React.FC = () => {
     setGenerating(true);
     setLastToken(null);
     try {
-      const r = await fetch(`${API_BASE_URL}/api/agents/enroll`, {
+      const r = await authFetch(`${API_BASE_URL}/api/agents/enroll`, {
         method: 'POST',
-        headers: authHeaders(),
         body: JSON.stringify({
           hostname_hint: hostnameHint || undefined,
           note: note || undefined,
@@ -104,9 +109,8 @@ const Deployment: React.FC = () => {
   const revokeToken = async (id: number) => {
     if (!confirm('Revoke this enrollment token?')) return;
     try {
-      const r = await fetch(`${API_BASE_URL}/api/agents/enrollments/${id}`, {
+      const r = await authFetch(`${API_BASE_URL}/api/agents/enrollments/${id}`, {
         method: 'DELETE',
-        headers: authHeaders(),
       });
       if (r.ok) loadEnrollments();
       else {

@@ -27,7 +27,8 @@ RUN apt-get update && apt-get install -y \
 COPY ./requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy backend source
+# Copy backend source. See .dockerignore — .env and data/ are excluded so
+# secrets are not baked into the image layers.
 COPY . /app
 
 # Copy the built frontend from the previous stage
@@ -38,7 +39,21 @@ COPY --from=frontend-builder /build/dist /app/frontend/dist
 # Environment variables
 ENV PYTHONUNBUFFERED=1
 ENV VITE_API_BASE_URL=""
-ENV CORS_ORIGINS="*"
+# Empty, not "*": the SPA is served from this same container, so requests are
+# same-origin. A wildcard origin is rejected by browsers once the session
+# cookie is attached.
+ENV CORS_ORIGINS=""
+
+# Drop root. The container previously ran as uid 0, so any code execution bug
+# in the API — the HTTP proxy and the playbook engine both reach out to
+# attacker-influenced input — started with full privileges inside the
+# container. /app/data is the one path written at runtime (the Fernet key when
+# FERNET_KEY is unset), so it is the only thing the app user needs to own.
+RUN useradd --system --create-home --uid 10001 sentora \
+    && mkdir -p /app/data \
+    && chown -R sentora:sentora /app/data \
+    && chmod 700 /app/data
+USER sentora
 
 # Expose Sanic port
 EXPOSE 8000

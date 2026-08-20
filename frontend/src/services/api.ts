@@ -4,12 +4,19 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || (import.meta.env.DEV ?
 
 const api = axios.create({
   baseURL: API_BASE_URL,
+  // Identity now travels in an HttpOnly session cookie, which axios only
+  // attaches cross-origin when this is set. Same-origin (production) would
+  // work either way; the dev server talking to :8000 would not.
+  withCredentials: true,
   headers: {
     'Content-Type': 'application/json',
   },
 });
 
-// Interceptor to add user ID for permission checks
+// Sent alongside the session cookie and validated against it server-side.
+// It is no longer identity — the server rejects a mismatch — but because
+// browsers cannot set custom headers on cross-site requests without a CORS
+// preflight, requiring it here is what makes the cookie CSRF-resistant.
 api.interceptors.request.use((config) => {
   const userId = localStorage.getItem('userId');
   if (userId) {
@@ -17,6 +24,21 @@ api.interceptors.request.use((config) => {
   }
   return config;
 });
+
+// Sessions now expire (idle and absolute), so a 401 can arrive at any point
+// in a long-lived tab. Without this the UI just renders errors everywhere
+// instead of sending the operator back to the login screen.
+api.interceptors.response.use(
+  (res) => res,
+  (err) => {
+    const status = err?.response?.status;
+    if (status === 401 && !window.location.pathname.startsWith('/login')) {
+      localStorage.clear();
+      window.location.href = '/login';
+    }
+    return Promise.reject(err);
+  }
+);
 
 export const authService = {
   login: (credentials: any) => api.post('/login', credentials).then(res => {
@@ -27,11 +49,15 @@ export const authService = {
     }
     throw new Error(res.data.message || 'Login failed');
   }),
-  logout: () => {
-    localStorage.removeItem('userId');
-    localStorage.removeItem('user');
-    // Clear any other potential stale data
-    localStorage.clear(); 
+  logout: async () => {
+    // Revoke server-side first; clearing localStorage alone used to leave the
+    // session valid for anyone who still had the cookie.
+    try {
+      await api.post('/logout');
+    } catch {
+      // Network failure or an already-dead session — clear locally regardless.
+    }
+    localStorage.clear();
     window.location.href = '/login';
   },
   isAuthenticated: () => !!localStorage.getItem('userId'),
