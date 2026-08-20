@@ -1185,6 +1185,27 @@ export const InsightCard: React.FC<{ insight: any }> = ({ insight }) => {
   const sevStyle = SEVERITY_STYLE[sevKey] || SEVERITY_STYLE.INFO;
   const accent = p.auto_dispatched ? '#ef4444' : sevStyle.color;
 
+  // Pick the card's narrative once, so the Reason block below can tell whether
+  // it has already been shown. Suppressing a verdict echo used to `return
+  // null`, which left cards rendering nothing but chips whenever the model
+  // returned an empty `summary` or a summary that was just "NOT_CRITICAL".
+  const VERDICT_WORDS = [
+    'ACT', 'MONITOR', 'IGNORE', 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW',
+    'INFO', 'NOT_CRITICAL', 'SUSPICIOUS', 'INSUFFICIENT_DATA',
+  ];
+  const isVerdictEcho = (text: string) => {
+    const u = (text || '').trim().toUpperCase();
+    return !u
+      || u === (p.verdict || '').toUpperCase()
+      || u === (p.severity || '').toUpperCase()
+      || VERDICT_WORDS.includes(u);
+  };
+  // First candidate carrying actual prose wins.
+  const narrative = [p.summary, p.reason, p.indicator]
+    .map(v => (v || '').trim())
+    .find(v => v && !isVerdictEcho(v)) || '';
+  const reasonAlreadyShown = !!narrative && narrative === (p.reason || '').trim();
+
   return (
     <div className="card" style={{ padding: '20px', borderLeft: `4px solid ${accent}` }}>
       {/* Header */}
@@ -1245,22 +1266,23 @@ export const InsightCard: React.FC<{ insight: any }> = ({ insight }) => {
         </div>
       )}
 
-      {/* Summary - hide if it's just a one-word echo of the verdict/severity */}
-      {(() => {
-        const s = (p.summary || '').trim();
-        if (!s) return null;
-        const upper = s.toUpperCase();
-        const isVerdictEcho =
-          upper === (p.verdict || '').toUpperCase()
-          || upper === (p.severity || '').toUpperCase()
-          || ['ACT', 'MONITOR', 'IGNORE', 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO', 'NOT_CRITICAL', 'SUSPICIOUS', 'INSUFFICIENT_DATA'].includes(upper);
-        if (isVerdictEcho) return null;
-        return (
-          <p style={{ fontSize: '0.95rem', lineHeight: 1.6, color: 'var(--text-primary)', margin: 0, marginBottom: '14px' }}>
-            {s}
-          </p>
-        );
-      })()}
+      {/* Every card says something. A blank card reads as a rendering bug and
+          gets scrolled past; "the model returned no narrative" is a fact about
+          the model that an operator should actually see. */}
+      {narrative ? (
+        <p style={{ fontSize: '0.95rem', lineHeight: 1.6, color: 'var(--text-primary)', margin: 0, marginBottom: '14px' }}>
+          {narrative}
+        </p>
+      ) : (
+        <p style={{
+          fontSize: '0.875rem', lineHeight: 1.6, color: 'var(--text-secondary)',
+          fontStyle: 'italic', margin: 0, marginBottom: '14px',
+        }}>
+          {(p.verdict || p.summary || '').trim()
+            ? `Model returned a ${(p.verdict || p.summary).trim().replace(/_/g, ' ').toLowerCase()} verdict with no written narrative.`
+            : 'Model returned no narrative for this event. Use View Source to see the log it was given.'}
+        </p>
+      )}
 
       {/* Target */}
       {p.target && p.target !== 'none' && (
@@ -1300,8 +1322,9 @@ export const InsightCard: React.FC<{ insight: any }> = ({ insight }) => {
         </div>
       )}
 
-      {/* Reason (defensive only) */}
-      {p.reason && (
+      {/* Reason (defensive only). Skipped when the block above already used it
+          as the narrative, which happens whenever `summary` was empty. */}
+      {p.reason && !reasonAlreadyShown && (
         <div style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)', fontStyle: 'italic', marginBottom: '12px' }}>
           Reason: {p.reason}
         </div>

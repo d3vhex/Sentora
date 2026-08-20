@@ -68,7 +68,11 @@ FALSE_POSITIVE_PATTERNS = [
 
 def parse_siem_event(row) -> AlertContext:
     try:
-        raw_msg = str(row.get("message", "{}"))
+        # `dict.get(key, default)` only returns the default when the key is
+        # ABSENT. These columns exist and are frequently NULL, so the default
+        # never fired and str(None) produced the literal string "None" — which
+        # is what the Alerts table was displaying under Source.
+        raw_msg = str(row.get("message") or "{}")
         if raw_msg.strip().startswith("{") and raw_msg.strip().endswith("}"):
             try:
                 msg_json = json.loads(raw_msg)
@@ -76,17 +80,17 @@ def parse_siem_event(row) -> AlertContext:
                 msg_json = {}
         else:
             msg_json = {}
-        
-        source = str(row.get("source", "Unknown"))
-        msg_str = msg_json.get("message", raw_msg) if isinstance(msg_json, dict) else raw_msg
-        
-        severity = msg_json.get("severity", "MEDIUM") if isinstance(msg_json, dict) else "MEDIUM"
-        event_type = msg_json.get("event_type", source) if isinstance(msg_json, dict) else source
-        ip_addr = msg_json.get("ip_address", None) if isinstance(msg_json, dict) else None
-        user = msg_json.get("user", None) if isinstance(msg_json, dict) else None
-        threat_hits = int(msg_json.get("threat_hits", 0)) if isinstance(msg_json, dict) else 0
 
-        ts_val = row.get("timestamp", time.time())
+        source = str(row.get("source") or "Unknown")
+        msg_str = (msg_json.get("message") or raw_msg) if isinstance(msg_json, dict) else raw_msg
+
+        severity = (msg_json.get("severity") or "MEDIUM") if isinstance(msg_json, dict) else "MEDIUM"
+        event_type = (msg_json.get("event_type") or source) if isinstance(msg_json, dict) else source
+        ip_addr = msg_json.get("ip_address") if isinstance(msg_json, dict) else None
+        user = msg_json.get("user") if isinstance(msg_json, dict) else None
+        threat_hits = int(msg_json.get("threat_hits") or 0) if isinstance(msg_json, dict) else 0
+
+        ts_val = row.get("timestamp") or time.time()
         
         return AlertContext(
             row_id=row["id"],

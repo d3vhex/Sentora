@@ -45,6 +45,22 @@ CREATE TABLE email_config (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Read by send_email() and /<agent>/notifications/templates. Was missing
+-- entirely, so templated alert mail failed at the SELECT.
+CREATE TABLE IF NOT EXISTS email_templates (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    template_name VARCHAR(255) NOT NULL UNIQUE,
+    subject_template TEXT NOT NULL,
+    body_template TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT IGNORE INTO email_templates (template_name, subject_template, body_template)
+VALUES ('critical_alerts',
+        '[Sentora] Critical alerts on {{agent}}',
+        'Agent: {{agent}}\n\n{{body}}\n\n-- Sentora');
+
 CREATE TABLE ai_config (
     id INT AUTO_INCREMENT PRIMARY KEY,
     model_name VARCHAR(100) NOT NULL UNIQUE,
