@@ -16,6 +16,14 @@ import {
   Server
 } from 'lucide-react';
 import api, { agentService } from '../services/api';
+import {
+  ACTIONS,
+  CATEGORY_LABELS,
+  getAction,
+  validateStep,
+  type ActionCategory,
+  type ActionSpec,
+} from '../lib/playbookActions';
 
 interface PlaybookNode {
   id: string;
@@ -29,6 +37,20 @@ interface PlaybookNode {
   }
 }
 
+/** One-line "3 steps · Block IP → Kill Process → …" for the list row. */
+const summarisePlaybook = (pb: any): string => {
+  const nodes: PlaybookNode[] = Array.isArray(pb?.nodes) ? pb.nodes : [];
+  if (!nodes.length) return 'No steps defined';
+
+  const labels = nodes.map(n => getAction(n?.data?.action)?.label || n?.data?.action || '?');
+  const shown = labels.slice(0, 3).join(' → ');
+  const rest = labels.length > 3 ? ` +${labels.length - 3} more` : '';
+  const risky = nodes.filter(n => getAction(n?.data?.action)?.destructive).length;
+
+  return `${nodes.length} step${nodes.length > 1 ? 's' : ''} · ${shown}${rest}`
+    + (risky ? `  ⚠ ${risky} irreversible` : '');
+};
+
 const Playbooks: React.FC = () => {
   const [agents, setAgents] = useState<string[]>([]);
   const [selectedAgent, setSelectedAgent] = useState('');
@@ -36,6 +58,9 @@ const Playbooks: React.FC = () => {
   const [runs, setRuns] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
   const [runningId, setRunningId] = useState<number | null>(null);
+  const [expandedRun, setExpandedRun] = useState<number | null>(null);
+  const [runDetail, setRunDetail] = useState<any>(null);
+  const [runDetailLoading, setRunDetailLoading] = useState(false);
   
   // Modal states
   const [showModal, setShowModal] = useState(false);
@@ -77,6 +102,24 @@ const Playbooks: React.FC = () => {
       setRuns(runList);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const toggleRunDetail = async (runId: number) => {
+    if (expandedRun === runId) {
+      setExpandedRun(null);
+      return;
+    }
+    setExpandedRun(runId);
+    setRunDetail(null);
+    setRunDetailLoading(true);
+    try {
+      setRunDetail(await agentService.getPlaybookRunDetail(selectedAgent, runId));
+    } catch (err) {
+      console.error('Failed to load run detail', err);
+      setRunDetail(null);
+    } finally {
+      setRunDetailLoading(false);
     }
   };
 
@@ -197,25 +240,22 @@ const Playbooks: React.FC = () => {
     setFormData({ ...formData, nodes: updatedNodes });
   };
 
-  const availableActions = [
-    { value: 'block_ip', label: 'Block IP Address', param: 'target', paramLabel: 'Target IP' },
-    { value: 'unblock_ip', label: 'Unblock IP Address', param: 'target', paramLabel: 'Target IP' },
-    { value: 'disable_user', label: 'Disable User Account', param: 'target', paramLabel: 'Username' },
-    { value: 'enable_user', label: 'Enable User Account', param: 'target', paramLabel: 'Username' },
-    { value: 'quarantine_file', label: 'Quarantine File', param: 'target', paramLabel: 'File Path' },
-    { value: 'delete_file', label: 'Delete File', param: 'target', paramLabel: 'File Path' },
-    { value: 'kill_process', label: 'Kill Process', param: 'target', paramLabel: 'PID or Name' },
-    { value: 'suspend_process', label: 'Suspend Process (Dondur)', param: 'target', paramLabel: 'PID or Name' },
-    { value: 'delete_registry_key', label: 'Delete Registry Key', param: 'target', paramLabel: 'Registry Path' },
-    { value: 'protect_shadows', label: 'Protect Volume Shadows (VSS)', param: '', paramLabel: '' },
-    { value: 'restart_service', label: 'Restart Service', param: 'target', paramLabel: 'Service Name' },
-    { value: 'isolate_host', label: 'Isolate Host from Network', param: '', paramLabel: '' },
-    { value: 'lock_machine', label: 'Lock Machine', param: '', paramLabel: '' },
-    { value: 'flush_dns', label: 'Flush DNS Cache', param: '', paramLabel: '' },
-    { value: 'clear_temp', label: 'Clear Temp Folders', param: '', paramLabel: '' },
-    { value: 'logoff_user', label: 'Logoff User', param: 'target', paramLabel: 'Session ID' },
-    { value: 'run_cmd', label: 'Run Custom Command', param: 'target', paramLabel: 'Command' }
-  ];
+  // Per-step parameter errors, keyed by step index. Recomputed on every edit
+  // so the Save button reflects the current state rather than the state at
+  // the last submit attempt.
+  const stepErrors = React.useMemo(() => {
+    const out: Record<number, string> = {};
+    formData.nodes.forEach((node, i) => {
+      const err = validateStep(node.data.action, node.data.params.target || '');
+      if (err) out[i] = err;
+    });
+    return out;
+  }, [formData.nodes]);
+
+  const hasStepErrors = Object.keys(stepErrors).length > 0;
+  const destructiveSteps = formData.nodes
+    .map(n => getAction(n.data.action))
+    .filter((a): a is ActionSpec => !!a?.destructive);
 
   return (
     <div>
@@ -286,6 +326,12 @@ const Playbooks: React.FC = () => {
                     </div>
                     <div>
                       <h4 style={{ fontSize: '1rem', fontWeight: 600, marginBottom: '4px' }}>{pb.name || 'Unnamed Playbook'}</h4>
+                      {/* The list showed only a name and a timestamp, so the
+                          one thing you need before pressing Run — what it will
+                          do — meant opening the editor first. */}
+                      <p style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '4px' }}>
+                        {summarisePlaybook(pb)}
+                      </p>
                       <p style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: '6px' }}>
                         <Clock size={12} /> Updated: {pb.updated_at}
                       </p>
@@ -323,8 +369,19 @@ const Playbooks: React.FC = () => {
               {runs.map((run, i) => {
                 const failed = !(run.status === 'success' || run.status === 'completed');
                 const reason = (run.last_error || run.error || run.failure_reason || '').toString().trim();
+                const expanded = expandedRun === run.id;
                 return (
-                  <div key={run.id || i} style={{ padding: '16px 20px', borderBottom: i < runs.length - 1 ? '1px solid var(--border-color)' : 'none' }}>
+                  <div
+                    key={run.id || i}
+                    onClick={() => toggleRunDetail(run.id)}
+                    style={{
+                      padding: '16px 20px',
+                      borderBottom: i < runs.length - 1 ? '1px solid var(--border-color)' : 'none',
+                      cursor: 'pointer',
+                      backgroundColor: expanded ? 'rgba(255,255,255,0.02)' : 'transparent',
+                    }}
+                    title="Show the result of each step"
+                  >
                     <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
                       <span style={{ fontSize: '0.875rem', fontWeight: 600 }}>{run.playbook_name || `Run #${run.id}`}</span>
                       <span style={{
@@ -362,6 +419,45 @@ const Playbooks: React.FC = () => {
                         }}
                       >
                         {reason}
+                      </div>
+                    )}
+
+                    {/* Per-step results. The run row only ever showed one
+                        error line, so "which step failed, and what did the
+                        endpoint say" was invisible — even though the server
+                        already records it per node. */}
+                    {expanded && (
+                      <div style={{ marginTop: '12px', borderTop: '1px solid var(--border-color)', paddingTop: '12px' }}>
+                        {runDetailLoading ? (
+                          <p style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>Loading step results…</p>
+                        ) : runDetail?.results?.length ? (
+                          runDetail.results.map((step: any, si: number) => {
+                            const stepOk = /success|ok|completed/i.test(String(step.status || ''));
+                            const spec = getAction(step.action || step.type);
+                            return (
+                              <div key={si} style={{ display: 'flex', gap: '10px', alignItems: 'flex-start', padding: '6px 0', fontSize: '0.75rem' }}>
+                                <span style={{ color: stepOk ? 'var(--accent-success)' : 'var(--accent-color)', marginTop: '2px', flexShrink: 0 }}>
+                                  {stepOk ? <CheckCircle2 size={13} /> : <AlertCircle size={13} />}
+                                </span>
+                                <div style={{ minWidth: 0 }}>
+                                  <div style={{ fontWeight: 600, color: 'var(--text-primary)' }}>
+                                    {si + 1}. {spec?.label || step.action || step.type || 'step'}
+                                    {step.target ? <span style={{ color: 'var(--text-secondary)', fontWeight: 400 }}> → {step.target}</span> : null}
+                                  </div>
+                                  {(step.output || step.error || step.message) && (
+                                    <div style={{ color: 'var(--text-secondary)', fontFamily: 'monospace', marginTop: '2px', wordBreak: 'break-word' }}>
+                                      {String(step.output || step.error || step.message).slice(0, 300)}
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })
+                        ) : (
+                          <p style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                            No per-step results were recorded for this run.
+                          </p>
+                        )}
                       </div>
                     )}
                   </div>
@@ -419,7 +515,7 @@ const Playbooks: React.FC = () => {
 
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', backgroundColor: 'rgba(0,0,0,0.1)', padding: '16px', borderRadius: '12px', border: '1px dashed var(--border-color)' }}>
                   {formData.nodes.map((node, index) => {
-                    const actionInfo = availableActions.find(a => a.value === node.data.action) || availableActions[0];
+                    const actionInfo = getAction(node.data.action);
                     return (
                       <div key={node.id} style={{ display: 'flex', gap: '12px', backgroundColor: 'var(--card-bg)', border: '1px solid var(--border-color)', borderRadius: '10px', padding: '16px', alignItems: 'flex-start', position: 'relative' }}>
                         
@@ -437,32 +533,79 @@ const Playbooks: React.FC = () => {
                         </div>
 
                         {/* Action Configuration */}
-                        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '10px' }}>
                           <div style={{ display: 'flex', gap: '12px' }}>
                             <div style={{ flex: 1 }}>
-                              <select 
+                              <select
                                 value={node.data.action}
                                 onChange={e => handleUpdateNode(index, 'action', e.target.value)}
                                 style={{ backgroundColor: 'var(--bg-color)', border: '1px solid var(--border-color)', padding: '10px', borderRadius: '8px', color: 'white', width: '100%', fontSize: '0.875rem' }}
                               >
-                                {availableActions.map(a => <option key={a.value} value={a.value}>{a.label}</option>)}
+                                {/* Grouped, so seventeen actions read as five short
+                                    lists instead of one long one. */}
+                                {(Object.keys(CATEGORY_LABELS) as ActionCategory[])
+                                  .filter(cat => ACTIONS.some(a => a.category === cat))
+                                  .map(cat => (
+                                    <optgroup key={cat} label={CATEGORY_LABELS[cat]}>
+                                      {ACTIONS.filter(a => a.category === cat).map(a => (
+                                        <option key={a.value} value={a.value}>
+                                          {a.label}{a.destructive ? '  ⚠' : ''}
+                                        </option>
+                                      ))}
+                                    </optgroup>
+                                  ))}
                               </select>
                             </div>
                             <button type="button" onClick={() => handleRemoveNode(index)} style={{ padding: '8px', color: 'var(--accent-color)', backgroundColor: 'rgba(239, 68, 68, 0.1)', borderRadius: '8px' }}>
                               <Trash2 size={16} />
                             </button>
                           </div>
-                          
-                          {actionInfo.param && (
+
+                          {/* What the step actually does, so the operator does
+                              not have to already know the action name. */}
+                          {actionInfo && (
+                            <p style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', margin: 0, lineHeight: 1.5 }}>
+                              {actionInfo.description}
+                            </p>
+                          )}
+
+                          {actionInfo?.destructive && (
+                            <div style={{
+                              display: 'flex', alignItems: 'center', gap: '8px',
+                              fontSize: '0.75rem', color: '#f59e0b', fontWeight: 600,
+                              backgroundColor: 'rgba(245,158,11,0.08)',
+                              border: '1px solid rgba(245,158,11,0.25)',
+                              borderRadius: '6px', padding: '8px 10px',
+                            }}>
+                              <AlertCircle size={14} /> Cannot be undone from the console.
+                            </div>
+                          )}
+
+                          {/* Only rendered when the action takes one. The old
+                              editor showed an empty box for parameterless
+                              actions, which read as a field left unfilled. */}
+                          {actionInfo?.param && (
                             <div>
-                              <input 
-                                type="text" 
-                                value={node.data.params[actionInfo.param] || ''}
-                                onChange={e => handleUpdateNode(index, actionInfo.param, e.target.value)}
-                                placeholder={actionInfo.paramLabel}
-                                required
-                                style={{ backgroundColor: 'rgba(0,0,0,0.2)', border: '1px solid var(--border-color)', padding: '10px 12px', borderRadius: '8px', color: 'white', width: '100%', fontSize: '0.875rem' }}
+                              <label style={{ fontSize: '0.7rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em', color: 'var(--text-secondary)', display: 'block', marginBottom: '6px' }}>
+                                {actionInfo.param.label}
+                              </label>
+                              <input
+                                type="text"
+                                value={node.data.params.target || ''}
+                                onChange={e => handleUpdateNode(index, 'target', e.target.value)}
+                                placeholder={actionInfo.param.placeholder}
+                                style={{
+                                  backgroundColor: 'rgba(0,0,0,0.2)',
+                                  border: `1px solid ${stepErrors[index] ? 'rgba(239,68,68,0.5)' : 'var(--border-color)'}`,
+                                  padding: '10px 12px', borderRadius: '8px', color: 'white',
+                                  width: '100%', fontSize: '0.875rem',
+                                }}
                               />
+                              {stepErrors[index] && (
+                                <p style={{ fontSize: '0.75rem', color: '#ef4444', margin: '6px 0 0 0' }}>
+                                  {stepErrors[index]}
+                                </p>
+                              )}
                             </div>
                           )}
                         </div>
@@ -479,9 +622,41 @@ const Playbooks: React.FC = () => {
                 </div>
               </div>
 
+              {destructiveSteps.length > 0 && (
+                <div style={{
+                  padding: '12px 14px', borderRadius: '8px', fontSize: '0.8125rem',
+                  backgroundColor: 'rgba(245,158,11,0.08)',
+                  border: '1px solid rgba(245,158,11,0.25)', color: '#fbbf24',
+                  display: 'flex', gap: '10px', alignItems: 'flex-start',
+                }}>
+                  <AlertCircle size={16} style={{ flexShrink: 0, marginTop: '2px' }} />
+                  <span>
+                    This playbook contains {destructiveSteps.length} irreversible step
+                    {destructiveSteps.length > 1 ? 's' : ''} ({destructiveSteps.map(a => a.label).join(', ')}).
+                    Running it cannot be undone from the console.
+                  </span>
+                </div>
+              )}
+
               <div style={{ display: 'flex', gap: '12px', marginTop: '12px' }}>
                 <button type="button" onClick={() => setShowModal(false)} style={{ flex: 1, padding: '14px', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'white', fontWeight: 600 }}>Cancel</button>
-                <button type="submit" style={{ flex: 1, padding: '14px', borderRadius: '8px', backgroundColor: 'var(--accent-secondary)', color: 'white', fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}>
+                <button
+                  type="submit"
+                  disabled={hasStepErrors || formData.nodes.length === 0}
+                  title={
+                    formData.nodes.length === 0 ? 'Add at least one step'
+                      : hasStepErrors ? 'Fix the highlighted steps first'
+                        : undefined
+                  }
+                  style={{
+                    flex: 1, padding: '14px', borderRadius: '8px',
+                    backgroundColor: (hasStepErrors || formData.nodes.length === 0)
+                      ? 'var(--border-color)' : 'var(--accent-secondary)',
+                    color: 'white', fontWeight: 700, display: 'flex',
+                    alignItems: 'center', justifyContent: 'center', gap: '8px',
+                    cursor: (hasStepErrors || formData.nodes.length === 0) ? 'not-allowed' : 'pointer',
+                  }}
+                >
                   <Save size={18} /> {isEditing ? 'Update Playbook' : 'Create Playbook'}
                 </button>
               </div>

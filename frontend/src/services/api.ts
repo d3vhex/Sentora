@@ -102,6 +102,10 @@ export const agentService = {
   // Agent Config
   getAgentYamlConfig: (agent: string, type: string) => api.get(`/${agent}/config/${type}`).then(res => res.data),
   setAgentYamlConfig: (agent: string, type: string, content: string) => api.post(`/${agent}/config/${type}`, { content }).then(res => res.data),
+  // Lints without pushing, so the editor can flag a broken regex before it
+  // reaches a sensor and silently disables detection.
+  validateAgentConfig: (agent: string, type: string, content: string) =>
+    api.post(`/${agent}/config/${type}/validate`, { content }).then(res => res.data),
   
   // SOAR Actions
   getSoarActions: (agent: string, params?: any) => api.get(`/${agent}/soar_actions`, { params }).then(res => res.data),
