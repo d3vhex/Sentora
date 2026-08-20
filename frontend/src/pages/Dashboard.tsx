@@ -17,6 +17,8 @@ const Dashboard: React.FC = () => {
   const [resources, setResources] = useState<any>(null);
   const [globalStats, setGlobalStats] = useState<any>(null);
   const [aiInsights, setAiInsights] = useState<any[]>([]);
+  const [allInsights, setAllInsights] = useState<any[]>([]);
+  const [dbStatus, setDbStatus] = useState<any>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -28,18 +30,21 @@ const Dashboard: React.FC = () => {
   const fetchData = async () => {
     setLoading(true);
     try {
-      const [agentList, allAlerts, serverRes, gStats, aiRes] = await Promise.all([
+      const [agentList, allAlerts, serverRes, gStats, aiRes, dbRes] = await Promise.all([
         agentService.getAgents(),
         agentService.getAllAlerts(),
         agentService.getServerResources(),
         agentService.getGlobalStats(),
-        agentService.getCustom('/api/ai-insights/all')
+        agentService.getCustom('/api/ai-insights/all'),
+        agentService.getCustom('/db-status').catch(() => null),
       ]);
       setAgents(agentList || []);
       setAlerts(allAlerts || []);
       setResources(serverRes);
       setGlobalStats(gStats);
+      setDbStatus(dbRes);
       if (aiRes && aiRes.results) {
+        setAllInsights(aiRes.results || []);
         setAiInsights(aiRes.results.slice(0, 3)); // Only show top 3 on dashboard
       }
     } catch (err) {
@@ -50,6 +55,41 @@ const Dashboard: React.FC = () => {
   };
 
   const criticalAlerts = alerts.filter(a => a.severity === 'CRITICAL');
+
+  // Global Health, computed rather than asserted. "Alert Coverage: 100%" and
+  // "DB Integrity: Verified" used to be literal strings in the JSX — they
+  // never read anything and would have kept saying the same thing with the
+  // database down. On a security dashboard a metric nobody computes is worse
+  // than no metric, because it gets trusted.
+  const health = React.useMemo(() => {
+    const online = agents.filter(a => a?.status === 'Online').length;
+    const total = agents.length;
+
+    // Agents the platform has actually received alert telemetry from. An
+    // enrolled agent that is online but has never reported is a blind spot,
+    // and that distinction is the whole point of a coverage number.
+    const reporting = new Set(
+      alerts.map(a => a?.agent).filter(Boolean)
+    ).size;
+
+    // Insights produced in the last hour — shows the worker fleet is draining
+    // its queue, not just that rows exist from some point in the past.
+    const hourAgo = Date.now() - 3600_000;
+    const recentInsights = allInsights.filter(i => {
+      const t = Date.parse(i?.created_at || i?.timestamp || '');
+      return Number.isFinite(t) && t >= hourAgo;
+    }).length;
+
+    return {
+      online,
+      total,
+      reporting,
+      coverage: total > 0 ? Math.round((reporting / total) * 100) : null,
+      recentInsights,
+      dbOnline: typeof dbStatus?.mysql === 'string' && dbStatus.mysql.startsWith('online'),
+      dbDetail: dbStatus?.mysql || dbStatus?.error || 'unreachable',
+    };
+  }, [agents, alerts, allInsights, dbStatus]);
 
   return (
     <div>
@@ -190,18 +230,41 @@ const Dashboard: React.FC = () => {
           <div className="card" style={{ padding: '24px' }}>
             <h3 style={{ fontSize: '1.125rem', fontWeight: 700, marginBottom: '24px' }}>Global Health</h3>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.875rem' }}>
-                <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>Active Agents</span>
-                <span style={{ fontWeight: 700, color: 'var(--text-primary)' }}>{agents.length}</span>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.875rem' }}>
-                <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>Alert Coverage</span>
-                <span style={{ fontWeight: 700, color: 'var(--accent-success)' }}>100%</span>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.875rem' }}>
-                <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>DB Integrity</span>
-                <span style={{ fontWeight: 700, color: 'var(--accent-success)' }}>Verified</span>
-              </div>
+              <HealthRow
+                label="Agents Online"
+                hint="Reported telemetry within the last 90 seconds"
+                value={`${health.online} / ${health.total}`}
+                color={
+                  health.total === 0 ? 'var(--text-secondary)'
+                    : health.online === health.total ? 'var(--accent-success)'
+                    : health.online === 0 ? 'var(--accent-color)'
+                    : 'var(--accent-warning)'
+                }
+              />
+              <HealthRow
+                label="Alert Coverage"
+                hint="Enrolled agents the platform has received alerts from. The rest are blind spots."
+                value={health.coverage === null ? 'No agents' : `${health.coverage}%`}
+                color={
+                  health.coverage === null ? 'var(--text-secondary)'
+                    : health.coverage >= 100 ? 'var(--accent-success)'
+                    : health.coverage >= 50 ? 'var(--accent-warning)'
+                    : 'var(--accent-color)'
+                }
+                sub={health.coverage === null ? undefined : `${health.reporting} of ${health.total} reporting`}
+              />
+              <HealthRow
+                label="AI Triage"
+                hint="Insights written by the worker fleet in the last hour"
+                value={health.recentInsights > 0 ? `${health.recentInsights} / hr` : 'Idle'}
+                color={health.recentInsights > 0 ? 'var(--accent-success)' : 'var(--text-secondary)'}
+              />
+              <HealthRow
+                label="Database"
+                hint={String(health.dbDetail)}
+                value={health.dbOnline ? 'Online' : 'Unreachable'}
+                color={health.dbOnline ? 'var(--accent-success)' : 'var(--accent-color)'}
+              />
             </div>
           </div>
           
@@ -231,6 +294,29 @@ const Dashboard: React.FC = () => {
     </div>
   );
 };
+
+// `hint` goes on the title attribute so the definition of each number is
+// reachable — a coverage percentage nobody can define is a number nobody can
+// act on.
+const HealthRow: React.FC<{
+  label: string;
+  value: string;
+  color: string;
+  hint?: string;
+  sub?: string;
+}> = ({ label, value, color, hint, sub }) => (
+  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', fontSize: '0.875rem', gap: '12px' }} title={hint}>
+    <span style={{ color: 'var(--text-secondary)', fontWeight: 500, cursor: hint ? 'help' : 'default' }}>{label}</span>
+    <div style={{ textAlign: 'right' }}>
+      <div style={{ fontWeight: 700, color }}>{value}</div>
+      {sub && (
+        <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: '2px', fontWeight: 500 }}>
+          {sub}
+        </div>
+      )}
+    </div>
+  </div>
+);
 
 const ResourceCard: React.FC<{ label: string, value: number, icon: React.ReactNode }> = ({ label, value, icon }) => (
   <div className="card">

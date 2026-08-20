@@ -240,6 +240,48 @@ async def init_enrollment_tables():
     except Exception as e:
         print(f"[Enrollment] Error initializing tables: {e}")
 
+async def init_email_templates_table():
+    """Ensure `email_templates` exists in userdb (idempotent migration).
+
+    `send_email` and `/<agent>/notifications/templates` both query this table,
+    but init_userdb.sql never created it — so every templated alert mail failed
+    at the SELECT and the notifications endpoint returned a 500. Columns match
+    what send_email reads: template_name, subject_template, body_template.
+    """
+    try:
+        with sync_mysql_conn("userdb") as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS email_templates (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        template_name VARCHAR(255) NOT NULL UNIQUE,
+                        subject_template TEXT NOT NULL,
+                        body_template TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                # Seed the one template dispatch_critical_alerts asks for by
+                # name, so critical-alert mail works without the operator
+                # having to discover the required template_name first.
+                cur.execute("""
+                    INSERT IGNORE INTO email_templates
+                        (template_name, subject_template, body_template)
+                    VALUES (%s, %s, %s)
+                """, (
+                    "critical_alerts",
+                    "[Sentora] Critical alerts on {{agent}}",
+                    "Agent: {{agent}}\n\n{{body}}\n\n-- Sentora",
+                ))
+                conn.commit()
+            finally:
+                cur.close()
+        print("[Email] Templates table ready in userdb.")
+    except Exception as e:
+        print(f"[Email] Error initializing templates table: {e}")
+
+
 async def init_session_table():
     """Ensure the `sessions` table exists in userdb (idempotent migration)."""
     try:
@@ -259,6 +301,7 @@ async def setup_hub(app):
     await init_hub_db()
     await init_enrollment_tables()
     await init_session_table()
+    await init_email_templates_table()
 
 
 def is_soar_enabled() -> bool:
@@ -5259,7 +5302,12 @@ async def get_ldap_config(request):
     try:
         cnx = await connect_userdb()
         cursor = await cnx.cursor()
-        await cursor.execute("SELECT * FROM ldap_config ORDER BY updated_at DESC LIMIT 1")
+        # Was `FROM ldap_config ORDER BY updated_at` — neither exists. The
+        # table is `ldap_conf` (init_userdb.sql, and every other query in this
+        # file) and it has created_at, not updated_at. It is also a
+        # single-row table pinned to id=1 by the upsert below, so there is
+        # nothing to order by.
+        await cursor.execute("SELECT * FROM ldap_conf LIMIT 1")
         columns = [col[0] for col in cursor.description]
         row = await cursor.fetchone()
         await cursor.close(); await cnx.close()
@@ -6005,46 +6053,96 @@ async def periodic_threat_intel_update():
 @require_permission("read_telemetry")
 @app.route("/threat-intel")
 async def get_threat_intel(request):
-    async with aiomysql.create_pool(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, db="sentora_hub", autocommit=True) as pool:
-        async with pool.acquire() as conn:
-            async with conn.cursor(aiomysql.DictCursor) as cur:
-                await cur.execute("SELECT * FROM threat_intel ORDER BY created_at DESC")
-                rows = await cur.fetchall()
-                return sanic_json(rows)
-
-@require_permission("read_telemetry")
-@app.route("/api/compliance/report")
-async def get_compliance_report(request):
-    """
-    Generates a simple compliance score based on recent telemetry.
-    """
     try:
         async with aiomysql.create_pool(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, db="sentora_hub", autocommit=True) as pool:
             async with pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
-                    await cur.execute("SELECT COUNT(*) as count FROM vulnerabilities_report")
-                    v_row = await cur.fetchone()
-                    vuln_count = v_row["count"] if v_row else 0
-                    
-                    await cur.execute("SELECT COUNT(*) as count FROM fim_data WHERE status != 'baseline' AND last_seen > NOW() - INTERVAL 1 DAY")
-                    f_row = await cur.fetchone()
-                    fim_count = f_row["count"] if f_row else 0
-                    
-                    score = 100 - (vuln_count * 2) - (fim_count * 5)
-                    score = max(0, score)
-                    
-                    status = "EXCELLENT" if score > 90 else "GOOD" if score > 75 else "WARNING" if score > 50 else "CRITICAL"
-                    
-                    return sanic_json({
-                        "score": score,
-                        "status": status,
-                        "checks": {
-                            "vulnerabilities": vuln_count,
-                            "recent_fim_changes": fim_count,
-                            "valid": True 
-                        },
-                        "timestamp": datetime.now().isoformat()
-                    })
+                    await cur.execute("SELECT * FROM threat_intel ORDER BY created_at DESC")
+                    rows = await cur.fetchall()
+        # `created_at` is a datetime, which the default serializer cannot
+        # encode — so this 500'd for every populated table and only ever
+        # looked healthy while threat_intel was empty. Every other endpoint
+        # in this file already passes CustomEncoder; this one was missed.
+        return sanic_json(
+            rows,
+            dumps=lambda obj: pyjson.dumps(obj, ensure_ascii=False, cls=CustomEncoder),
+        )
+    except Exception as e:
+        # There was no handler at all, so failures fell through to the global
+        # one and surfaced as "Contact administrator" with the cause hidden.
+        print(f"[!] threat-intel fetch failed: {e}")
+        return sanic_json({"status": "error", "message": str(e)}, status=500)
+
+@require_permission("read_telemetry")
+@app.route("/api/compliance/report")
+async def get_compliance_report(request):
+    """Compliance score derived from vulnerability and FIM telemetry.
+
+    This queried `sentora_hub.vulnerabilities_report` and `sentora_hub.fim_data`,
+    neither of which exists — `init_hub_db()` only creates hardware_inventory
+    and threat_intel there. Both tables are per-agent (`<agent>_db`), so the
+    endpoint was written against a central aggregation that was never built.
+
+    Creating the two tables empty in sentora_hub would have silenced the 500
+    while making the report permanently answer "EXCELLENT / 100" — a
+    compliance figure computed from nothing. It aggregates across agent
+    databases instead, which is where the data actually is.
+    """
+    try:
+        agents = await _list_agent_names_sync()
+
+        vuln_count = 0
+        fim_count = 0
+        scanned: list[str] = []
+        unreachable: list[str] = []
+
+        for agent in agents:
+            try:
+                async with agent_conn(agent) as cnx:
+                    cur = await cnx.cursor()
+                    try:
+                        await cur.execute("SELECT COUNT(*) FROM vulnerabilities_report")
+                        row = await cur.fetchone()
+                        vuln_count += int(row[0]) if row else 0
+
+                        await cur.execute(
+                            "SELECT COUNT(*) FROM fim_data "
+                            "WHERE status != 'baseline' AND last_seen > NOW() - INTERVAL 1 DAY"
+                        )
+                        row = await cur.fetchone()
+                        fim_count += int(row[0]) if row else 0
+                    finally:
+                        await cur.close()
+                scanned.append(agent)
+            except Exception as e:
+                # A newly-enrolled agent may not have provisioned these tables
+                # yet. Skipping it is correct, but the caller has to be told —
+                # a score computed over half the fleet is not a fleet score.
+                print(f"[compliance] skipped {agent}: {e}")
+                unreachable.append(agent)
+
+        score = max(0, 100 - (vuln_count * 2) - (fim_count * 5))
+        status = ("EXCELLENT" if score > 90 else "GOOD" if score > 75
+                  else "WARNING" if score > 50 else "CRITICAL")
+
+        return sanic_json({
+            "score": score,
+            "status": status,
+            "checks": {
+                "vulnerabilities": vuln_count,
+                "recent_fim_changes": fim_count,
+                # False when the score does not cover the whole fleet, so the
+                # UI can mark the figure as partial instead of presenting it
+                # as authoritative.
+                "valid": len(scanned) == len(agents) and bool(agents),
+            },
+            "coverage": {
+                "agents_total": len(agents),
+                "agents_scanned": len(scanned),
+                "agents_unreachable": unreachable,
+            },
+            "timestamp": datetime.now().isoformat(),
+        })
     except Exception as e:
         return sanic_json({"error": str(e)}, status=500)
 
@@ -6138,6 +6236,23 @@ async def list_databases(request):
     except Exception as e:
         return sanic_json({"status": "error", "message": str(e)}, status=500)
 
+# MySQL: 1049 unknown database, 1146 table doesn't exist. Both mean the
+# client named something that isn't there — a 404, not a server fault. They
+# were surfacing as 500s, which makes a mistyped name in the DB browser look
+# like the platform is broken and buries real faults in the same bucket.
+_MISSING_OBJECT_CODES = (1049, 1146)
+
+
+def _db_object_error(e: Exception):
+    code = getattr(e, "errno", None)
+    if code is None:
+        m = re.search(r"\b(1049|1146)\b", str(e))
+        code = int(m.group(1)) if m else None
+    if code in _MISSING_OBJECT_CODES:
+        return sanic_json({"status": "error", "message": str(e)}, status=404)
+    return sanic_json({"status": "error", "message": str(e)}, status=500)
+
+
 @require_permission("manage_db")
 @app.route("/databases/<db_name>/tables", methods=["GET"])
 async def list_tables_in_database(request, db_name):
@@ -6153,7 +6268,7 @@ async def list_tables_in_database(request, db_name):
         tables = await asyncio.to_thread(_q)
         return sanic_json({"status": "success", "tables": tables})
     except Exception as e:
-        return sanic_json({"status": "error", "message": str(e)}, status=500)
+        return _db_object_error(e)
 
 @require_permission("manage_db")
 @app.route("/databases/<db_name>/tables/<table_name>/columns", methods=["GET"])
@@ -6173,7 +6288,7 @@ async def list_table_columns(request, db_name, table_name):
         columns = await asyncio.to_thread(_q)
         return sanic_json({"status": "success", "columns": columns})
     except Exception as e:
-        return sanic_json({"status": "error", "message": str(e)}, status=500)
+        return _db_object_error(e)
 
 @require_permission("manage_db")
 @app.route("/databases/<db_name>/tables/<table_name>/data", methods=["GET"])
@@ -6200,7 +6315,7 @@ async def get_table_data(request, db_name, table_name):
             content_type="application/json; charset=utf-8"
         )
     except Exception as e:
-        return sanic_json({"status": "error", "message": str(e)}, status=500)
+        return _db_object_error(e)
 
 @require_permission("manage_users")
 @app.route("/roles/<role_id>", methods=["DELETE"])
