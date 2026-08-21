@@ -13,13 +13,12 @@ import { Link } from 'react-router-dom';
 
 const Dashboard: React.FC = () => {
   const [agents, setAgents] = useState<any[]>([]);
-  const [alerts, setAlerts] = useState<any[]>([]);
   const [resources, setResources] = useState<any>(null);
   const [globalStats, setGlobalStats] = useState<any>(null);
   const [aiInsights, setAiInsights] = useState<any[]>([]);
-  const [allInsights, setAllInsights] = useState<any[]>([]);
   const [dbStatus, setDbStatus] = useState<any>(null);
-  const [exposure, setExposure] = useState<any>(null);
+  const [summary, setSummary] = useState<any>(null);
+  const [recentAlerts, setRecentAlerts] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -31,25 +30,27 @@ const Dashboard: React.FC = () => {
   const fetchData = async () => {
     setLoading(true);
     try {
-      const [agentList, allAlerts, serverRes, gStats, aiRes, dbRes, expRes] = await Promise.all([
+      // Four fan-out requests collapsed into one aggregate. The page was
+      // downloading up to 100 decrypted alerts per agent, and every AI
+      // insight with its full raw log attached, only to count them.
+      const [agentList, summary, serverRes, gStats, dbRes, aiRes, recent] = await Promise.all([
         agentService.getAgents(),
-        agentService.getAllAlerts(),
+        agentService.getDashboardSummary(),
         agentService.getServerResources(),
         agentService.getGlobalStats(),
-        agentService.getCustom('/api/ai-insights/all'),
         agentService.getCustom('/db-status').catch(() => null),
-        agentService.getExposureReport().catch(() => null),
+        // Still needed, but only for the three headlines shown here.
+        agentService.getCustom('/api/ai-insights/all?limit=3&per_agent=3').catch(() => null),
+        // The feed below shows six rows; it used to pull a hundred per agent.
+        agentService.getCustom('/all_alerts?per_agent=3').catch(() => []),
       ]);
-      setExposure(expRes);
       setAgents(agentList || []);
-      setAlerts(allAlerts || []);
+      setSummary(summary?.status === 'success' ? summary : null);
       setResources(serverRes);
       setGlobalStats(gStats);
       setDbStatus(dbRes);
-      if (aiRes && aiRes.results) {
-        setAllInsights(aiRes.results || []);
-        setAiInsights(aiRes.results.slice(0, 3)); // Only show top 3 on dashboard
-      }
+      setAiInsights(aiRes?.results?.slice(0, 3) || []);
+      setRecentAlerts(Array.isArray(recent) ? recent.slice(0, 6) : []);
     } catch (err) {
       console.error("Dashboard fetch error", err);
     } finally {
@@ -57,42 +58,33 @@ const Dashboard: React.FC = () => {
     }
   };
 
-  const criticalAlerts = alerts.filter(a => a.severity === 'CRITICAL');
-
   // Global Health, computed rather than asserted. "Alert Coverage: 100%" and
   // "DB Integrity: Verified" used to be literal strings in the JSX — they
   // never read anything and would have kept saying the same thing with the
   // database down. On a security dashboard a metric nobody computes is worse
   // than no metric, because it gets trusted.
+  //
+  // The counts now arrive already aggregated, so none of this depends on
+  // having downloaded the underlying rows.
   const health = React.useMemo(() => {
     const online = agents.filter(a => a?.status === 'Online').length;
     const total = agents.length;
-
-    // Agents the platform has actually received alert telemetry from. An
-    // enrolled agent that is online but has never reported is a blind spot,
-    // and that distinction is the whole point of a coverage number.
-    const reporting = new Set(
-      alerts.map(a => a?.agent).filter(Boolean)
-    ).size;
-
-    // Insights produced in the last hour — shows the worker fleet is draining
-    // its queue, not just that rows exist from some point in the past.
-    const hourAgo = Date.now() - 3600_000;
-    const recentInsights = allInsights.filter(i => {
-      const t = Date.parse(i?.created_at || i?.timestamp || '');
-      return Number.isFinite(t) && t >= hourAgo;
-    }).length;
+    const cov = summary?.coverage;
+    const reporting = cov?.agents_reporting ?? 0;
 
     return {
       online,
       total,
       reporting,
       coverage: total > 0 ? Math.round((reporting / total) * 100) : null,
-      recentInsights,
+      recentInsights: summary?.totals?.insights_1h ?? 0,
       dbOnline: typeof dbStatus?.mysql === 'string' && dbStatus.mysql.startsWith('online'),
       dbDetail: dbStatus?.mysql || dbStatus?.error || 'unreachable',
     };
-  }, [agents, alerts, allInsights, dbStatus]);
+  }, [agents, summary, dbStatus]);
+
+  const criticalCount = summary?.totals?.critical ?? 0;
+  const alertCount = summary?.totals?.alerts ?? 0;
 
   return (
     <div>
@@ -136,8 +128,8 @@ const Dashboard: React.FC = () => {
         <StatCard 
           icon={<ShieldAlert color="var(--accent-color)" />} 
           label="Critical Alerts" 
-          value={criticalAlerts.length.toString()} 
-          warning={criticalAlerts.length > 0}
+          value={criticalCount.toString()}
+          warning={criticalCount > 0}
           link="/all-alerts"
         />
         <StatCard 
@@ -163,8 +155,8 @@ const Dashboard: React.FC = () => {
             <Link to="/all-alerts" style={{ fontSize: '0.75rem', color: 'var(--accent-secondary)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em' }}>View All</Link>
           </div>
           <div style={{ padding: '0' }}>
-            {alerts.slice(0, 6).map((alert, i) => (
-              <div key={i} style={{ padding: '16px 24px', borderBottom: i < alerts.slice(0,6).length - 1 ? '1px solid var(--border-color)' : 'none', display: 'flex', gap: '16px', alignItems: 'flex-start', transition: 'background-color 0.2s ease' }}
+            {recentAlerts.map((alert, i) => (
+              <div key={i} style={{ padding: '16px 24px', borderBottom: i < recentAlerts.length - 1 ? '1px solid var(--border-color)' : 'none', display: 'flex', gap: '16px', alignItems: 'flex-start', transition: 'background-color 0.2s ease' }}
                 onMouseOver={e => e.currentTarget.style.backgroundColor = 'var(--bg-color)'}
                 onMouseOut={e => e.currentTarget.style.backgroundColor = 'transparent'}
               >
@@ -178,7 +170,7 @@ const Dashboard: React.FC = () => {
                 </div>
               </div>
             ))}
-            {alerts.length === 0 && (
+            {recentAlerts.length === 0 && (
               <div style={{ padding: '60px 20px', textAlign: 'center', color: 'var(--text-secondary)', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px' }}>
                 <Activity size={48} style={{ opacity: 0.1 }} />
                 <p>No recent alerts detected in the system.</p>
@@ -280,7 +272,7 @@ const Dashboard: React.FC = () => {
               <span style={{ fontSize: '0.7rem', color: 'var(--text-secondary)' }}>FIM: last 24h</span>
             </div>
 
-            {!exposure || exposure.status !== 'success' ? (
+            {!summary ? (
               <p style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)' }}>
                 Exposure data unavailable.
               </p>
@@ -289,43 +281,43 @@ const Dashboard: React.FC = () => {
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginBottom: '16px' }}>
                   <ExposureStat
                     label="Vulnerabilities"
-                    value={exposure.totals?.vulnerabilities ?? 0}
-                    tone={exposure.totals?.vulnerabilities > 0 ? 'warn' : 'ok'}
+                    value={summary.totals?.vulnerabilities ?? 0}
+                    tone={summary.totals?.vulnerabilities > 0 ? 'warn' : 'ok'}
                   />
                   <ExposureStat
-                    label="Files changed"
-                    value={exposure.totals?.fim_changed ?? 0}
-                    tone={exposure.totals?.fim_changed > 0 ? 'warn' : 'ok'}
+                    label="File events 24h"
+                    value={summary.totals?.fim_24h ?? 0}
+                    tone={summary.totals?.fim_24h > 0 ? 'warn' : 'ok'}
                   />
                   <ExposureStat
-                    label="Files added"
-                    value={exposure.totals?.fim_new ?? 0}
+                    label="Total alerts"
+                    value={alertCount}
                     tone="neutral"
                   />
                   <ExposureStat
-                    label="Files deleted"
-                    value={exposure.totals?.fim_deleted ?? 0}
-                    tone={exposure.totals?.fim_deleted > 0 ? 'bad' : 'ok'}
+                    label="Critical"
+                    value={criticalCount}
+                    tone={criticalCount > 0 ? 'bad' : 'ok'}
                   />
                 </div>
 
                 {/* Worst agents first — where to start, not just how bad. */}
-                {(exposure.agents || []).slice(0, 3).map((a: any) => (
+                {(summary.agents || []).slice(0, 3).map((a: any) => (
                   <div key={a.agent} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.75rem', padding: '6px 0', borderTop: '1px solid var(--border-color)' }}>
                     <span style={{ color: 'var(--text-primary)', fontWeight: 600 }}>{a.agent}</span>
                     <span style={{ color: 'var(--text-secondary)' }}>
-                      {a.vulnerabilities} vulns · {a.fim_changed + a.fim_new + a.fim_deleted} file events
+                      {a.critical} critical · {a.vulnerabilities} vulns · {a.fim_24h} file events
                     </span>
                   </div>
                 ))}
 
                 {/* Partial numbers must say so. A total over half the fleet is
                     not a fleet total. */}
-                {exposure.coverage && !exposure.coverage.complete && (
+                {summary.coverage && !summary.coverage.complete && (
                   <p style={{ fontSize: '0.7rem', color: 'var(--accent-warning)', marginTop: '12px', lineHeight: 1.5 }}>
-                    Partial: {exposure.coverage.agents_scanned} of {exposure.coverage.agents_total} agents scanned
-                    {exposure.coverage.agents_unreachable?.length
-                      ? ` (no data from ${exposure.coverage.agents_unreachable.join(', ')})`
+                    Partial: {summary.coverage.agents_scanned} of {summary.coverage.agents_total} agents scanned
+                    {summary.coverage.agents_unreachable?.length
+                      ? ` (no data from ${summary.coverage.agents_unreachable.join(', ')})`
                       : ''}
                   </p>
                 )}

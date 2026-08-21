@@ -2255,29 +2255,30 @@ async def analyze_all_agents_logs():
 async def get_global_inventory_stats(request):
     try:
         def fetch_counts():
+            """One query instead of three per agent.
+
+            This looped `USE <db>` then three COUNT(*)s per agent on a single
+            connection — 3N round trips, serial. information_schema keeps
+            approximate row counts for InnoDB and answers for the whole fleet
+            at once. "Approximate" is fine here: these are headline inventory
+            totals, not anything a decision hangs on.
+            """
             with sync_mysql_conn() as conn:
                 cursor = conn.cursor()
                 try:
-                    cursor.execute("SHOW DATABASES")
-                    agents = [db[0] for db in cursor.fetchall() if db[0].endswith('_db')]
-
-                    total_hardware = 0
-                    total_software = 0
-                    total_fim = 0
-
-                    for db in agents:
-                        try:
-                            cursor.execute(f"USE {db}")
-                            cursor.execute("SELECT COUNT(*) FROM hardware_inventory")
-                            total_hardware += cursor.fetchone()[0]
-                            cursor.execute("SELECT COUNT(*) FROM software_inventory")
-                            total_software += cursor.fetchone()[0]
-                            cursor.execute("SELECT COUNT(*) FROM fim_data")
-                            total_fim += cursor.fetchone()[0]
-                        except Exception:
-                            continue
-
-                    return total_hardware, total_software, total_fim
+                    cursor.execute("""
+                        SELECT TABLE_NAME, SUM(TABLE_ROWS)
+                          FROM information_schema.TABLES
+                         WHERE TABLE_SCHEMA LIKE %s
+                           AND TABLE_NAME IN ('hardware_inventory','software_inventory','fim_data')
+                         GROUP BY TABLE_NAME
+                    """, ('%\\_db',))
+                    counts = {name: int(n or 0) for name, n in cursor.fetchall()}
+                    return (
+                        counts.get('hardware_inventory', 0),
+                        counts.get('software_inventory', 0),
+                        counts.get('fim_data', 0),
+                    )
                 finally:
                     cursor.close()
 
@@ -3845,61 +3846,101 @@ async def get_all_ai_insights(request):
                     cursor.close()
 
         agents = await asyncio.to_thread(get_agent_names)
+        per_agent = max(1, min(int(request.args.get("per_agent", 100)), 500))
+        total_limit = max(1, min(int(request.args.get("limit", 500)), 2000))
 
-        all_results = []
+        async def _for_agent(agent):
+            async with agent_conn(agent) as cnx:
+                acur = await cnx.cursor(dictionary=True)
+                try:
+                    # This used to run an information_schema lookup and an
+                    # ALTER TABLE on every request, for every agent, just to
+                    # find out whether the table existed. Both are expensive,
+                    # the DDL is redundant — save_ai_results owns that
+                    # migration — and a missing table is cheaper to detect by
+                    # letting the SELECT fail.
+                    #
+                    # `source_data` is excluded: it holds the entire raw log
+                    # per insight, and the feed does not render it. It is
+                    # fetched per insight by the View Source modal instead.
+                    await acur.execute(
+                        """SELECT id, timestamp, source_file, critical_summary,
+                                  verdict, severity, confidence, model,
+                                  proposed_action, proposed_target, shadow_status,
+                                  created_at
+                             FROM ai_analysis_results
+                            ORDER BY created_at DESC, id DESC
+                            LIMIT %s""",
+                        (per_agent,),
+                    )
+                    rows = await acur.fetchall()
+                except Exception as e:
+                    if "1146" in str(e) or "doesn't exist" in str(e).lower():
+                        return []
+                    raise
+                finally:
+                    await acur.close()
 
-        for agent in agents:
-            try:
-                async with agent_conn(agent) as cnx:
-                    acur = await cnx.cursor(dictionary=True)
-                    try:
-                        await acur.execute("""
-                            SELECT TABLE_NAME
-                            FROM information_schema.tables
-                            WHERE table_schema = %s AND table_name = 'ai_analysis_results'
-                        """, (_agent_db_name(agent),))
+            for r in rows:
+                r['agent'] = agent
+                for field in ('created_at', 'timestamp'):
+                    if r.get(field) and hasattr(r[field], 'isoformat'):
+                        r[field] = r[field].isoformat()
+                if r.get('confidence') is not None:
+                    r['confidence'] = float(r['confidence'])
+            return rows
 
-                        if await acur.fetchone():
-                            try:
-                                await acur.execute(
-                                    "ALTER TABLE ai_analysis_results ADD COLUMN source_data LONGTEXT NULL"
-                                )
-                            except Exception:
-                                pass
-                            await acur.execute("""
-                                SELECT id, timestamp, source_file, critical_summary, source_data, created_at
-                                FROM ai_analysis_results
-                                ORDER BY created_at DESC LIMIT 100
-                            """)
-                            rows = await acur.fetchall()
-                            for r in rows:
-                                r['agent'] = agent
-                                if r.get('created_at') and hasattr(r['created_at'], 'isoformat'):
-                                    r['created_at'] = r['created_at'].isoformat()
-                                if r.get('timestamp') and hasattr(r['timestamp'], 'isoformat'):
-                                    r['timestamp'] = r['timestamp'].isoformat()
-                                all_results.append(r)
-                    finally:
-                        await acur.close()
-            except Exception as e:
-                print(f"[!] ai-insights skip agent={agent}: {e}", flush=True)
-                continue
+        buckets = await gather_over_agents(_for_agent, agents)
+        all_results = [row for bucket in buckets for row in bucket]
 
         sorted_results = sorted(
             all_results,
             key=lambda x: x.get('created_at') or '',
             reverse=True,
-        )
+        )[:total_limit]
 
         return sanic_json({
             "success": True,
-            "results": sorted_results[:500],
+            "results": sorted_results,
             "agents_scanned": agents,
             "agents_with_insights": sorted({r['agent'] for r in sorted_results}),
         })
         
     except Exception as e:
         return sanic_json({"success": False, "error": str(e)}, status=500)
+
+@app.get("/<agent>/ai_insights/<insight_id:int>/source")
+@require_permission("read_telemetry")
+async def get_insight_source(request, agent, insight_id):
+    """The raw log one insight was produced from.
+
+    Split out of the list response because `source_data` is a LONGTEXT holding
+    the full event, and shipping it for every row made the AI feed several
+    megabytes when only the rows an operator actually opens need it.
+    """
+    try:
+        async with agent_conn(agent) as cnx:
+            cur = await cnx.cursor(dictionary=True)
+            try:
+                await cur.execute(
+                    "SELECT id, source_file, source_data, payload, timestamp "
+                    "FROM ai_analysis_results WHERE id = %s",
+                    (insight_id,),
+                )
+                row = await cur.fetchone()
+            finally:
+                await cur.close()
+
+        if not row:
+            return sanic_json({"status": "error", "message": "Insight not found"}, status=404)
+
+        return sanic_json(
+            {"status": "success", "insight": row},
+            dumps=lambda o: pyjson.dumps(o, ensure_ascii=False, cls=CustomEncoder),
+        )
+    except Exception as e:
+        return _db_object_error(e)
+
 
 @require_permission("analyze_logs")
 @app.route("/ai-config/<agent>", methods=["GET"])
@@ -6069,6 +6110,7 @@ async def get_all_alerts(request):
                 finally:
                     cursor.close()
         agents = await asyncio.to_thread(_list_agents)
+        per_agent = max(1, min(int(request.args.get("per_agent", 100)), 500))
 
         # `events_alert` stores source/message/severity encrypted at rest. The
         # per-agent endpoint runs them through stream_from_db_dec; this one did
@@ -6080,26 +6122,33 @@ async def get_all_alerts(request):
         fernet_obj = Fernet(key_b64.encode("utf-8") if isinstance(key_b64, str) else key_b64)
         encrypted_fields = ENCRYPTED_FIELDS_MAP["events_alert"]
 
-        all_alerts = []
+        async def _for_agent(agent):
+            async with agent_conn(agent) as cnx:
+                cursor = await cnx.cursor()
+                try:
+                    await cursor.execute(
+                        "SELECT * FROM events_alert ORDER BY id DESC LIMIT %s", (per_agent,)
+                    )
+                    columns = [col[0] for col in cursor.description]
+                    rows = await cursor.fetchall()
+                except Exception as e:
+                    if "1146" in str(e) or "doesn't exist" in str(e).lower():
+                        return []
+                    raise
+                finally:
+                    await cursor.close()
 
-        for agent in agents:
-            try:
-                async with agent_conn(agent) as cnx:
-                    cursor = await cnx.cursor()
-                    try:
-                        await cursor.execute("SELECT * FROM events_alert ORDER BY id DESC LIMIT 100")
-                        columns = [col[0] for col in cursor.description]
-                        rows = await cursor.fetchall()
-                    finally:
-                        await cursor.close()
+            out = []
+            for row in rows:
+                alert = decrypt_row_fields(dict(zip(columns, row)), encrypted_fields, fernet_obj)
+                alert['agent'] = agent
+                out.append(alert)
+            return out
 
-                for row in rows:
-                    alert = decrypt_row_fields(dict(zip(columns, row)), encrypted_fields, fernet_obj)
-                    alert['agent'] = agent
-                    all_alerts.append(alert)
-
-            except Exception as e:
-                print(f"[!] Error fetching alerts for agent {agent}: {e}")
+        # Walked one agent at a time before, so page latency scaled with fleet
+        # size even though the queries are independent.
+        buckets = await gather_over_agents(_for_agent, agents)
+        all_alerts = [a for bucket in buckets for a in bucket]
 
         json_stream = '[' + ','.join(
             [pyjson.dumps(alert, cls=CustomEncoder, ensure_ascii=False) for alert in all_alerts]
@@ -6217,6 +6266,36 @@ async def periodic_session_purge():
 
 
 VULN_SCAN_INTERVAL = int(os.getenv("VULN_SCAN_INTERVAL", "1800"))
+
+
+# Fan-out queries used to walk agent databases one at a time, so page latency
+# was N x single-agent latency. Every one of them is independent — different
+# databases, different pools — so they run concurrently now.
+#
+# Bounded because each slot holds a pooled connection, and an unbounded gather
+# across a large fleet would open one per agent at once.
+_AGENT_FANOUT_LIMIT = int(os.getenv("AGENT_FANOUT_LIMIT", "8"))
+
+
+async def gather_over_agents(fn, agents: list, limit: int = None) -> list:
+    """Run `fn(agent)` across agents concurrently; skip the ones that fail.
+
+    A newly enrolled agent may not have provisioned a table yet, and one
+    unreachable database must not take a whole page down with it — so
+    exceptions are swallowed per agent and simply contribute nothing.
+    """
+    sem = asyncio.Semaphore(limit or _AGENT_FANOUT_LIMIT)
+
+    async def _one(agent):
+        async with sem:
+            try:
+                return await fn(agent)
+            except Exception as e:
+                print(f"[fanout] skip {agent}: {e}", flush=True)
+                return None
+
+    results = await asyncio.gather(*(_one(a) for a in agents))
+    return [r for r in results if r is not None]
 
 
 async def _list_agent_names_sync() -> list:
@@ -6500,6 +6579,86 @@ async def refresh_threat_intel(request):
         return sanic_json({"status": "error", "message": str(e)}, status=500)
 
 
+@app.get("/api/dashboard/summary")
+@require_permission("read_telemetry")
+async def get_dashboard_summary(request):
+    """Everything the dashboard renders, in one round trip.
+
+    The page used to issue seven requests, four of which walked every agent
+    database — and then used most of the results only to count them. It pulled
+    up to 100 fully decrypted alerts per agent to render two numbers.
+
+    Counting in SQL instead means the payload no longer scales with fleet size.
+    The alert *rows* are still available from /all_alerts for the page that
+    actually lists them.
+    """
+    try:
+        agents = await _list_agent_names_sync()
+
+        async def _for_agent(agent):
+            async with agent_conn(agent) as cnx:
+                cur = await cnx.cursor(dictionary=True)
+                try:
+                    stats = {"agent": agent, "alerts": 0, "critical": 0,
+                             "insights_1h": 0, "vulnerabilities": 0, "fim_24h": 0}
+
+                    async def _count(sql, default=0):
+                        try:
+                            await cur.execute(sql)
+                            row = await cur.fetchone()
+                            return int(list(row.values())[0]) if row else default
+                        except Exception:
+                            return default   # table not provisioned yet
+
+                    stats["alerts"] = await _count("SELECT COUNT(*) AS n FROM events_alert")
+                    stats["critical"] = await _count(
+                        "SELECT COUNT(*) AS n FROM events_alert WHERE severity = 'CRITICAL'"
+                    )
+                    stats["insights_1h"] = await _count(
+                        "SELECT COUNT(*) AS n FROM ai_analysis_results "
+                        "WHERE created_at > (NOW() - INTERVAL 1 HOUR)"
+                    )
+                    stats["vulnerabilities"] = await _count(
+                        "SELECT COUNT(*) AS n FROM vulnerabilities_report"
+                    )
+                    stats["fim_24h"] = await _count(
+                        "SELECT COUNT(*) AS n FROM fim_data "
+                        "WHERE status IS NOT NULL AND status <> 'baseline' "
+                        "AND last_seen > (NOW() - INTERVAL 1 DAY)"
+                    )
+                    return stats
+                finally:
+                    await cur.close()
+
+        per_agent = await gather_over_agents(_for_agent, agents)
+        scanned = {s["agent"] for s in per_agent}
+
+        totals = {
+            key: sum(s[key] for s in per_agent)
+            for key in ("alerts", "critical", "insights_1h", "vulnerabilities", "fim_24h")
+        }
+        # Agents that have actually reported an alert. An enrolled agent that
+        # is online but has never reported is the blind spot worth surfacing,
+        # which is what makes this different from the online count.
+        reporting = sum(1 for s in per_agent if s["alerts"] > 0)
+
+        return sanic_json({
+            "status": "success",
+            "totals": totals,
+            "agents": sorted(per_agent, key=lambda s: (s["critical"], s["alerts"]), reverse=True),
+            "coverage": {
+                "agents_total": len(agents),
+                "agents_scanned": len(per_agent),
+                "agents_reporting": reporting,
+                "agents_unreachable": sorted(set(agents) - scanned),
+                "complete": bool(agents) and len(per_agent) == len(agents),
+            },
+            "timestamp": datetime.now().isoformat(),
+        })
+    except Exception as e:
+        return sanic_json({"status": "error", "message": str(e)}, status=500)
+
+
 @require_permission("read_telemetry")
 @app.route("/api/exposure/report", name="exposure_report")
 # Kept so anything already pointing at the old path keeps working. The name is
@@ -6530,48 +6689,47 @@ async def get_exposure_report(request):
     try:
         agents = await _list_agent_names_sync()
 
-        per_agent: list[dict] = []
-        unreachable: list[str] = []
-        totals = {"vulnerabilities": 0, "fim_changed": 0, "fim_new": 0, "fim_deleted": 0}
+        async def _for_agent(agent):
+            async with agent_conn(agent) as cnx:
+                cur = await cnx.cursor()
+                try:
+                    await cur.execute("SELECT COUNT(*) FROM vulnerabilities_report")
+                    row = await cur.fetchone()
+                    vulns = int(row[0]) if row else 0
 
-        for agent in agents:
-            try:
-                async with agent_conn(agent) as cnx:
-                    cur = await cnx.cursor()
-                    try:
-                        await cur.execute("SELECT COUNT(*) FROM vulnerabilities_report")
-                        row = await cur.fetchone()
-                        vulns = int(row[0]) if row else 0
+                    # Grouped rather than summed: "12 files changed" and
+                    # "12 files deleted" are very different mornings.
+                    await cur.execute(
+                        "SELECT status, COUNT(*) FROM fim_data "
+                        "WHERE status IS NOT NULL AND status <> 'baseline' "
+                        "AND last_seen > NOW() - INTERVAL 1 DAY "
+                        "GROUP BY status"
+                    )
+                    fim_rows = await cur.fetchall() or []
+                finally:
+                    await cur.close()
 
-                        # Grouped rather than summed: "12 files changed" and
-                        # "12 files deleted" are very different mornings.
-                        await cur.execute(
-                            "SELECT status, COUNT(*) FROM fim_data "
-                            "WHERE status IS NOT NULL AND status <> 'baseline' "
-                            "AND last_seen > NOW() - INTERVAL 1 DAY "
-                            "GROUP BY status"
-                        )
-                        fim_rows = await cur.fetchall() or []
-                    finally:
-                        await cur.close()
+            fim = {str(s).lower(): int(c) for s, c in fim_rows}
+            return {
+                "agent": agent,
+                "vulnerabilities": vulns,
+                "fim_changed": fim.get("changed", 0),
+                "fim_new": fim.get("new", 0),
+                "fim_deleted": fim.get("deleted", 0),
+            }
 
-                fim = {str(s).lower(): int(c) for s, c in fim_rows}
-                entry = {
-                    "agent": agent,
-                    "vulnerabilities": vulns,
-                    "fim_changed": fim.get("changed", 0),
-                    "fim_new": fim.get("new", 0),
-                    "fim_deleted": fim.get("deleted", 0),
-                }
-                per_agent.append(entry)
-                for key in totals:
-                    totals[key] += entry[key]
-            except Exception as e:
-                # A newly-enrolled agent may not have provisioned these tables
-                # yet. Skipping is correct; hiding it is not — a total over
-                # half the fleet is not a fleet total.
-                print(f"[exposure] skipped {agent}: {e}")
-                unreachable.append(agent)
+        # Concurrent: these are independent databases, and walking them in
+        # sequence made latency scale with fleet size for no reason.
+        per_agent = await gather_over_agents(_for_agent, agents)
+        # A newly-enrolled agent may not have provisioned these tables yet.
+        # Skipping is correct; hiding it is not — a total over half the fleet
+        # is not a fleet total.
+        unreachable = sorted(set(agents) - {e["agent"] for e in per_agent})
+
+        totals = {
+            key: sum(e[key] for e in per_agent)
+            for key in ("vulnerabilities", "fim_changed", "fim_new", "fim_deleted")
+        }
 
         # Worst first: the operator wants to know where to start.
         per_agent.sort(key=lambda a: (a["vulnerabilities"], a["fim_changed"]), reverse=True)

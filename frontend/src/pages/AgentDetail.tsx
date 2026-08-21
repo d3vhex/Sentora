@@ -1323,6 +1323,24 @@ const Chip: React.FC<{ children: React.ReactNode, color?: string, bg?: string, m
 export const InsightCard: React.FC<{ insight: any }> = ({ insight }) => {
   const [showRaw, setShowRaw] = useState(false);
   const [showSource, setShowSource] = useState(false);
+  const [sourceText, setSourceText] = useState<string | null>(insight.source_data ?? null);
+  const [sourceLoading, setSourceLoading] = useState(false);
+
+  // Older rows still carry source_data inline; newer ones are fetched on
+  // demand. Either way the modal gets what it needs.
+  const openSource = async () => {
+    setShowSource(true);
+    if (sourceText != null || !insight.id || !insight.agent) return;
+    setSourceLoading(true);
+    try {
+      const res = await agentService.getInsightSource(insight.agent, insight.id);
+      setSourceText(res?.insight?.source_data ?? null);
+    } catch {
+      setSourceText(null);
+    } finally {
+      setSourceLoading(false);
+    }
+  };
   const p = parseInsight(insight.critical_summary || '');
   const sevKey = (p.severity || '').toUpperCase();
   const sevStyle = SEVERITY_STYLE[sevKey] || SEVERITY_STYLE.INFO;
@@ -1360,7 +1378,7 @@ export const InsightCard: React.FC<{ insight: any }> = ({ insight }) => {
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
           <button
-            onClick={() => setShowSource(true)}
+            onClick={openSource}
             title="View the raw log analyzed by AI"
             style={{
               fontSize: '0.7rem',
@@ -1385,7 +1403,11 @@ export const InsightCard: React.FC<{ insight: any }> = ({ insight }) => {
 
       {showSource && (
         <SourceLogModal
-          source={insight.source_data}
+          // Fetched on open rather than shipped with every row. source_data
+          // holds the full raw log, so including it in the feed made the AI
+          // list response scale with the size of the events themselves.
+          source={sourceText}
+          loading={sourceLoading}
           sourceFile={insight.source_file}
           timestamp={insight.timestamp || insight.created_at}
           onClose={() => setShowSource(false)}
@@ -1496,7 +1518,7 @@ export const InsightCard: React.FC<{ insight: any }> = ({ insight }) => {
   );
 };
 
-const SourceLogModal: React.FC<{ source?: string | null, sourceFile?: string, timestamp?: string, onClose: () => void }> = ({ source, sourceFile, timestamp, onClose }) => {
+const SourceLogModal: React.FC<{ source?: string | null, loading?: boolean, sourceFile?: string, timestamp?: string, onClose: () => void }> = ({ source, loading, sourceFile, timestamp, onClose }) => {
   // Lock body scroll while the modal is open so the page underneath doesn't
   // scroll when the user wheels inside the modal.
   useEffect(() => {
@@ -1510,7 +1532,7 @@ const SourceLogModal: React.FC<{ source?: string | null, sourceFile?: string, ti
     };
   }, [onClose]);
 
-  let pretty = '';
+  let pretty = loading ? 'Loading the source log…' : '';
   if (source) {
     try {
       pretty = JSON.stringify(JSON.parse(source), null, 2);
