@@ -141,6 +141,16 @@ export const agentService = {
   // an ordinary fleet.
   getExposureReport: () => api.get('/api/exposure/report').then(res => res.data),
 
+  // Everything the dashboard renders, counted in SQL. Replaces four fan-out
+  // calls whose results were mostly used to compute lengths — it pulled up to
+  // 100 decrypted alerts per agent to display two numbers.
+  getDashboardSummary: () => api.get('/api/dashboard/summary').then(res => res.data),
+
+  // The raw log for one insight. Split out of /api/ai-insights/all, which was
+  // shipping the full source_data LONGTEXT for every row in the feed.
+  getInsightSource: (agent: string, insightId: number) =>
+    api.get(`/${agent}/ai_insights/${insightId}/source`).then(res => res.data),
+
   // Known-bad indicators pulled from abuse.ch. `stats` answers the first
   // question anyone has about a feed — is this data current — which was
   // unanswerable while the table was seeded with three hardcoded rows.

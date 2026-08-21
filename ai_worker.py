@@ -10,7 +10,14 @@ import logging
 import aio_pika
 import os
 from datetime import datetime
-from ai.utils import load_ai_config, analyze_with_ai, save_ai_results, queue_soar_action
+from ai.utils import (
+    AITransientError,
+    analyze_structured,
+    load_ai_config,
+    queue_soar_action,
+    save_ai_results,
+)
+from ai.schemas import TriageVerdict, DeepAnalysis, DefensiveDecision, render_summary
 from ai.intel import get_threat_intel_summary
 from core import mq as mq_utils
 
@@ -70,60 +77,17 @@ LOG:
 }
 
 
-def _extract_json(text: str):
-    """Best-effort extraction of the first JSON object from an LLM response.
-    Handles models that wrap JSON in prose or markdown fences."""
-    if not text:
-        return None
-    cleaned = re.sub(r"```(?:json)?", "", text).replace("```", "").strip()
-    start = cleaned.find('{')
-    if start == -1:
-        return None
-    depth = 0
-    for i in range(start, len(cleaned)):
-        c = cleaned[i]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                blob = cleaned[start:i+1]
-                try:
-                    return json.loads(blob)
-                except Exception:
-                    return None
-    return None
-
-
-def _format_insight(verdict: dict, prefix: str) -> str:
-    """Render a verdict JSON into a human-readable single-line insight.
-
-    The defensive prompt returns `reason` instead of `summary`, the manual
-    prompt returns `summary`, automation returns `summary` + `indicator`.
-    We pull whichever fields are present so the rendered line is never an
-    empty stub like `[AI DEFENSIVE] [INFO] -> none`.
-    """
-    sev = (verdict.get('severity') or 'INFO').upper()
-    conf = verdict.get('confidence')
-    summary = (
-        verdict.get('summary')
-        or verdict.get('reason')
-        or verdict.get('rationale')
-        or verdict.get('explanation')
-        or ''
-    )
-    indicator = verdict.get('indicator') or verdict.get('kill_chain_stage') or ''
-    action = verdict.get('recommended_action') or verdict.get('action') or ''
-    parts = [f"[{prefix}]", f"[{sev}]"]
-    if isinstance(conf, (int, float)):
-        parts.append(f"conf={conf:.2f}")
-    if indicator and indicator != 'none':
-        parts.append(f"({indicator})")
-    if summary:
-        parts.append(summary.strip())
-    if action and action not in ('MONITOR', 'none', ''):
-        parts.append(f"-> {action}")
-    return ' '.join(p for p in parts if p)
+# `_extract_json` and `_format_insight` used to live here.
+#
+# The first counted braces to pull a JSON object out of whatever prose the
+# model wrapped it in — necessary when the model was merely *asked* for JSON.
+# Ollama's `format` parameter now constrains it to the schema, so there is
+# nothing to salvage. See ai/schemas.py.
+#
+# The second flattened a verdict into one display line, which then became the
+# only stored record of it. Verdict, severity and confidence are columns now;
+# `render_summary` still produces the line, but it is derived from the data
+# rather than standing in for it.
 
 QUEUES = {
     "automation": mq_utils.AI_AUTOMATION,
@@ -133,48 +97,81 @@ QUEUES = {
 
 soar = SOARAutomation(SOARConfig())
 
+def _parse_failure_entry(source_file: str, log_text: str, error: str, model: str) -> dict:
+    """The row written when the model could not produce a usable verdict.
+
+    This replaces `_lazy()`, which detected the model saying "insufficient
+    information" and then *fabricated* a narrative from the log fields —
+    writing invented analysis into the audit trail as though the model had
+    produced it. A security tool must not do that. An honest
+    INSUFFICIENT_DATA row is less satisfying and far more useful: it says the
+    model failed, which is a fact about the model worth acting on.
+    """
+    return {
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'source_file': source_file,
+        'critical_summary': f"[PARSE FAILED] The model did not return a usable verdict. {error}",
+        'source_data': log_text,
+        'verdict': 'INSUFFICIENT_DATA',
+        'severity': 'INFO',
+        'confidence': 0.0,
+        'model': model,
+        'payload': None,
+    }
+
+
 async def handle_automation(agent, table, data, api_key, endpoint, model=None):
     log_text = json.dumps(data, indent=2)
-    raw = await asyncio.to_thread(
-        analyze_with_ai, api_key, log_text, PROMPTS["automation"], endpoint, agent, model,
+    model_name = model or os.getenv("OLLAMA_MODEL", "")
+
+    verdict, raw, error = await asyncio.to_thread(
+        analyze_structured, PROMPTS["automation"], log_text, TriageVerdict,
+        endpoint=endpoint, agent=agent, model=model, api_key=api_key,
     )
 
-    verdict = _extract_json(raw) or {}
-    v = (verdict.get('verdict') or '').upper()
-    sev = (verdict.get('severity') or '').upper()
-    try:
-        conf = float(verdict.get('confidence') or 0)
-    except Exception:
-        conf = 0.0
+    if error or verdict is None:
+        logger.error(f"[!] Automation verdict unusable agent={agent} table={table}: {error}")
+        entry = _parse_failure_entry(f"Reviewed_{table}", log_text, error or "no response", model_name)
+        try:
+            await asyncio.to_thread(save_ai_results, agent, [entry])
+        except Exception as e:
+            logger.error(f"[!] Automation save FAILED agent={agent}: {e}")
+        return
 
     intel_match = await asyncio.to_thread(get_threat_intel_summary, log_text)
 
-    is_critical = (v == 'CRITICAL' and sev in ('CRITICAL', 'HIGH') and conf >= CRITICAL_CONFIDENCE_THRESHOLD)
-    is_suspicious = (v == 'SUSPICIOUS' and conf >= SUSPICIOUS_CONFIDENCE_THRESHOLD)
+    is_critical = (
+        verdict.verdict == 'CRITICAL'
+        and verdict.severity in ('CRITICAL', 'HIGH')
+        and verdict.confidence >= CRITICAL_CONFIDENCE_THRESHOLD
+    )
+    is_suspicious = (
+        verdict.verdict == 'SUSPICIOUS'
+        and verdict.confidence >= SUSPICIOUS_CONFIDENCE_THRESHOLD
+    )
 
     if is_critical or is_suspicious or intel_match:
-        summary_line = _format_insight(verdict, "AUTO") if verdict else f"[AUTO] {raw[:300]}"
+        summary_line = render_summary(verdict, "AUTO")
         if intel_match:
             summary_line = f"{summary_line}\n[!!] GLOBAL THREAT INTEL MATCH: {intel_match}"
         source_file = f"Realtime_{table}"
-        logger.info(f"[!] CRITICAL (Automation) for {agent}: {summary_line[:120]}")
+        logger.info(f"[!] {verdict.verdict} (Automation) {agent}: {summary_line[:120]}")
     else:
-        if verdict:
-            short_sev = sev or 'INFO'
-            summary = verdict.get('summary') or 'No critical indicator detected.'
-            summary_line = f"[AUTO REVIEW] [{short_sev}] conf={conf:.2f} {summary}"
-        elif raw:
-            summary_line = f"[AUTO REVIEW] {raw[:280]}"
-        else:
-            summary_line = f"[AUTO REVIEW] No response from AI service."
+        summary_line = render_summary(verdict, "AUTO REVIEW")
         source_file = f"Reviewed_{table}"
-        logger.info(f"[.] Reviewed (Automation) for {agent}/{table} v={v} conf={conf}")
+        logger.info(f"[.] Reviewed (Automation) {agent}/{table} "
+                    f"v={verdict.verdict} conf={verdict.confidence:.2f}")
 
     result_entry = {
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'source_file': source_file,
         'critical_summary': summary_line,
         'source_data': log_text,
+        'verdict': verdict.verdict,
+        'severity': verdict.severity,
+        'confidence': verdict.confidence,
+        'model': model_name,
+        'payload': verdict.model_dump_json(),
     }
     try:
         await asyncio.to_thread(save_ai_results, agent, [result_entry])
@@ -184,32 +181,47 @@ async def handle_automation(agent, table, data, api_key, endpoint, model=None):
 async def handle_manual(agent, table, data, api_key, endpoint, model=None):
     batch_size = len(data) if isinstance(data, list) else 1
     log_text = json.dumps(data, indent=2, default=str)
+    model_name = model or os.getenv("OLLAMA_MODEL", "")
     logger.info(f"[*] Manual analysis START agent={agent} table={table} batch={batch_size}")
 
-    raw = await asyncio.to_thread(
-        analyze_with_ai, api_key, log_text, PROMPTS["manual"], endpoint, agent, model,
+    verdict, raw, error = await asyncio.to_thread(
+        analyze_structured, PROMPTS["manual"], log_text, DeepAnalysis,
+        endpoint=endpoint, agent=agent, model=model, api_key=api_key,
     )
 
-    verdict = _extract_json(raw) or {}
-    if verdict:
-        summary_line = _format_insight(verdict, f"MANUAL x{batch_size}")
-        techniques = verdict.get('techniques') or []
-        iocs = verdict.get('iocs') or []
-        next_steps = verdict.get('next_steps') or []
-        extras = []
-        if techniques: extras.append(f"techniques={','.join(map(str, techniques))}")
-        if iocs:       extras.append(f"iocs={','.join(map(str, iocs))}")
-        if next_steps: extras.append("next=" + " | ".join(map(str, next_steps)))
-        if extras:
-            summary_line = f"{summary_line}\n  {' | '.join(extras)}"
-    else:
-        summary_line = f"[MANUAL DEEP SCAN x{batch_size}] {raw[:1500] if raw else 'No response from AI service.'}"
+    if error or verdict is None:
+        logger.error(f"[!] Manual verdict unusable agent={agent} table={table}: {error}")
+        entry = _parse_failure_entry(f"Manual_{table}", log_text, error or "no response", model_name)
+        try:
+            await asyncio.to_thread(save_ai_results, agent, [entry])
+        except Exception as e:
+            logger.error(f"[!] Manual save FAILED agent={agent}: {e}")
+        return
+
+    # The list fields are columns in `payload` now. They are still appended to
+    # the display line so the card reads the same, but nothing parses them
+    # back out of it.
+    summary_line = render_summary(verdict, f"MANUAL x{batch_size}")
+    extras = []
+    if verdict.techniques:
+        extras.append(f"techniques={','.join(verdict.techniques)}")
+    if verdict.iocs:
+        extras.append(f"iocs={','.join(verdict.iocs)}")
+    if verdict.next_steps:
+        extras.append("next=" + " | ".join(verdict.next_steps))
+    if extras:
+        summary_line = f"{summary_line}\n  {' | '.join(extras)}"
 
     result_entry = {
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'source_file': f"Manual_{table}",
         'critical_summary': summary_line,
         'source_data': log_text,
+        'verdict': verdict.verdict,
+        'severity': verdict.severity,
+        'confidence': verdict.confidence,
+        'model': model_name,
+        'payload': verdict.model_dump_json(),
     }
     try:
         await asyncio.to_thread(save_ai_results, agent, [result_entry])
@@ -242,20 +254,31 @@ SHADOW_MODE = os.getenv("AI_SHADOW_MODE", "0").lower() in ("1", "true", "yes", "
 
 async def handle_defensive(agent, table, data, api_key, endpoint, model=None):
     log_text = json.dumps(data, indent=2)
-    raw = await asyncio.to_thread(
-        analyze_with_ai, api_key, log_text, PROMPTS["defensive"], endpoint, agent, model,
+    model_name = model or os.getenv("OLLAMA_MODEL", "")
+
+    decision, raw, error = await asyncio.to_thread(
+        analyze_structured, PROMPTS["defensive"], log_text, DefensiveDecision,
+        endpoint=endpoint, agent=agent, model=model, api_key=api_key,
     )
 
-    verdict = _extract_json(raw) or {}
-    v = (verdict.get('verdict') or '').upper()
-    try:
-        conf = float(verdict.get('confidence') or 0)
-    except Exception:
-        conf = 0.0
+    if error or decision is None:
+        # Nothing is dispatched on an unusable verdict. That was already true,
+        # but it is worth being explicit: this is the path where the platform
+        # decides not to touch an endpoint because it could not understand the
+        # event, and that decision belongs in the record.
+        logger.error(f"[!] Defensive verdict unusable agent={agent} table={table}: {error}")
+        entry = _parse_failure_entry("AI_DEFENSIVE_ADVICE", log_text, error or "no response", model_name)
+        try:
+            await asyncio.to_thread(save_ai_results, agent, [entry])
+        except Exception as e:
+            logger.error(f"[!] Defensive save FAILED agent={agent}: {e}")
+        return
 
-    action = (verdict.get('action') or '').upper()
-    target = verdict.get('target') or ''
-    reason = verdict.get('reason') or ''
+    v = decision.verdict
+    conf = decision.confidence
+    action = decision.action
+    target = decision.target
+    reason = decision.reason
 
     should_act = (
         v == 'ACT'
@@ -289,115 +312,46 @@ async def handle_defensive(agent, table, data, api_key, endpoint, model=None):
             if ok:
                 logger.warning(f"[!!] AUTO-ACTION {action} target={target} agent={agent} conf={conf}")
 
-    # Build a real analyst-friendly explanation. The model frequently returns
-    # the structured JSON with `reason` blank — in that case we keep its raw
-    # commentary too so the operator actually sees what the AI concluded
-    # instead of an empty "MONITOR" badge.
     def _trim(s: str, n: int = 600) -> str:
         s = (s or '').strip()
         return s if len(s) <= n else s[: n - 3] + '...'
 
-    if verdict:
-        base = _format_insight(verdict, "AI DEFENSIVE")
-        if target and target != 'none':
-            base = f"{base} target={target}"
+    base = render_summary(decision, "AI DEFENSIVE")
+    if target and target != 'none':
+        base = f"{base} target={target}"
 
-        explanation = (
-            verdict.get('reason')
-            or verdict.get('summary')
-            or verdict.get('rationale')
-            or verdict.get('explanation')
-            or ''
-        ).strip()
-        event_name = (verdict.get('event_name') or '').strip()
+    # `_lazy()` used to live here. It matched the model saying "insufficient
+    # information", then rebuilt a narrative out of the log's own fields and
+    # stored it as though the model had written it. That is fabricated
+    # analysis in an audit trail. The schema now allows INSUFFICIENT_DATA as a
+    # real verdict, so the model can say it and we record what it said.
+    explanation = _trim(reason)
 
-        # The small llama3.2:3b model loves the lazy "Insufficient information
-        # to determine X" non-answer. When we detect that pattern, rebuild a
-        # useful note from the actual log content so the operator gets a real
-        # description instead of a copy-pasted apology.
-        def _lazy(text: str) -> bool:
-            t = (text or '').strip().lower()
-            if not t:
-                return True
-            lazy_starts = (
-                'insufficient information',
-                'insufficient evidence',
-                'insufficient data',
-                'unclear',
-                'cannot determine',
-                "can't determine",
-                'no information',
-                'not enough information',
-                'no further action',
-            )
-            return any(t.startswith(p) for p in lazy_starts)
+    proposed_action = None
+    proposed_target = None
+    shadow_status = None
 
-        if _lazy(explanation):
-            try:
-                parsed_log = json.loads(log_text) if log_text.strip().startswith('{') else None
-            except Exception:
-                parsed_log = None
-            rec = parsed_log if isinstance(parsed_log, dict) else {}
-            src = (rec.get('source') or rec.get('channel') or rec.get('logger') or '').strip()
-            sev_lg = (rec.get('severity') or rec.get('level') or '').strip()
-            msg = (rec.get('message') or rec.get('msg') or rec.get('details') or '').strip()
-            cats = (rec.get('categories') or rec.get('event_type') or '').strip()
-            facts = []
-            if event_name: facts.append(event_name)
-            elif cats: facts.append(cats)
-            if src: facts.append(f"source={src}")
-            if sev_lg: facts.append(f"severity={sev_lg}")
-            head = ' | '.join(facts) if facts else 'Telemetry event'
-            tail = msg[:240] if msg else 'no message body'
-            verdict_word = v or 'MONITOR'
-            explanation = (
-                f"{head}. Observed: {tail}. "
-                f"No high-confidence indicator of compromise detected, defaulting to {verdict_word}."
-            )
-
-        if not explanation and raw:
-            # JSON parsed but model gave no narrative — surface raw answer
-            cleaned = raw.replace('\n', ' ').strip()
-            if cleaned and not cleaned.startswith('{'):
-                explanation = cleaned
-
-        proposed_action = None
-        proposed_target = None
-        shadow_status = None
-
-        if shadow_proposed:
-            summary_line = f"{base} | SHADOW-PROPOSED {action} (awaiting operator approval)"
-            source_file = "AI_DEFENSIVE_SHADOW"
-            proposed_action = action.lower()
-            proposed_target = str(target)
-            shadow_status = 'pending'
-        elif auto_dispatched:
-            summary_line = f"{base} | AUTO-DISPATCHED {action}"
-            source_file = "AI_DEFENSIVE_AUTO"
-        elif should_act:
-            summary_line = f"{base} | RECOMMENDED {action} (conf below auto-dispatch threshold)"
-            source_file = "AI_DEFENSIVE_ADVICE"
-        elif v == 'ACT':
-            summary_line = f"{base} | NEEDS-REVIEW (no valid target/action)"
-            source_file = "AI_DEFENSIVE_ADVICE"
-        else:
-            summary_line = f"{base} | {v or 'MONITOR'}"
-            source_file = "AI_DEFENSIVE_MONITOR"
-
-        if explanation:
-            summary_line = f"{summary_line}\nReason: {_trim(explanation)}"
-    elif raw:
-        summary_line = f"[AI DEFENSIVE] {_trim(raw)}"
-        source_file = "AI_DEFENSIVE_MONITOR"
-        proposed_action = None
-        proposed_target = None
-        shadow_status = None
+    if shadow_proposed:
+        summary_line = f"{base} | SHADOW-PROPOSED {action} (awaiting operator approval)"
+        source_file = "AI_DEFENSIVE_SHADOW"
+        proposed_action = action.lower()
+        proposed_target = str(target)
+        shadow_status = 'pending'
+    elif auto_dispatched:
+        summary_line = f"{base} | AUTO-DISPATCHED {action}"
+        source_file = "AI_DEFENSIVE_AUTO"
+    elif should_act:
+        summary_line = f"{base} | RECOMMENDED {action} (conf below auto-dispatch threshold)"
+        source_file = "AI_DEFENSIVE_ADVICE"
+    elif v == 'ACT':
+        summary_line = f"{base} | NEEDS-REVIEW (no valid target/action)"
+        source_file = "AI_DEFENSIVE_ADVICE"
     else:
-        summary_line = "[AI DEFENSIVE] No response from AI service."
+        summary_line = f"{base} | {v}"
         source_file = "AI_DEFENSIVE_MONITOR"
-        proposed_action = None
-        proposed_target = None
-        shadow_status = None
+
+    if explanation:
+        summary_line = f"{summary_line}\nReason: {explanation}"
 
     logger.info(f"[?] Defensive ({source_file}) for {agent}: {summary_line[:140]}")
     result_entry = {
@@ -408,6 +362,11 @@ async def handle_defensive(agent, table, data, api_key, endpoint, model=None):
         'proposed_action': proposed_action,
         'proposed_target': proposed_target,
         'shadow_status': shadow_status,
+        'verdict': decision.verdict,
+        'severity': decision.severity,
+        'confidence': decision.confidence,
+        'model': model_name,
+        'payload': decision.model_dump_json(),
     }
     try:
         await asyncio.to_thread(save_ai_results, agent, [result_entry])
@@ -426,19 +385,60 @@ AI_CONCURRENCY = max(1, int(os.getenv("AI_CONCURRENCY", "1")))
 
 ai_semaphore = asyncio.Semaphore(AI_CONCURRENCY)
 
+# A timeout means the inference did not happen, so the event has not been
+# triaged. Redelivering is the right answer; recording a verdict is not.
+#
+# RabbitMQ only tracks a redelivery count when a dead-letter exchange is
+# configured, so the attempt is carried in a header on a republished copy.
+MAX_AI_ATTEMPTS = max(1, int(os.getenv("AI_MAX_ATTEMPTS", "4")))
+# Backoff between attempts. A model that just timed out will not be faster
+# one millisecond later, and hammering it makes the queue worse.
+AI_RETRY_BASE_SEC = int(os.getenv("AI_RETRY_BASE_SEC", "30"))
+
+_exchange = None   # set in main(), used to republish retries
+
+
+async def _requeue_with_backoff(message: aio_pika.IncomingMessage, attempt: int, reason: str):
+    """Republish this task for another attempt, or give up loudly."""
+    if attempt >= MAX_AI_ATTEMPTS:
+        logger.error(
+            f"[!] Giving up on {WORKER_TYPE} task after {attempt} attempts: {reason}. "
+            f"The event was not triaged — check that Ollama is reachable and "
+            f"AI_TIMEOUT_SEC is large enough for this model."
+        )
+        return
+
+    delay = AI_RETRY_BASE_SEC * attempt
+    logger.warning(f"[~] {reason} — retrying in {delay}s (attempt {attempt + 1}/{MAX_AI_ATTEMPTS})")
+    await asyncio.sleep(delay)
+    try:
+        await _exchange.publish(
+            aio_pika.Message(
+                body=message.body,
+                headers={**(message.headers or {}), "x-ai-attempt": attempt + 1},
+                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+            ),
+            routing_key=QUEUES.get(WORKER_TYPE, mq_utils.AI_AUTOMATION),
+        )
+    except Exception as e:
+        logger.error(f"[!] Could not requeue task: {e}")
+
+
 async def process_message(message: aio_pika.IncomingMessage):
     async with message.process():
         async with ai_semaphore:
+            attempt = int((message.headers or {}).get("x-ai-attempt", 0) or 0)
             try:
                 payload = json.loads(message.body.decode())
                 agent = payload.get("agent")
                 table = payload.get("table")
                 data  = payload.get("data")
-                
+
                 if not agent or not data:
                     return
 
-                logger.info(f"[*] Starting {WORKER_TYPE} task for agent: {agent}, table: {table}")
+                logger.info(f"[*] Starting {WORKER_TYPE} task for agent: {agent}, table: {table}"
+                            + (f" (attempt {attempt + 1})" if attempt else ""))
                 cfg = await load_ai_config(agent) or {}
                 api_key = cfg.get('api_key', 'ollama')
                 endpoint = cfg.get('endpoint')
@@ -455,6 +455,12 @@ async def process_message(message: aio_pika.IncomingMessage):
                 logger.info(f"[*] Finished {WORKER_TYPE} task for {agent}/{table} "
                             f"in {time.monotonic() - started:.1f}s")
 
+            except AITransientError as e:
+                # Nothing is written. A timeout says the inference did not
+                # happen, not that the event is benign, and a wall of "no
+                # usable verdict" cards in the UI is worse than none.
+                await _requeue_with_backoff(message, attempt, str(e))
+
             except Exception as e:
                 logger.error(f"[!] Error processing message in {WORKER_TYPE}: {e}")
 
@@ -470,8 +476,10 @@ async def main():
             logger.error(f"[!] Connection to {RABBITMQ_URL} failed, retrying in 5s...")
             await asyncio.sleep(5)
 
+    global _exchange
     async with connection:
         channel = await connection.channel()
+        _exchange = channel.default_exchange
         # Matched to the semaphore. Prefetching more than we can process just
         # moves the backlog from the broker into this process, where it is
         # invisible and unacked messages sit until the channel closes.

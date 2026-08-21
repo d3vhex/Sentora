@@ -96,10 +96,16 @@ def _normalize_ollama_url(endpoint: str) -> str:
 # previous cache had no such notion and a stale answer lived forever.
 PROMPT_VERSION = os.getenv("AI_PROMPT_VERSION", "v1")
 
-# A local 3B model answers in 20-60s on CPU. Ten minutes was not a timeout, it
-# was a hang: one stuck request blocked the worker's only slot for the whole
-# window while the queue backed up behind it.
-AI_TIMEOUT_SEC = int(os.getenv("AI_TIMEOUT_SEC", "120"))
+# Observed: llama3.2:3b on CPU takes ~47s for a single 2 KB event. The manual
+# worker batches ten events into one prompt, so its prompts are an order of
+# magnitude larger and 120s was not enough — every batch timed out.
+#
+# 600s was the original value and that was a hang, not a timeout. 300 is the
+# compromise: long enough for a batched prompt on CPU, short enough that a
+# genuinely stuck request frees the slot within a few minutes. Transient
+# failures are requeued rather than recorded, so an occasional overrun costs
+# a retry, not a lost event.
+AI_TIMEOUT_SEC = int(os.getenv("AI_TIMEOUT_SEC", "300"))
 
 
 def analyze_with_ai(api_key, text, prompt_template, endpoint=None, agent=None, model=None):
@@ -171,6 +177,108 @@ def analyze_with_ai(api_key, text, prompt_template, endpoint=None, agent=None, m
 # the old cache had no TTL and no prompt version, so the only way to clear one
 # was to drop the table by hand.
 AI_CACHE_TTL_HOURS = int(os.getenv("AI_CACHE_TTL_HOURS", "24"))
+
+
+class AITransientError(Exception):
+    """The model could not be reached or ran out of time.
+
+    Distinct from a bad verdict on purpose. A timeout says nothing about the
+    event — it says the inference did not happen — so it must not become an
+    insight row. The worker requeues these instead, and the operator sees the
+    problem in the worker log rather than as a wall of
+    "did not return a usable verdict" cards in the UI.
+    """
+
+
+def analyze_structured(prompt_template, text, schema_model, *,
+                       endpoint=None, agent=None, model=None, api_key=None):
+    """Ask the model for a verdict and get back a validated object.
+
+    Returns `(verdict, raw, error)`. Exactly one of `verdict` / `error` is set.
+
+    Raises `AITransientError` when the model could not be reached at all —
+    that is not a verdict and the caller should requeue rather than record it.
+
+    Two things separate this from analyze_with_ai:
+
+    1. The JSON schema is passed to Ollama's `format` parameter, so the model
+       is constrained to the shape rather than asked for it in the prompt and
+       parsed hopefully afterwards. That removes the failure mode where a
+       missing brace loses a whole verdict.
+    2. The result is validated with Pydantic. On failure there is exactly one
+       repair attempt, and if that also fails the caller gets an error to
+       record honestly — not a fabricated narrative.
+
+    Requires Ollama 0.5+ for schema-constrained output. Older versions ignore
+    an unknown `format` value and return prose, which then fails validation
+    and surfaces as a parse error rather than silently wrong data.
+    """
+    from ai.schemas import constrained_schema
+
+    target_url = _normalize_ollama_url(endpoint)
+    model_name = (model or OLLAMA_MODEL or '').strip() or OLLAMA_MODEL
+    prompt = prompt_template.format(log_text=text)
+    # Every field marked required — otherwise the model omits the ones with
+    # defaults and every verdict comes back INFO / 0.00.
+    schema = constrained_schema(schema_model)
+
+    prompt_hash = hashlib.sha256(
+        f"{PROMPT_VERSION}|{model_name}|structured|{prompt}".encode()
+    ).hexdigest()
+
+    if agent:
+        cached = get_ai_cache(agent, prompt_hash)
+        if cached:
+            try:
+                return schema_model.model_validate_json(cached), cached, None
+            except Exception:
+                pass  # cached value predates a schema change; re-ask
+
+    def _call(extra_instruction: str = "") -> tuple[str, float]:
+        payload = {
+            "model": model_name,
+            "prompt": prompt + extra_instruction,
+            "stream": False,
+            "format": schema,
+            # Triage wants the same answer for the same evidence. Sampling
+            # variance here shows up as an event being CRITICAL on one run and
+            # benign on the next, which is impossible to tune against.
+            "options": {"temperature": 0},
+        }
+        started = time.monotonic()
+        resp = requests.post(target_url, json=payload, timeout=AI_TIMEOUT_SEC)
+        elapsed = time.monotonic() - started
+        if resp.status_code != 200:
+            raise RuntimeError(f"AI service returned {resp.status_code}: {(resp.text or '')[:200]}")
+        return (resp.json().get("response") or "").strip(), elapsed
+
+    raw = ""
+    try:
+        raw, elapsed = _call()
+        print(f"[ai] {model_name} structured reply in {elapsed:.1f}s "
+              f"({len(prompt)} char prompt)", flush=True)
+        verdict = schema_model.model_validate_json(raw)
+    except (requests.Timeout, requests.ConnectionError) as e:
+        # Transient: the model is slow or Ollama is restarting. The caller
+        # requeues rather than recording a verdict — see AITransientError.
+        raise AITransientError(f"{type(e).__name__}: {e}") from e
+    except Exception as first_error:
+        # One repair attempt. More than one is throwing good money after bad:
+        # a model that cannot produce the schema twice will not manage it on
+        # the third try, and the queue is waiting.
+        try:
+            raw, _ = _call(
+                "\n\nYour previous reply did not match the required JSON schema. "
+                "Reply with ONLY the JSON object, no prose and no markdown fences."
+            )
+            verdict = schema_model.model_validate_json(raw)
+            print(f"[ai] {model_name} needed a repair round", flush=True)
+        except Exception as second_error:
+            return None, raw, f"{first_error} (repair also failed: {second_error})"
+
+    if agent and raw:
+        set_ai_cache(agent, prompt_hash, verdict.model_dump_json())
+    return verdict, raw, None
 
 
 def get_ai_cache(agent: str, prompt_hash: str):
@@ -336,11 +444,24 @@ def save_ai_results(agent: str, results: list):
                         shadow_status VARCHAR(16) NULL,
                         shadow_decided_at DATETIME NULL,
                         shadow_decided_by VARCHAR(128) NULL,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        verdict VARCHAR(24) NULL,
+                        severity VARCHAR(16) NULL,
+                        confidence DECIMAL(4,3) NULL,
+                        model VARCHAR(64) NULL,
+                        prompt_version VARCHAR(16) NULL,
+                        payload JSON NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_air_verdict (verdict),
+                        INDEX idx_air_created (created_at)
                     )
                 """)
                 # Backfill columns for tables created by an older worker so
-                # we don't blow up on INSERT when shadow_* fields are pushed.
+                # we don't blow up on INSERT when newer fields are pushed.
+                #
+                # verdict/severity/confidence are the point of this set: they
+                # used to exist only inside the rendered `critical_summary`
+                # string, so the UI parsed them back out with a regex and no
+                # query could filter on them.
                 for ddl in (
                     "ALTER TABLE ai_analysis_results ADD COLUMN source_data LONGTEXT NULL",
                     "ALTER TABLE ai_analysis_results ADD COLUMN proposed_action VARCHAR(64) NULL",
@@ -348,6 +469,14 @@ def save_ai_results(agent: str, results: list):
                     "ALTER TABLE ai_analysis_results ADD COLUMN shadow_status VARCHAR(16) NULL",
                     "ALTER TABLE ai_analysis_results ADD COLUMN shadow_decided_at DATETIME NULL",
                     "ALTER TABLE ai_analysis_results ADD COLUMN shadow_decided_by VARCHAR(128) NULL",
+                    "ALTER TABLE ai_analysis_results ADD COLUMN verdict VARCHAR(24) NULL",
+                    "ALTER TABLE ai_analysis_results ADD COLUMN severity VARCHAR(16) NULL",
+                    "ALTER TABLE ai_analysis_results ADD COLUMN confidence DECIMAL(4,3) NULL",
+                    "ALTER TABLE ai_analysis_results ADD COLUMN model VARCHAR(64) NULL",
+                    "ALTER TABLE ai_analysis_results ADD COLUMN prompt_version VARCHAR(16) NULL",
+                    "ALTER TABLE ai_analysis_results ADD COLUMN payload JSON NULL",
+                    "ALTER TABLE ai_analysis_results ADD INDEX idx_air_verdict (verdict)",
+                    "ALTER TABLE ai_analysis_results ADD INDEX idx_air_created (created_at)",
                 ):
                     try:
                         cursor.execute(ddl)
@@ -358,8 +487,9 @@ def save_ai_results(agent: str, results: list):
                         """
                         INSERT INTO ai_analysis_results
                             (timestamp, source_file, critical_summary, source_data,
-                             proposed_action, proposed_target, shadow_status)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                             proposed_action, proposed_target, shadow_status,
+                             verdict, severity, confidence, model, prompt_version, payload)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
                             res['timestamp'],
@@ -369,6 +499,12 @@ def save_ai_results(agent: str, results: list):
                             res.get('proposed_action'),
                             res.get('proposed_target'),
                             res.get('shadow_status'),
+                            res.get('verdict'),
+                            res.get('severity'),
+                            res.get('confidence'),
+                            res.get('model'),
+                            res.get('prompt_version', PROMPT_VERSION),
+                            res.get('payload'),
                         ),
                     )
                 conn.commit()
