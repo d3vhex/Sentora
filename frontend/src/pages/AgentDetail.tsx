@@ -897,13 +897,16 @@ const AlertsTab: React.FC<{ rows: AlertRow[] }> = ({ rows }) => {
   const eventTypes = React.useMemo(() => {
     const set = new Set<string>();
     rows.forEach(r => { if (r.event_type) set.add(r.event_type); });
-    return Array.from(set).sort();
+    // localeCompare, not the default sort: the default orders by UTF-16 code
+    // unit, which puts Turkish characters (ş, ç, ğ, İ) after Z in a filter
+    // dropdown an operator is scanning by eye.
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [rows]);
 
   const sources = React.useMemo(() => {
     const set = new Set<string>();
     rows.forEach(r => { if (r.source) set.add(r.source); });
-    return Array.from(set).sort();
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [rows]);
 
   const severityCounts = React.useMemo(() => {

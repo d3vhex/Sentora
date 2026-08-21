@@ -15,7 +15,7 @@ def get_cpu_info():
                     if "model name" in line:
                         cpu_name = line.split(":")[1].strip()
                         break
-        except:
+        except Exception:
             cpu_name = platform.machine()
     return cpu_name
 
@@ -82,7 +82,7 @@ def get_installed_software():
                             "vendor": vendor,
                             "install_date": dpkg_dates.get(parts[0], "N/A"),
                         })
-        except:
+        except Exception:
             pass
 
         # RHEL/Fedora/SUSE: rpm exposes vendor and install time directly.
@@ -106,7 +106,7 @@ def get_installed_software():
                                 "vendor": vendor,
                                 "install_date": install_date,
                             })
-            except:
+            except Exception:
                 pass
                 
     elif os_type == "windows":
@@ -133,11 +133,11 @@ def get_installed_software():
                                         "vendor": vendor,
                                         "install_date": install_date,
                                     })
-                                except:
+                                except Exception:
                                     continue
-                        except:
+                        except Exception:
                             continue
-        except:
+        except Exception:
             pass
             
     return software
@@ -153,7 +153,7 @@ def get_open_ports():
                     "pid": conn.pid,
                     "process": psutil.Process(conn.pid).name() if conn.pid else "Unknown"
                 })
-    except:
+    except Exception:
         pass
     return ports
 

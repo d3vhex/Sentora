@@ -47,6 +47,26 @@ RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq/")
 RECENT_AI_TASKS = {}
 AI_DEDUP_WINDOW = 30
 
+# asyncio holds only a *weak* reference to a running task, so a fire-and-forget
+# `create_task` can be garbage collected before it finishes. On the ingest path
+# that means telemetry silently not reaching the AI queue or the search index,
+# with nothing anywhere to say it happened.
+_background_tasks: set = set()
+
+
+def _spawn(coro, *, label: str = "background"):
+    """Fire-and-forget a coroutine while keeping it alive until it finishes."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+    def _report(t: asyncio.Task):
+        if not t.cancelled() and t.exception() is not None:
+            print(f"[!] {label} task failed: {t.exception()}", flush=True)
+
+    task.add_done_callback(_report)
+    return task
+
 
 def connect_db(db_name):
     return mysql.connector.connect(
@@ -252,14 +272,19 @@ async def insert_data(agent: str, table: str, data: list, public_ip: str = None,
                 last_time = RECENT_AI_TASKS.get(cache_key, 0)
                 if now - last_time > AI_DEDUP_WINDOW:
                     RECENT_AI_TASKS[cache_key] = now
-                    pub_task = asyncio.create_task(publish_to_ai_queue(agent, table, item))
-                    print(f"[AI-Trigger] Published {table} task for {agent} to RabbitMQ.")
-
+                    # This is the whole AI pipeline's entry point. The task was
+                    # previously assigned to a local that went out of scope
+                    # immediately, leaving only asyncio's weak reference — so
+                    # an event could be dropped before it ever reached the
+                    # queue, while the line below claimed it had been sent.
+                    _spawn(publish_to_ai_queue(agent, table, item),
+                           label=f"ai-publish {agent}/{table}")
 
                     if len(RECENT_AI_TASKS) > 1000:
                         RECENT_AI_TASKS.clear()
 
-            asyncio.create_task(os_utils.index_log(agent, table, item))
+            _spawn(os_utils.index_log(agent, table, item),
+                   label=f"index {agent}/{table}")
 
         conn.commit()
     except Exception as e:

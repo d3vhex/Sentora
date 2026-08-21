@@ -2,7 +2,7 @@ import os
 import re
 import logging
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict
 import platform
@@ -145,7 +145,7 @@ def check_file_windows(path: str) -> Optional[dict]:
     except ImportError:
         try:
             user = getpass.getuser()
-        except:
+        except Exception:
             pass
         if os.path.isdir(path):
             win_perms = "Directory"
@@ -281,7 +281,10 @@ def main():
     # declared once in enc_db.ENCRYPT_FIELDS_MAP.
 
     for item in results:
-        item['collected_at'] = datetime.utcnow()
+        # utcnow() is deprecated. The column is a naive DATETIME, so the value
+        # stays naive — this is the same instant, spelled without the
+        # deprecated call.
+        item['collected_at'] = datetime.now(timezone.utc).replace(tzinfo=None)
 
         dup_fp = make_dup_fp(item['path'], item['owner'], item['grp'], item['permissions'])
 

@@ -134,7 +134,9 @@ const AIAnalysis: React.FC = () => {
       const name = typeof a === 'string' ? a : a?.name;
       if (name) set.add(String(name));
     }
-    return Array.from(set).sort();
+    // localeCompare: agent hostnames can carry Turkish characters, which the
+    // default UTF-16 sort pushes past Z.
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [insights, agents]);
 
   const filteredInsights = insights.filter(i => {

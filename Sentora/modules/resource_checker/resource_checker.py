@@ -6,7 +6,7 @@ from modules.db import insert_record, delete_all
 def get_cpu_usage():
     try:
         return psutil.cpu_percent(interval=1)
-    except:
+    except Exception:
         return 0.0
 
 def get_memory_usage():
@@ -18,7 +18,7 @@ def get_memory_usage():
             "used": mem.used,
             "percent": mem.percent
         }
-    except:
+    except Exception:
         return {"total":0, "available":0, "used":0, "percent":0}
 
 def main():
