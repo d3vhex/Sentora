@@ -11,10 +11,9 @@ from collections import defaultdict, deque
 
 try:
     import modules.enc_db as enc_db
-    enc_db.set_encrypt_fields_map({
-        "siem_events": ["message"],
-        "events_alert": ["source", "message"]
-    })
+    # Encrypted fields are declared once in enc_db.ENCRYPT_FIELDS_MAP. Setting
+    # them here replaced the map for the whole process, dropping every table
+    # other modules had registered.
     fetch_unsent_dec = enc_db.fetch_recent_dec
     insert_record_enc = enc_db.insert_record_enc
     mark_sent_enc     = enc_db.mark_sent_enc

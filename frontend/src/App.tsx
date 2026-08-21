@@ -6,6 +6,7 @@ import AgentDetail from './pages/AgentDetail';
 import AdminConfig from './pages/AdminConfig';
 import AdminUsers from './pages/AdminUsers';
 import AIAnalysis from './pages/AIAnalysis';
+import ThreatIntel from './pages/ThreatIntel';
 import Login from './pages/Login';
 import Playbooks from './pages/Playbooks';
 import Databases from './pages/Databases';
@@ -58,6 +59,12 @@ const App: React.FC = () => {
         <Route path="/all-alerts" element={
           <ProtectedRoute>
             <GlobalAlerts />
+          </ProtectedRoute>
+        } />
+
+        <Route path="/threat-intel" element={
+          <ProtectedRoute>
+            <ThreatIntel />
           </ProtectedRoute>
         } />
         

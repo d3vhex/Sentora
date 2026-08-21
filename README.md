@@ -414,6 +414,15 @@ The deeper version (per-module layout, schema, AI pipeline, SOAR
 autonomy, air-gap surfaces) lives in
 [docs/Sentora_Architecture.md](docs/Sentora_Architecture.md).
 
+Operational docs:
+
+| Document | Covers |
+| :--- | :--- |
+| [Architecture](docs/Sentora_Architecture.md) | Module layout, data flow, auth model, AI pipeline |
+| [Production deployment](docs/production-deployment.md) | Sizing, network topology, TLS, backup, monitoring, air-gap |
+| [Update runbook](docs/update-runbook.md) | Upgrades, agent rollout, DB migrations, rollback |
+| [Progress report](docs/PROGRESS_REPORT.md) | What has changed and why |
+
 ---
 
 ## Development setup

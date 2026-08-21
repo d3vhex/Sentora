@@ -275,9 +275,10 @@ def main():
             if res:
                 results.append(res)
 
-    set_encrypt_fields_map({
-    "critical_files": ["path", "owner", "grp", "permissions", "last_opened"]
-    })
+    # The call that used to live here replaced the whole encryption map on
+    # every scan, leaving `critical_files` as the only encrypted table and
+    # silently turning off encryption for everything else. These fields are
+    # declared once in enc_db.ENCRYPT_FIELDS_MAP.
 
     for item in results:
         item['collected_at'] = datetime.utcnow()

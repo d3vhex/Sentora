@@ -15,9 +15,9 @@ from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Set
 
 import modules.enc_db as enc_db
-enc_db.set_encrypt_fields_map({
-    "siem_events": ["message"]
-})
+# Encrypted fields are declared once in enc_db.ENCRYPT_FIELDS_MAP. Setting
+# them here replaced the map for the whole process, dropping every table other
+# modules had registered.
 insert_record_enc = enc_db.insert_record_enc
 fetch_where_dec   = enc_db.fetch_where_dec
 
@@ -581,7 +581,14 @@ def follow_windows_eventlog(rules_list: List[Dict], exclude_patterns, log_type,
                     if any(p.search(full_msg) for p in exclude_patterns):
                         continue
 
-                    event = enricher.enrich_event(full_msg, log_type)
+                    # `source` (the event provider, e.g.
+                    # Microsoft-Windows-Security-Auditing) was computed above,
+                    # used in the message summary, and then dropped — only
+                    # `log_type`, the channel name, reached the source column.
+                    # Both are worth keeping: the channel says where to look,
+                    # the provider says what produced it.
+                    origin = f"{log_type}/{source}" if source and source != "Unknown" else log_type
+                    event = enricher.enrich_event(full_msg, origin)
                     event.event_type = matched_rule['category']
                     event.severity = matched_rule['severity']
 
