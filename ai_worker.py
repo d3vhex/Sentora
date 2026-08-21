@@ -124,7 +124,7 @@ async def handle_automation(agent, table, data, api_key, endpoint, model=None):
     log_text = json.dumps(data, indent=2)
     model_name = model or os.getenv("OLLAMA_MODEL", "")
 
-    verdict, raw, error = await asyncio.to_thread(
+    verdict, _, error = await asyncio.to_thread(
         analyze_structured, PROMPTS["automation"], log_text, TriageVerdict,
         endpoint=endpoint, agent=agent, model=model, api_key=api_key,
     )
@@ -134,8 +134,8 @@ async def handle_automation(agent, table, data, api_key, endpoint, model=None):
         entry = _parse_failure_entry(f"Reviewed_{table}", log_text, error or "no response", model_name)
         try:
             await asyncio.to_thread(save_ai_results, agent, [entry])
-        except Exception as e:
-            logger.error(f"[!] Automation save FAILED agent={agent}: {e}")
+        except Exception:
+            logger.exception(f"[!] Automation save FAILED agent={agent}")
         return
 
     intel_match = await asyncio.to_thread(get_threat_intel_summary, log_text)
@@ -175,8 +175,8 @@ async def handle_automation(agent, table, data, api_key, endpoint, model=None):
     }
     try:
         await asyncio.to_thread(save_ai_results, agent, [result_entry])
-    except Exception as e:
-        logger.error(f"[!] Automation save FAILED agent={agent} table={table}: {e}")
+    except Exception:
+        logger.exception(f"[!] Automation save FAILED agent={agent} table={table}")
 
 async def handle_manual(agent, table, data, api_key, endpoint, model=None):
     batch_size = len(data) if isinstance(data, list) else 1
@@ -184,7 +184,7 @@ async def handle_manual(agent, table, data, api_key, endpoint, model=None):
     model_name = model or os.getenv("OLLAMA_MODEL", "")
     logger.info(f"[*] Manual analysis START agent={agent} table={table} batch={batch_size}")
 
-    verdict, raw, error = await asyncio.to_thread(
+    verdict, _, error = await asyncio.to_thread(
         analyze_structured, PROMPTS["manual"], log_text, DeepAnalysis,
         endpoint=endpoint, agent=agent, model=model, api_key=api_key,
     )
@@ -194,8 +194,8 @@ async def handle_manual(agent, table, data, api_key, endpoint, model=None):
         entry = _parse_failure_entry(f"Manual_{table}", log_text, error or "no response", model_name)
         try:
             await asyncio.to_thread(save_ai_results, agent, [entry])
-        except Exception as e:
-            logger.error(f"[!] Manual save FAILED agent={agent}: {e}")
+        except Exception:
+            logger.exception(f"[!] Manual save FAILED agent={agent}")
         return
 
     # The list fields are columns in `payload` now. They are still appended to
@@ -226,8 +226,8 @@ async def handle_manual(agent, table, data, api_key, endpoint, model=None):
     try:
         await asyncio.to_thread(save_ai_results, agent, [result_entry])
         logger.info(f"[*] Manual analysis SAVED agent={agent} table={table} batch={batch_size}")
-    except Exception as e:
-        logger.error(f"[!] Manual save FAILED agent={agent} table={table}: {e}")
+    except Exception:
+        logger.exception(f"[!] Manual save FAILED agent={agent} table={table}")
 
 AUTONOMOUS_ACTIONS = {
     "BLOCK_IP",
@@ -256,7 +256,7 @@ async def handle_defensive(agent, table, data, api_key, endpoint, model=None):
     log_text = json.dumps(data, indent=2)
     model_name = model or os.getenv("OLLAMA_MODEL", "")
 
-    decision, raw, error = await asyncio.to_thread(
+    decision, _, error = await asyncio.to_thread(
         analyze_structured, PROMPTS["defensive"], log_text, DefensiveDecision,
         endpoint=endpoint, agent=agent, model=model, api_key=api_key,
     )
@@ -270,8 +270,8 @@ async def handle_defensive(agent, table, data, api_key, endpoint, model=None):
         entry = _parse_failure_entry("AI_DEFENSIVE_ADVICE", log_text, error or "no response", model_name)
         try:
             await asyncio.to_thread(save_ai_results, agent, [entry])
-        except Exception as e:
-            logger.error(f"[!] Defensive save FAILED agent={agent}: {e}")
+        except Exception:
+            logger.exception(f"[!] Defensive save FAILED agent={agent}")
         return
 
     v = decision.verdict
@@ -370,8 +370,8 @@ async def handle_defensive(agent, table, data, api_key, endpoint, model=None):
     }
     try:
         await asyncio.to_thread(save_ai_results, agent, [result_entry])
-    except Exception as e:
-        logger.error(f"[!] Defensive save FAILED agent={agent} table={table}: {e}")
+    except Exception:
+        logger.exception(f"[!] Defensive save FAILED agent={agent} table={table}")
 
 # How many events this worker will have in flight at once.
 #
@@ -420,8 +420,8 @@ async def _requeue_with_backoff(message: aio_pika.IncomingMessage, attempt: int,
             ),
             routing_key=QUEUES.get(WORKER_TYPE, mq_utils.AI_AUTOMATION),
         )
-    except Exception as e:
-        logger.error(f"[!] Could not requeue task: {e}")
+    except Exception:
+        logger.exception("[!] Could not requeue task — this event is now lost")
 
 
 async def process_message(message: aio_pika.IncomingMessage):
@@ -461,8 +461,12 @@ async def process_message(message: aio_pika.IncomingMessage):
                 # usable verdict" cards in the UI is worse than none.
                 await _requeue_with_backoff(message, attempt, str(e))
 
-            except Exception as e:
-                logger.error(f"[!] Error processing message in {WORKER_TYPE}: {e}")
+            except Exception:
+                # exception(), not error(): this is the catch-all for the
+                # whole message path, and without a traceback a message like
+                # "'NoneType' object has no attribute 'get'" says nothing
+                # about which handler raised it.
+                logger.exception(f"[!] Error processing message in {WORKER_TYPE}")
 
 async def main():
     queue_name = QUEUES.get(WORKER_TYPE, mq_utils.AI_AUTOMATION)
@@ -473,7 +477,10 @@ async def main():
         try:
             connection = await aio_pika.connect_robust(RABBITMQ_URL)
         except Exception as e:
-            logger.error(f"[!] Connection to {RABBITMQ_URL} failed, retrying in 5s...")
+            # The reason was captured and then dropped, so a broker that was
+            # refusing the credentials looked identical to one that was not up
+            # yet — both just retried silently every 5s.
+            logger.error(f"[!] Connection to {RABBITMQ_URL} failed ({e}), retrying in 5s...")
             await asyncio.sleep(5)
 
     global _exchange

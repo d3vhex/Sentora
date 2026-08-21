@@ -13,7 +13,7 @@ import multiprocessing
 import json as pyjson
 from mysql.connector.aio import connect 
 import mysql.connector
-from datetime import datetime
+from datetime import datetime, timezone
 from time import sleep
 import core.opensearch as os_utils
 import smtplib
@@ -1473,7 +1473,7 @@ class CustomEncoder(pyjson.JSONEncoder):
         if isinstance(obj, float) and 1000000000 < obj < 2000000000:
             try:
                 return datetime.fromtimestamp(obj).strftime("%Y-%m-%d %H:%M:%S")
-            except:
+            except Exception:
                 pass
         
         if isinstance(obj, str) and '.' in obj:
@@ -1624,9 +1624,9 @@ async def audit_log(request, action: str, resource: str, details: str = ""):
         await cursor.close(); await cnx.close()
 
         try:
-            asyncio.create_task(os_utils.index_log(
-                agent="system", 
-                table="audit_logs", 
+            _spawn(os_utils.index_log(
+                agent="system",
+                table="audit_logs",
                 item={
                     "user_id": user_id,
                     "username": username,
@@ -3413,7 +3413,11 @@ async def _chain_append(cnx, shadow_id: int, action: str, target: str,
         last = await cur.fetchone()
         prev_hash = last['row_hash'] if last else ('0' * 64)
 
-        decided_at_str = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        # datetime.utcnow() is deprecated in 3.12 and returns a naive datetime
+        # that merely *claims* to be UTC — a footgun anywhere it meets an
+        # aware one. This value is hashed into the audit chain, so it should
+        # be unambiguous. Same output string, explicit timezone.
+        decided_at_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
         payload = f"{shadow_id}|{action}|{target}|{decision}|{decided_by}|{decided_at_str}|{prev_hash}"
         row_hash = hashlib.sha256(payload.encode()).hexdigest()
 
@@ -4662,12 +4666,12 @@ async def report_automation_result(request, agent=None):
         
         try:
             await cur.execute(query_soar, (status, output[:500], task_id))
-        except:
+        except Exception:
             pass
             
         try:
             await cur.execute(query_auto, (status.lower(), output[:500], task_id))
-        except:
+        except Exception:
             pass
             
         await cnx.commit(); await cur.close(); await cnx.close()
@@ -4722,7 +4726,7 @@ async def fixed_list_automations(request, agent):
             await cur.execute("SELECT id, device, event_id, action, target, comment, status, `timestamp`, payload, created_at, updated_at, 'automation' as source FROM automations WHERE device = %s ORDER BY id DESC LIMIT %s", (agent, limit))
             cols = [d[0] for d in cur.description]
             all_data.extend([dict(zip(cols, r)) for r in await cur.fetchall()])
-        except:
+        except Exception:
             await cur.execute("SELECT id, device, event_id, action, target, comment, status, `timestamp`, payload, created_at, created_at as updated_at, 'automation' as source FROM automations WHERE device = %s ORDER BY id DESC LIMIT %s", (agent, limit))
             cols = [d[0] for d in cur.description]
             all_data.extend([dict(zip(cols, r)) for r in await cur.fetchall()])
@@ -4732,7 +4736,7 @@ async def fixed_list_automations(request, agent):
             await cur.execute("SELECT id, action, target, comment, status, `timestamp`, created_at, updated_at, 'manual' as source FROM soar_actions ORDER BY id DESC LIMIT %s", (limit,))
             cols = [d[0] for d in cur.description]
             rows_soar = [dict(zip(cols, r)) for r in await cur.fetchall()]
-        except:
+        except Exception:
             await cur.execute("SELECT id, action, target, comment, status, `timestamp`, created_at, created_at as updated_at, 'manual' as source FROM soar_actions ORDER BY id DESC LIMIT %s", (limit,))
             cols = [d[0] for d in cur.description]
             rows_soar = [dict(zip(cols, r)) for r in await cur.fetchall()]
@@ -4755,7 +4759,7 @@ async def fixed_list_automations(request, agent):
                     from datetime import datetime
                     dt = datetime.fromisoformat(val.replace(" ", "T"))
                     return float(dt.timestamp())
-                except:
+                except Exception:
                     try: return float(val)
                     except: return 0.0
             return 0.0
@@ -6023,10 +6027,15 @@ async def list_agents(request):
 @app.route("/restart-db", methods=["POST"])
 async def restart_db(request):
     try:
-        result = subprocess.run(
+        # Off the event loop. `subprocess.run` blocks until docker finishes
+        # restarting the container — several seconds during which this worker
+        # served no other request, including the health check.
+        result = await asyncio.to_thread(
+            subprocess.run,
             ["docker", "compose", "restart", "mysql"],
             capture_output=True,
-            text=True
+            text=True,
+            timeout=120,
         )
 
         if result.returncode != 0:
@@ -6296,6 +6305,32 @@ async def gather_over_agents(fn, agents: list, limit: int = None) -> list:
 
     results = await asyncio.gather(*(_one(a) for a in agents))
     return [r for r in results if r is not None]
+
+
+# asyncio keeps only a *weak* reference to a running task. A task nobody holds
+# can be garbage collected mid-execution, so a fire-and-forget
+# `asyncio.create_task(...)` silently may or may not finish — which for log
+# indexing means audit entries that intermittently never reach OpenSearch, with
+# nothing in the log to say so.
+#
+# Holding a strong reference until the task completes is the documented fix.
+_background_tasks: set = set()
+
+
+def _spawn(coro, *, label: str = "background"):
+    """Fire-and-forget a coroutine without letting the GC eat it."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+    def _report(t: asyncio.Task):
+        # An exception in a discarded task is otherwise only surfaced by
+        # asyncio's "exception was never retrieved" warning at GC time.
+        if not t.cancelled() and t.exception() is not None:
+            print(f"[!] {label} task failed: {t.exception()}", flush=True)
+
+    task.add_done_callback(_report)
+    return task
 
 
 async def _list_agent_names_sync() -> list:
@@ -7278,11 +7313,11 @@ async def ensure_playbooks_table(agent: str):
     """)
     try:
         await cur.execute("ALTER TABLE playbooks ADD COLUMN description TEXT AFTER name")
-    except:
+    except Exception:
         pass
     try:
         await cur.execute("ALTER TABLE playbooks ADD COLUMN updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")
-    except:
+    except Exception:
         pass
     
     await cnx.commit()
@@ -7315,7 +7350,7 @@ async def list_playbooks(request, agent):
             await cur.execute(
                 "SELECT id, name, description, nodes, connections, created_at, updated_at FROM playbooks ORDER BY updated_at DESC"
             )
-        except:
+        except Exception:
             await cur.execute(
                 "SELECT id, name, '' as description, nodes, connections, created_at, created_at as updated_at FROM playbooks ORDER BY created_at DESC"
             )

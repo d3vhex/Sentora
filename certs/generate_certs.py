@@ -1,7 +1,7 @@
 
 import argparse
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -24,7 +24,10 @@ def generate_root_ca(common_name: str, days: int):
         x509.NameAttribute(NameOID.COMMON_NAME, common_name),
     ])
 
-    now = datetime.utcnow()
+    # Naive UTC on purpose. `cryptography` is unpinned in requirements.txt and
+    # older versions expect naive datetimes here, so this stays the same value
+    # utcnow() produced — just without the call Python deprecated in 3.12.
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)
@@ -61,7 +64,10 @@ def generate_server_cert(cn: str, days: int, ca_key, ca_cert):
         x509.NameAttribute(NameOID.COMMON_NAME, cn),
     ])
 
-    now = datetime.utcnow()
+    # Naive UTC on purpose. `cryptography` is unpinned in requirements.txt and
+    # older versions expect naive datetimes here, so this stays the same value
+    # utcnow() produced — just without the call Python deprecated in 3.12.
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
 
     san = x509.SubjectAlternativeName([
         x509.DNSName(cn),

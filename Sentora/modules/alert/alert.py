@@ -75,7 +75,7 @@ def parse_siem_event(row) -> AlertContext:
         if raw_msg.strip().startswith("{") and raw_msg.strip().endswith("}"):
             try:
                 msg_json = json.loads(raw_msg)
-            except:
+            except Exception:
                 msg_json = {}
         else:
             msg_json = {}

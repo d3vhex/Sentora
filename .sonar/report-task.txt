@@ -1,0 +1,6 @@
+projectKey=d3vhex_Sentora_f88073b9-3ab9-4a1e-80b4-2849ab1030a6
+serverUrl=http://localhost:9000
+serverVersion=26.8.0.126808
+dashboardUrl=http://localhost:9000/dashboard?id=d3vhex_Sentora_f88073b9-3ab9-4a1e-80b4-2849ab1030a6
+ceTaskId=39b2d055-f799-44a3-899b-3f8a1ab96daa
+ceTaskUrl=http://localhost:9000/api/ce/task?id=39b2d055-f799-44a3-899b-3f8a1ab96daa

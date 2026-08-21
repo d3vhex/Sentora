@@ -2,7 +2,7 @@ from modules.db import insert_record, delete_all, fetch_where
 import socket
 import sys
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 import struct
 import asyncio
 
@@ -612,7 +612,7 @@ async def main_async():
     print(f"[*] Port Range: 1-65535")
     print(f"{'='*70}\n")
     
-    start_time = datetime.utcnow()
+    start_time = datetime.now(timezone.utc).replace(tzinfo=None)
     try:
         total_found = 0
         total_saved = 0
@@ -629,12 +629,12 @@ async def main_async():
                         'service': service,
                         'product': product,
                         'version': version,
-                        'scanned_at': datetime.utcnow(),
+                        'scanned_at': datetime.now(timezone.utc).replace(tzinfo=None),
                     },
                 )
                 total_saved += 1
                 
-        end_time = datetime.utcnow()
+        end_time = datetime.now(timezone.utc).replace(tzinfo=None)
         duration = (end_time - start_time).total_seconds()
         
         print(f"\n{'='*70}")

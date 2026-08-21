@@ -418,7 +418,7 @@ def get_public_ip() -> str:
         host_ip = socket.gethostbyname(socket.gethostname())
         if host_ip and not host_ip.startswith("127.") and not host_ip.startswith("169.254."):
             return host_ip
-    except:
+    except Exception:
         pass
 
     return ip or "127.0.0.1"

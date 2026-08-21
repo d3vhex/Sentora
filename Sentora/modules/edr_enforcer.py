@@ -74,7 +74,7 @@ def track_network():
             try:
                 proc = psutil.Process(conn.pid)
                 name = proc.name()
-            except:
+            except Exception:
                 name = "Unknown"
             
             insert_record_enc("network_connections", {
@@ -127,7 +127,7 @@ def monitor_processes():
                                 "status": "suspicious_child"
                             })
                             continue
-                except:
+                except Exception:
                     pass
             
             try:
@@ -146,7 +146,7 @@ def monitor_processes():
             except (psutil.AccessDenied, psutil.ZombieProcess):
                 pass
 
-        except:
+        except Exception:
             continue
 
 def get_hardware_inventory():
