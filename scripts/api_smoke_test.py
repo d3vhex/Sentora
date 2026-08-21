@@ -61,12 +61,18 @@ SKIP = {
 # entry path, which is where unhandled-KeyError 500s live: a well-behaved
 # endpoint answers 400 to a malformed body, never 500.
 SAFE_WRITE_PROBES: dict[str, dict] = {
-    "/<agent>/playbooks/validate": {},          # validates a graph, no writes
+    "/<agent>/playbooks/validate": {},           # validates a graph, no writes
     "/<agent>/automations/validate-target": {},  # validates an IP/username
     "/ldap/test-connection": {},                 # no host in body -> 400 before connecting
     "/change-password": {},                      # pydantic rejects the empty body
     "/roles": {},                                # role_name missing -> 400
     "/users": {},                                # pydantic rejects the empty body
+    # Lints a config and returns the issues. Never writes, never reaches the
+    # agent — that is the whole point of the endpoint.
+    "/<agent>/config/<cfg_type>/validate": {"content": "not: [valid"},
+    # Rejected for missing fields before it touches the table. Sending a real
+    # body here would overwrite a live template.
+    "/email-templates": {},
 }
 
 # Endpoints that legitimately answer without a session.

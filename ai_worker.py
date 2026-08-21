@@ -5,6 +5,7 @@ sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "Sentor
 import asyncio
 import json
 import re
+import time
 import logging
 import aio_pika
 import os
@@ -413,7 +414,17 @@ async def handle_defensive(agent, table, data, api_key, endpoint, model=None):
     except Exception as e:
         logger.error(f"[!] Defensive save FAILED agent={agent} table={table}: {e}")
 
-ai_semaphore = asyncio.Semaphore(1)
+# How many events this worker will have in flight at once.
+#
+# Left at 1 by default on purpose. Ollama serialises requests per model unless
+# OLLAMA_NUM_PARALLEL is raised, and on CPU inference more parallelism does not
+# add throughput — it splits the same compute, making every request slower.
+# Raise this together with OLLAMA_NUM_PARALLEL, and only on a GPU box or one
+# with cores to spare. The latency line in ai/utils.py tells you whether it
+# actually helped.
+AI_CONCURRENCY = max(1, int(os.getenv("AI_CONCURRENCY", "1")))
+
+ai_semaphore = asyncio.Semaphore(AI_CONCURRENCY)
 
 async def process_message(message: aio_pika.IncomingMessage):
     async with message.process():
@@ -433,6 +444,7 @@ async def process_message(message: aio_pika.IncomingMessage):
                 endpoint = cfg.get('endpoint')
                 model = cfg.get('model_name') or cfg.get('model')
 
+                started = time.monotonic()
                 if WORKER_TYPE == "automation":
                     await handle_automation(agent, table, data, api_key, endpoint, model)
                 elif WORKER_TYPE == "manual":
@@ -440,7 +452,8 @@ async def process_message(message: aio_pika.IncomingMessage):
                 elif WORKER_TYPE == "defensive":
                     await handle_defensive(agent, table, data, api_key, endpoint, model)
 
-                await asyncio.sleep(0.5)
+                logger.info(f"[*] Finished {WORKER_TYPE} task for {agent}/{table} "
+                            f"in {time.monotonic() - started:.1f}s")
 
             except Exception as e:
                 logger.error(f"[!] Error processing message in {WORKER_TYPE}: {e}")
@@ -459,7 +472,11 @@ async def main():
 
     async with connection:
         channel = await connection.channel()
-        await channel.set_qos(prefetch_count=1)
+        # Matched to the semaphore. Prefetching more than we can process just
+        # moves the backlog from the broker into this process, where it is
+        # invisible and unacked messages sit until the channel closes.
+        await channel.set_qos(prefetch_count=AI_CONCURRENCY)
+        logger.info(f"[*] Concurrency: {AI_CONCURRENCY}, prefetch: {AI_CONCURRENCY}")
         queue = await channel.declare_queue(queue_name, durable=True)
         await queue.consume(process_message)
         await asyncio.Future()

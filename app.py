@@ -675,19 +675,33 @@ echo "main.exe" -a "Agent-%%COMPUTERNAME%%" -s "{server_ip}" >> run_agent.bat
 
 echo [*] Installing Sentora Agent Background Task...
 set TASK_NAME=SentoraAgent
+set WATCH_NAME=SentoraAgentWatchdog
 set BIN_PATH="%~dp0run_agent.bat"
 
-:: Stop and delete old Scheduled Task if it exists
+:: Stop and delete old Scheduled Tasks if they exist
 schtasks /end /tn "%TASK_NAME%" >nul 2>&1
 schtasks /delete /tn "%TASK_NAME%" /f >nul 2>&1
+schtasks /delete /tn "%WATCH_NAME%" /f >nul 2>&1
 
-:: Create a new Scheduled Task to run silently on boot as SYSTEM
+:: Run silently on boot as SYSTEM
 schtasks /create /tn "%TASK_NAME%" /tr "%BIN_PATH%" /sc onstart /ru System /f
 if %errorlevel% neq 0 (
     echo [!] Failed to create background task.
 ) else (
     echo [*] Starting the Agent now...
     schtasks /run /tn "%TASK_NAME%"
+)
+
+:: Watchdog. schtasks cannot attach a repetition interval to an onstart
+:: trigger, so this is a second task on a 15-minute schedule. main.exe takes
+:: a single-instance lock before doing any work and exits 0 if another agent
+:: already holds it -- so while the agent is healthy this is a no-op, and
+:: when it has died it brings it back without waiting for a reboot.
+schtasks /create /tn "%WATCH_NAME%" /tr "%BIN_PATH%" /sc minute /mo 15 /ru System /f >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [!] Watchdog task not created - the agent will still start at boot.
+) else (
+    echo [*] Watchdog registered ^(checks every 15 minutes^).
 )
 
 echo [+] Setup Complete! The Agent is now running in the background.
@@ -1330,10 +1344,35 @@ def _render_windows_install(server_url: str, server_ip: str, token: str) -> str:
 
         try {{
             $action    = New-ScheduledTaskAction -Execute $exePath -Argument "--config `"$ConfigPath`"" -WorkingDirectory $workDir
-            $trigger   = New-ScheduledTaskTrigger -AtStartup
+
+            # Two triggers. AtStartup is the normal path. The repeating one is
+            # a watchdog: if the agent is ever not running -- crash, manual
+            # stop, a failed upgrade -- the next tick starts it again. Without
+            # it, a single unhandled exit left the endpoint blind until
+            # somebody noticed, which is the worst failure mode a sensor has.
+            #
+            # MultipleInstances=IgnoreNew below makes the watchdog a no-op
+            # while the agent is already up, so this costs nothing when
+            # everything is fine.
+            $bootTrigger  = New-ScheduledTaskTrigger -AtStartup
+            $watchTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
+                                -RepetitionInterval (New-TimeSpan -Minutes 15)
+            $triggers = @($bootTrigger, $watchTrigger)
+
             $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-            $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-            Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+
+            # RestartCount is deliberately generous: the agent now retries its
+            # own server bootstrap internally, so a restart here means the
+            # process actually died, and a sensor that gives up after three
+            # tries is a sensor you cannot rely on.
+            $settings = New-ScheduledTaskSettingsSet `
+                            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                            -StartWhenAvailable `
+                            -ExecutionTimeLimit ([TimeSpan]::Zero) `
+                            -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1) `
+                            -MultipleInstances IgnoreNew
+
+            Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $triggers -Principal $principal -Settings $settings -Force | Out-Null
         }} catch {{
             Write-Host "[!] Failed to register scheduled task: $($_.Exception.Message)" -ForegroundColor Red
             return

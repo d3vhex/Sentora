@@ -37,6 +37,12 @@ phone-home. If you want a smarter model and have the RAM, swap it in `.env`.
   per-node result tracking, can be triggered manually or by AI verdict.
 - **Vulnerability scans** every agent's installed packages against OSV
   (online or via an internal mirror).
+- **Pulls threat-intel feeds** from abuse.ch (Feodo, ThreatFox, URLhaus)
+  into a local indicator table, with staleness pruning and an air-gap
+  switch.
+- **Validates agent configs before pushing them.** YAML parse, structural
+  shape and regex compilation — an invalid regex is valid YAML and silently
+  disables the rule containing it.
 - **Built-in remote desktop** via WebSocket JPEG streaming, no separate
   VNC install needed on the endpoint.
 
@@ -323,19 +329,69 @@ The server uses two Fernet keys, both auto-generated on first boot:
 `chmod 600` both. Back them up. Losing either makes the corresponding
 encrypted data unreadable. There is no in-place rotation yet.
 
-### Threat intel keys
+### Threat intel
 
-`OTX_API_KEY` and `VT_API_KEY` are optional. Unset → enrichment becomes
-a no-op, no external API calls. Keeps the stack air-gap-friendly.
+Two independent mechanisms, both optional:
+
+**Per-verdict enrichment** (`ai/intel.py`). The AI worker cross-checks
+indicators found in a log against AlienVault OTX and VirusTotal. Needs
+`OTX_API_KEY` / `VT_API_KEY`; unset means no external call at all.
+
+**Indicator feeds** (`core/threat_feeds.py`). Populates the `threat_intel`
+table hourly from abuse.ch — Feodo Tracker (botnet C2 addresses), ThreatFox
+(mixed IoCs with a confidence score) and URLhaus (malware-distributing URLs).
+
+Indicators carry `last_seen` and are pruned after `THREAT_INTEL_STALE_DAYS`
+(default 30): an address that hosted a C2 last quarter usually belongs to
+someone else now, and keeping it produces false positives indefinitely. Each
+feed is capped at `THREAT_INTEL_MAX_PER_FEED` rows because the table is read
+on the alert path.
+
+abuse.ch has been moving downloads behind a free account key. A feed
+returning 401/403 says so in the server log; set `THREAT_INTEL_AUTH_KEY`.
+
+Check what actually arrived:
+
+```bash
+docker logs sentora-server | grep ThreatIntel
+```
 
 ### Air-gap mode
 
 ```ini
 OSV_MODE=mirror
 OSV_MIRROR_URL=http://osv.internal
+
+THREAT_INTEL_MODE=off
+# or serve the feeds internally:
+# THREAT_INTEL_FEODO_URL=http://mirror.internal/feodo.json
 ```
 
-Bundled fonts, local Ollama, no external CDN. Works fully offline.
+With those set, plus `OTX_API_KEY` / `VT_API_KEY` unset, nothing leaves the
+network. Fonts are bundled, Ollama is local, no CDN is contacted.
+
+### Fleet exposure
+
+`/api/exposure/report` counts unpatched packages and file-integrity events
+across the fleet, per agent, worst first. It reports its own coverage:
+`complete: false` when an agent could not be read, because a total over half
+the fleet is not a fleet total.
+
+There is deliberately no score. The endpoint previously returned
+`100 - vulns*2 - fim*5` as a "compliance score" — that maps to no framework,
+does not scale with fleet size, and pins to zero on any real fleet. Severity
+grading is absent for the same reason: `vulnerabilities_report` has no
+severity column and its fields are encrypted at rest, so any grade would have
+to be invented.
+
+### Agent config validation
+
+`POST /<agent>/config/<type>` validates before anything reaches a sensor:
+YAML parse, structural shape, and — the layer that matters — **regex
+compilation**. An invalid regex is perfectly valid YAML and silently disables
+the category containing it, so a syntax-only check would push it straight to
+the endpoint. The editor lints against the same endpoint as you type and
+reports issues with clickable line numbers.
 
 ---
 
@@ -399,8 +455,23 @@ Production: let `docker-compose.yaml` do it.
 PRs welcome. Before opening:
 
 1. Fork → branch → PR against `main`.
-2. `npx tsc --noEmit` in `frontend/` and `python -m py_compile app.py`.
-3. New endpoints must be wrapped in `@require_permission(...)`.
+2. Run the checks:
+
+```bash
+pytest -ra                                   # no MySQL or RabbitMQ needed
+python -m compileall -q app.py core security
+cd frontend && npx tsc --noEmit && npm run build && cd ..
+
+# With the stack up — enumerates every route and calls it twice
+python scripts/api_smoke_test.py
+```
+
+3. New endpoints must be wrapped in `@require_permission(...)`. The boot log
+   prints the tally; if it reports `0 permission-gated`, something is wrong
+   with the wiring, not with your route.
+4. Anything that reaches an agent or an external host needs validation on the
+   server side, not only in the browser. Two implementations drift, and the
+   browser's copy is the one operators end up trusting.
 
 For anything bigger than a fix, open an issue first so we can align on
 the approach.
@@ -411,21 +482,32 @@ the approach.
 
 ```
 .
-├── app.py                # Sanic API + React SPA host
-├── server.py             # TCP ingest
-├── ai_worker.py          # AI worker fleet (3 modes)
+├── app.py                     # Sanic API + React SPA host
+├── server.py                  # TCP ingest
+├── ai_worker.py               # AI worker fleet (3 modes)
 ├── ai/
-│   ├── utils.py          # LLM helpers, AI cache, SOAR queueing
-│   └── intel.py          # OTX / VT enrichment (opt-in)
+│   ├── utils.py               # LLM helpers, AI cache, SOAR queueing
+│   └── intel.py               # OTX / VT per-verdict enrichment (opt-in)
 ├── core/
-│   ├── mq.py             # RabbitMQ publisher
-│   └── opensearch.py     # OpenSearch index/search
+│   ├── mq.py                  # RabbitMQ publisher
+│   ├── opensearch.py          # OpenSearch index/search
+│   ├── config_validation.py   # Agent YAML validation (parse, shape, regex)
+│   └── threat_feeds.py        # abuse.ch indicator feeds
+├── security/
+│   ├── session.py             # Server-side session store
+│   └── ssrf.py                # Proxy destination rules
 ├── scanners/
-│   └── vuln.py           # Server-side OSV scanner
-├── frontend/             # React 18 + TS SPA
-├── Sentora/             # Cross-platform agent
-├── certs/                # Self-signed dev certs
-├── docs/                 # Architecture + screenshots
+│   └── vuln.py                # Server-side OSV scanner
+├── scripts/
+│   ├── init_secrets.py        # Generate the secrets .env needs
+│   ├── rotate_db_password.py  # Rotate the MySQL root password safely
+│   └── api_smoke_test.py      # Exercise every route against a live server
+├── tests/                     # pytest; no MySQL or RabbitMQ required
+├── frontend/                  # React 18 + TS SPA
+│   └── src/lib/               # Shared logic (playbook action catalogue)
+├── Sentora/                   # Cross-platform agent
+├── certs/                     # Self-signed dev certs
+├── docs/                      # Architecture + screenshots
 └── docker-compose.yaml
 ```
 

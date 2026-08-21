@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 import requests
 import mysql.connector
 import hashlib
@@ -90,6 +91,17 @@ def _normalize_ollama_url(endpoint: str) -> str:
     return f"{url}/api/generate"
 
 
+# Bump when a prompt template changes. It is part of the cache key, so a
+# reworded prompt cannot keep serving verdicts produced by the old one — the
+# previous cache had no such notion and a stale answer lived forever.
+PROMPT_VERSION = os.getenv("AI_PROMPT_VERSION", "v1")
+
+# A local 3B model answers in 20-60s on CPU. Ten minutes was not a timeout, it
+# was a hang: one stuck request blocked the worker's only slot for the whole
+# window while the queue backed up behind it.
+AI_TIMEOUT_SEC = int(os.getenv("AI_TIMEOUT_SEC", "120"))
+
+
 def analyze_with_ai(api_key, text, prompt_template, endpoint=None, agent=None, model=None):
     """Generic AI analysis function for different worker types.
 
@@ -100,7 +112,14 @@ def analyze_with_ai(api_key, text, prompt_template, endpoint=None, agent=None, m
     model_name = (model or OLLAMA_MODEL or '').strip() or OLLAMA_MODEL
 
     prompt = prompt_template.format(log_text=text)
-    prompt_hash = hashlib.md5(f"{model_name}|{prompt}".encode()).hexdigest()
+    # Keyed on the exact prompt, deliberately. Normalising the log text to
+    # raise the hit rate would let one event answer for a different one, and
+    # in a triage pipeline a wrong cache hit is a missed detection. Dedup of
+    # similar events belongs upstream, where server.py already fingerprints
+    # them before publishing.
+    prompt_hash = hashlib.sha256(
+        f"{PROMPT_VERSION}|{model_name}|{prompt}".encode()
+    ).hexdigest()
 
     if agent:
         cached = get_ai_cache(agent, prompt_hash)
@@ -113,10 +132,16 @@ def analyze_with_ai(api_key, text, prompt_template, endpoint=None, agent=None, m
         "stream": False,
     }
 
+    started = time.monotonic()
     try:
-        resp = requests.post(target_url, json=payload, timeout=600)
+        resp = requests.post(target_url, json=payload, timeout=AI_TIMEOUT_SEC)
+        elapsed = time.monotonic() - started
         if resp.status_code == 200:
             ai_resp = resp.json().get('response', '').strip()
+            # Latency was invisible, so there was no way to tell a slow model
+            # from a stuck one, or to know whether raising concurrency helped.
+            print(f"[ai] {model_name} responded in {elapsed:.1f}s "
+                  f"({len(prompt)} char prompt, {len(ai_resp)} char reply)", flush=True)
             if agent and ai_resp:
                 set_ai_cache(agent, prompt_hash, ai_resp)
             return ai_resp
@@ -133,17 +158,34 @@ def analyze_with_ai(api_key, text, prompt_template, endpoint=None, agent=None, m
                 f"Check OLLAMA_BASE_URL / AI Config endpoint value."
             )
         return f"Error: AI service returned {resp.status_code}"
+    except requests.Timeout:
+        elapsed = time.monotonic() - started
+        print(f"[ai] {model_name} timed out after {elapsed:.0f}s "
+              f"(AI_TIMEOUT_SEC={AI_TIMEOUT_SEC})", flush=True)
+        return f"Error: AI service timed out after {AI_TIMEOUT_SEC}s"
     except Exception as e:
         return f"Error connecting to AI service: {str(e)}"
 
+
+# Cached verdicts expire. Without this a single bad answer was served forever:
+# the old cache had no TTL and no prompt version, so the only way to clear one
+# was to drop the table by hand.
+AI_CACHE_TTL_HOURS = int(os.getenv("AI_CACHE_TTL_HOURS", "24"))
+
+
 def get_ai_cache(agent: str, prompt_hash: str):
-    """Retrieve cached AI result if available"""
+    """Return a cached response, or None when absent or expired."""
     db_name = _agent_db(agent)
     try:
         with _conn(db_name) as conn:
             cursor = conn.cursor()
             try:
-                cursor.execute("SELECT response FROM ai_cache WHERE prompt_hash = %s", (prompt_hash,))
+                cursor.execute(
+                    "SELECT response FROM ai_cache "
+                    "WHERE prompt_hash = %s "
+                    "AND created_at > (NOW() - INTERVAL %s HOUR)",
+                    (prompt_hash, AI_CACHE_TTL_HOURS),
+                )
                 row = cursor.fetchone()
             finally:
                 cursor.close()
@@ -151,8 +193,41 @@ def get_ai_cache(agent: str, prompt_hash: str):
     except Exception:
         return None
 
+
+def purge_ai_cache(agent: str) -> int:
+    """Drop expired rows. Called opportunistically on write."""
+    db_name = _agent_db(agent)
+    try:
+        with _conn(db_name) as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    "DELETE FROM ai_cache WHERE created_at < (NOW() - INTERVAL %s HOUR)",
+                    (AI_CACHE_TTL_HOURS,),
+                )
+                removed = cursor.rowcount or 0
+                conn.commit()
+            finally:
+                cursor.close()
+        return removed
+    except Exception:
+        return 0
+
+# Purging on every write would be a DELETE per inference. Once every N writes
+# keeps the table bounded without that cost.
+_PURGE_EVERY = 50
+_writes_since_purge = 0
+
+
 def set_ai_cache(agent: str, prompt_hash: str, response: str):
-    """Store AI result in cache"""
+    """Store an AI result.
+
+    The key widened from CHAR(32) (MD5) to CHAR(64) (SHA-256) and now carries
+    the prompt version, so the ALTER below migrates tables created by an older
+    worker. Without it every write would fail on a truncated key and the cache
+    would silently stop working.
+    """
+    global _writes_since_purge
     db_name = _agent_db(agent)
     try:
         with _conn(db_name) as conn:
@@ -160,20 +235,35 @@ def set_ai_cache(agent: str, prompt_hash: str, response: str):
             try:
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS ai_cache (
-                        prompt_hash CHAR(32) PRIMARY KEY,
+                        prompt_hash CHAR(64) PRIMARY KEY,
                         response TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_created (created_at)
                     )
                 """)
+                for ddl in (
+                    "ALTER TABLE ai_cache MODIFY COLUMN prompt_hash CHAR(64) NOT NULL",
+                    "ALTER TABLE ai_cache ADD INDEX idx_created (created_at)",
+                ):
+                    try:
+                        cursor.execute(ddl)
+                    except Exception:
+                        pass  # already migrated
                 cursor.execute(
-                    "INSERT INTO ai_cache (prompt_hash, response) VALUES (%s, %s) ON DUPLICATE KEY UPDATE response=VALUES(response)",
+                    "INSERT INTO ai_cache (prompt_hash, response) VALUES (%s, %s) "
+                    "ON DUPLICATE KEY UPDATE response=VALUES(response), created_at=NOW()",
                     (prompt_hash, response),
                 )
                 conn.commit()
             finally:
                 cursor.close()
     except Exception:
-        pass
+        return
+
+    _writes_since_purge += 1
+    if _writes_since_purge >= _PURGE_EVERY:
+        _writes_since_purge = 0
+        purge_ai_cache(agent)
 
 def is_critical_log(api_key, log_text, endpoint=None, agent=None):
     """Analyze log text using Ollama AI to determine if it's critical"""

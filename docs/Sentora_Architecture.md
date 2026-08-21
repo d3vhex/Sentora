@@ -45,24 +45,39 @@ split into intent-based packages:
 
 ```
 Sentora-Server/
-├── app.py            entry: Sanic API + SPA
-├── server.py         entry: TCP ingest
-├── ai_worker.py      entry: AI worker fleet (WORKER_TYPE env selects role)
+├── app.py                     entry: Sanic API + SPA
+├── server.py                  entry: TCP ingest
+├── ai_worker.py               entry: AI worker fleet (WORKER_TYPE selects role)
 ├── ai/
-│   ├── utils.py      LLM call helpers, AI cache, SOAR action queueing
-│   └── intel.py      AlienVault OTX + VirusTotal indicator enrichment
+│   ├── utils.py               LLM call helpers, AI cache, SOAR action queueing
+│   └── intel.py               AlienVault OTX + VirusTotal per-verdict enrichment
 ├── core/
-│   ├── mq.py         RabbitMQ publisher
-│   └── opensearch.py OpenSearch index/search helpers
+│   ├── mq.py                  RabbitMQ publisher
+│   ├── opensearch.py          OpenSearch index/search helpers
+│   ├── config_validation.py   agent YAML validation (parse, shape, regex)
+│   └── threat_feeds.py        abuse.ch indicator feeds
+├── security/
+│   ├── session.py             server-side session store
+│   └── ssrf.py                proxy destination rules
 ├── scanners/
-│   └── vuln.py       Server-side OSV vulnerability scanner
-├── modules/db.py     (legacy postgres helper, unused, kept for back-compat)
-└── frontend/         React SPA source
+│   └── vuln.py                Server-side OSV vulnerability scanner
+├── scripts/
+│   ├── init_secrets.py        generate the secrets .env requires
+│   ├── rotate_db_password.py  rotate the MySQL root account safely
+│   └── api_smoke_test.py      exercise every route against a live server
+├── tests/                     pytest; runs without MySQL or RabbitMQ
+├── modules/db.py              (legacy postgres helper, unused)
+└── frontend/                  React SPA source
 ```
 
 Entry-point file names are kept at the root so `docker-compose.yaml`
 commands (`python app.py`, `python server.py`, `python ai_worker.py`)
 remain unchanged.
+
+`app.py` is still the bulk of the server (~7,500 lines) and is the next
+candidate for a Blueprint split. `security/`, `core/config_validation.py` and
+`core/threat_feeds.py` were extracted from it because each has logic worth
+unit-testing without a running stack.
 
 ---
 
@@ -70,12 +85,19 @@ remain unchanged.
 
 ### 2.1 Management API (`app.py`, port 8000)
 
+- Authentication. Server-side sessions in `userdb.sessions`; the browser
+  holds an opaque token in an `HttpOnly` cookie and only its SHA-256 is
+  stored. See [§2.5 Authentication](#25-authentication) for the full model —
+  this replaced a scheme where the client asserted its own identity in an
+  `X-User-ID` header the server trusted verbatim.
 - RBAC and IAM. Multi-tier roles, per-permission gating via
-  `@require_permission`, optional LDAP/AD fallback. Bcrypt-hashed
-  credentials.
+  `@require_permission`, optional LDAP/AD fallback with just-in-time user
+  provisioning. Bcrypt-hashed credentials.
 - Audit Logging. `audit_logs` table records every privileged action
-  (who, from, action, resource, details, IP, timestamp). Surfaced in the
-  UI with an expandable per-row detail modal.
+  (who, from, action, resource, details, IP, timestamp). Attribution comes
+  from the session, not from a request header — an audit trail an attacker
+  can sign with someone else's name is worse than none, because it reads as
+  authoritative. Surfaced in the UI with an expandable per-row detail modal.
 - Agent Enrollment. One-time `enrollment_tokens` produce a 64-char
   `agent_key` and an `agent_identities` row. Generates pre-baked
   installer payloads (`deploy.sh`, `deploy.ps1`).
@@ -178,6 +200,142 @@ Browser <--ws--> /vnc-proxy/<agent>  (server)
   rendering. Live FPS display, on-the-fly FPS / quality dropdowns,
   `URL.revokeObjectURL` keeps memory bounded.
 - No TightVNC install or VNC client required.
+
+### 2.5 Authentication
+
+Identity comes from a server-side session, never from a client-supplied
+value.
+
+```
+POST /login  ──►  bcrypt / LDAP bind
+                      │
+                      ▼
+              userdb.sessions row          Set-Cookie: sentora_session=<token>
+              (stores SHA-256 only)  ◄──   HttpOnly; SameSite=Lax; Path=/
+                      │
+                      ▼
+        @app.on_request authenticate  ──►  request.ctx.user
+```
+
+**Storage.** Only `sha256(token)` is persisted, so a dump of the `sessions`
+table yields nothing presentable. Two expiry clocks are enforced in SQL
+rather than in Python, so an expired session cannot be returned even if a
+caller forgets to check: `SESSION_IDLE_MINUTES` (sliding, default 60) and
+`SESSION_ABSOLUTE_HOURS` (hard ceiling, default 12). `last_seen_at` is only
+rewritten once a minute so a polling dashboard does not become one UPDATE
+per request.
+
+**Deny-by-default.** The `authenticate` middleware runs after routing, so
+`request.route` names the handler. Everything is rejected without a session
+except an explicit set: the login endpoint, the SPA shell, static assets, and
+the agent-facing endpoints (which carry `X-Agent-Key` or an enrolment token).
+
+**`X-User-ID`.** Still sent by the frontend, but no longer identity — the
+server validates it against the session and a mismatch is a hard 401. Since
+browsers cannot attach custom headers to cross-site requests without a CORS
+preflight, requiring it on state-changing requests backs up `SameSite` as a
+second CSRF control.
+
+**Permission enforcement.** `@require_permission(...)` records its
+requirement in a registry keyed by the handler's `__qualname__`, which
+`@wraps` preserves. The middleware enforces from that registry, so protection
+applies regardless of which side of `@app.route` the decorator sits on.
+
+> This matters because `app.route` registers the *bare* handler at decoration
+> time. When `@require_permission` sat above it, the wrapper it returned was
+> built and never called — 85 routes looked guarded in the source and were
+> not, with no runtime symptom. The registry removes the failure mode rather
+> than the individual instances.
+
+A boot-time self-check prints the tally, because the original bug was
+invisible precisely because nothing ever inspected the result:
+
+```
+[Auth] Routes: <n> permission-gated, <n> session-only, <n> public.
+```
+
+**Revocation.** Sessions are killed on password change, admin password reset,
+role change and account deletion. Without that, an admin can revoke access
+and still leave the browser tab working until the idle timeout.
+
+**LDAP.** A successful bind provisions a local `users` row on the fly, so
+sessions, RBAC and audit attribution all key off the same integer id as local
+accounts.
+
+### 2.6 Agent Config Validation (`core/config_validation.py`)
+
+`POST /<agent>/config/<cfg_type>` forwarded the request body to the sensor
+unread. A typo therefore reached the agent, where the only symptom was the
+agent quietly not detecting things any more.
+
+Three layers, cheapest first:
+
+| Layer | Catches |
+| :--- | :--- |
+| Parse | YAML syntax, with the line and column YAML itself reports |
+| Shape | A `log_paths` file that lost its root key — valid YAML, useless |
+| **Regex compilation** | The layer that matters |
+
+An invalid regex is perfectly valid YAML and silently disables the category
+containing it, so a syntax-only check would push it straight to the endpoint.
+Per-pattern line numbers come from `yaml.compose()`, which keeps the source
+marks `safe_load()` discards. Comments inside block scalars are literal
+content, not YAML comments, and are skipped the way the agent skips them.
+
+Errors block the push and are audit-logged; warnings (unknown regex flags,
+relative paths) are surfaced but do not block. `POST
+/<agent>/config/<cfg_type>/validate` lints without pushing, which is what the
+editor calls as you type — the rules are not duplicated in the browser,
+because two implementations drift and the browser's copy is the one operators
+would trust.
+
+### 2.7 Threat Intel Feeds (`core/threat_feeds.py`)
+
+Populates `sentora_hub.threat_intel` hourly from abuse.ch: Feodo Tracker
+(botnet C2 addresses), ThreatFox (mixed IoCs with a confidence score) and
+URLhaus (malware-distributing URLs).
+
+Parsing is separated from the HTTP call so feed shapes are testable without a
+network. Every parser is defensive: a feed that changes its schema yields
+fewer indicators, never an exception that kills the refresh loop.
+
+- **Staleness.** Indicators carry `last_seen` and are pruned after
+  `THREAT_INTEL_STALE_DAYS` (30). An address that hosted a C2 last quarter
+  usually belongs to someone else now.
+- **Ports stripped** from ThreatFox IP indicators — `1.2.3.4:443` would never
+  equal an observed address.
+- **Offline URLhaus entries skipped.** History, not live indicators.
+- **Per-feed cap** (`THREAT_INTEL_MAX_PER_FEED`, 2000) because the table is
+  read on the alert path.
+- **One failing feed does not stop the others**; the failure is reported.
+- **`THREAT_INTEL_MODE=off`** makes no outbound request at all, and every feed
+  URL is overridable for an internal mirror — the same shape as `OSV_MODE`.
+
+> This replaced a function that inserted three hardcoded rows every hour and
+> said so in its own docstring. One of them was the SHA-256 of the empty
+> string, marked CRITICAL malware: had anything matched against this table,
+> every empty file on every endpoint would have been flagged. Those rows are
+> purged from existing databases at startup, matched on `source` as well as
+> value so an operator who added one of those addresses by hand keeps it.
+
+### 2.8 Fleet Exposure (`/api/exposure/report`)
+
+Counts unpatched packages and file-integrity events across agent databases,
+per agent, worst first. FIM is split into `changed` / `new` / `deleted`
+rather than summed — twelve files changed and twelve files deleted are very
+different mornings.
+
+Coverage is explicit: `complete: false` when an agent could not be read, and
+the dashboard panel labels the figure partial. A total over half the fleet is
+not a fleet total.
+
+There is deliberately no score. This was `/api/compliance/report` (still
+routed, for compatibility) and returned `100 - vulns*2 - fim*5`. That maps to
+no framework so it cannot be shown to an auditor, does not scale with fleet
+size, and pins to zero at fifty vulnerabilities — an ordinary state. Severity
+grading is absent for the same reason: `vulnerabilities_report` has no
+severity column and its fields are encrypted at rest, so any grade would have
+to be invented here.
 
 ---
 
@@ -290,6 +448,12 @@ Both are no-ops when their API key is unset, so the agent ships
 air-gap-friendly out of the box. A confirmed external indicator hit can
 override a low-confidence `NOT_CRITICAL` LLM verdict.
 
+Not to be confused with the indicator feeds in
+[§2.7](#27-threat-intel-feeds-corethreat_feedspy): this module enriches a
+single verdict on demand by querying an external API, while the feeds
+maintain a local table of known-bad indicators. Different mechanisms, both
+optional, and either can run without the other.
+
 ---
 
 ## 4. Agent Architecture
@@ -365,27 +529,71 @@ Results are reported back via `/automations/<task_id>/report`.
 | Frontend fonts | Bundled locally via `@fontsource/*`. No CDN call. |
 | OSV scanner | `OSV_MODE=auto` probes public, falls back to `OSV_MIRROR_URL` (or no-ops if neither is reachable). `OSV_MODE=mirror` forces internal-only. |
 | Ollama | Runs in the same Compose stack on `:11434`. No external API. |
-| Threat intel (OTX / VT) | No-op when `OTX_API_KEY` or `VT_API_KEY` is unset. |
-| Periodic threat-intel feed | Currently mock data, no external call. |
+| Threat intel enrichment (OTX / VT) | No-op when `OTX_API_KEY` / `VT_API_KEY` are unset. |
+| Threat intel feeds | `THREAT_INTEL_MODE=off` makes no request at all. Each feed URL is overridable (`THREAT_INTEL_FEODO_URL` etc.) to serve them from an internal mirror. |
+| Outbound HTTP proxy | Disabled unless `PROXY_ALLOWED_HOSTS` names destinations. |
 | Build | Image artifacts can be `docker save`d on a connected box and `docker load`ed on the air-gap host. |
 
 ---
 
 ## 6. Operational Notes
 
-- Default credentials ship in `.env.example` and must be rotated before
-  production.
+- `DB_PASSWORD`, `RABBITMQ_PASSWORD` and `FERNET_KEY` are required — compose
+  refuses to start without the first two, the app without the third.
+  `scripts/init_secrets.py` generates what it can; it never overwrites an
+  existing value, because `FERNET_KEY` has no rotation path and a second run
+  that regenerated it would make every encrypted column unreadable.
+- Only `app` (:8000) and `ingest` (:5001) listen on all interfaces. The rest
+  bind to `BIND_ADDR` (default loopback) because none of them authenticate:
+  OpenSearch runs with `DISABLE_SECURITY_PLUGIN` and Dashboards is an
+  unauthenticated view of every collected log.
+- The app container runs as a non-root user (uid 10001). `/app/data` is the
+  only path written at runtime and is backed by the `sentora_data` volume —
+  without it, the agent Fernet key was regenerated on every recreate,
+  silently orphaning previously encrypted telemetry.
 - The MySQL pool caps per-DB at 10 concurrent connections; total fleet
   is bounded by `_POOL_MAXSIZE` times the number of agent DBs.
 - Sanic worker count is set by `WORKERS` env (compose default `1`).
-  Background tasks (`periodic_vuln_scan`,
-  `periodic_threat_intel_update`, `periodic_critical_alerts_check`,
-  `periodic_soar_automation_check`) only run on worker `0-0` to avoid
-  duplication.
+  Background tasks (`periodic_vuln_scan`, `periodic_threat_intel_update`,
+  `periodic_critical_alerts_check`, `periodic_soar_automation_check`,
+  `periodic_session_purge`) only run on worker `0-0` to avoid duplication.
 - All UI strings and operator-facing log lines are English-only as of
   2026-04-30. Internal docstrings and comments may still be Turkish in
   legacy modules.
 
 ---
 
-Document version: 4.0. Last revised against source HEAD on 2026-05-02.
+## 7. Verification
+
+```bash
+pytest -ra                                   # no MySQL or RabbitMQ needed
+python -m compileall -q app.py core security
+cd frontend && npx tsc --noEmit && npm run build && cd ..
+```
+
+With the stack up, `scripts/api_smoke_test.py` enumerates every route from
+`app.py` via AST — so the list cannot drift from the code — and exercises it
+twice:
+
+1. **Unauthenticated, every route and verb.** Safe for all of them because
+   the middleware rejects before the handler runs. A protected route
+   answering 2xx here is an auth bypass and fails the run.
+2. **Authenticated, read-only verbs** plus a small allow list of write
+   endpoints that validate before acting. A live session is never used to
+   send a write that would act, so the test cannot be the thing that
+   dispatches a SOAR action or drops a database.
+
+The write list is an allow list on purpose: with a deny list, one missing
+entry is `DELETE /databases/userdb`.
+
+**Known gap.** Roughly 60 write-verb routes — SOAR dispatch, playbook
+execution, agent restart, user deletion, table truncation — are checked
+anonymously but never with a session. Widening the allow list is not the fix.
+Closing it properly needs a disposable database and a fake agent endpoint
+that absorbs SOAR calls, so `block_ip` can be exercised for real without
+touching a machine. The summary output names this gap rather than folding it
+into a count.
+
+---
+
+Document version: 5.0. Last revised against source HEAD on 2026-08-21.
