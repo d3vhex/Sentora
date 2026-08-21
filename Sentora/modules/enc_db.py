@@ -12,13 +12,32 @@ import modules.db as _db
 
 FERNET_REFRESH_SEC: int = int(os.getenv("FERNET_REFRESH_SEC", "600"))
 
+# The single source of truth for what the agent encrypts at rest.
+#
+# This used to hold six tables that individual modules then REPLACED at import
+# time, because set_encrypt_fields_map defaulted to overwrite. The effective
+# map therefore depended on import order, and check_permissions called it from
+# inside its periodic scan — so after the first permission scan the map was cut
+# down to `critical_files` alone and every other table started writing
+# plaintext. That is why some events_alert rows carry `enc::` and others do
+# not.
+#
+# Every table lives here now. Modules must not replace it; they may add to it
+# with add_encrypted_fields().
+#
+# Adding a field here is not free: encrypted columns cannot be used in a WHERE
+# clause or an index. `siem_events.source` is deliberately left in the clear
+# for that reason — init.sql indexes it.
 ENCRYPT_FIELDS_MAP: Dict[str, List[str]] = {
     "fim_data": ["path", "hash_sha256"],
     "registry_logs": ["hive", "key_path", "value_name", "value_data"],
     "network_connections": ["process_name", "local_addr", "remote_addr"],
     "process_events": ["name", "cmdline", "username"],
     "hardware_inventory": ["name", "serial_number"],
-    "security_audit": ["finding", "details"]
+    "security_audit": ["finding", "details"],
+    "siem_events": ["message"],
+    "events_alert": ["source", "message"],
+    "critical_files": ["path", "owner", "grp", "permissions", "last_opened"],
 }
 
 _LOCK = threading.RLock()
@@ -40,7 +59,18 @@ def set_agent_config(
         FERNET_REFRESH_SEC = max(60, int(refresh_sec))
 
 
-def set_encrypt_fields_map(mapping: Dict[str, List[str]], *, merge: bool = False) -> None:
+def set_encrypt_fields_map(mapping: Dict[str, List[str]], *, merge: bool = True) -> None:
+    """Register fields to encrypt at rest.
+
+    `merge` defaults to True. It used to default to False, which meant any
+    module calling this wiped every table another module had registered — and
+    four modules did, one of them from inside a periodic scan. The result was
+    that most telemetry silently stopped being encrypted after the agent had
+    been running for a few minutes.
+
+    Passing merge=False is still possible but should be reserved for tests;
+    nothing in the agent has a reason to discard another module's fields.
+    """
     global ENCRYPT_FIELDS_MAP
     if not merge:
         ENCRYPT_FIELDS_MAP = {k: list(dict.fromkeys(v)) for k, v in (mapping or {}).items()}

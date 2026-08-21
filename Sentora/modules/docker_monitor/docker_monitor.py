@@ -14,9 +14,9 @@ except ImportError:
 import modules.enc_db as enc_db
 import modules.db as _db
 
-enc_db.set_encrypt_fields_map({
-    "siem_events": ["message"]
-})
+# Encrypted fields are declared once in enc_db.ENCRYPT_FIELDS_MAP. Setting
+# them here replaced the map for the whole process, dropping every table other
+# modules had registered.
 
 insert_record_enc = enc_db.insert_record_enc
 

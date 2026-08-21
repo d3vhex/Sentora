@@ -134,6 +134,17 @@ if not AGENT_SHARED_SECRET:
     AGENT_SHARED_SECRET = secrets.token_urlsafe(32)
     print("[+] Generated ephemeral agent shared secret (set AGENT_SHARED_SECRET in .env to override).")
 
+# Fields to attempt decryption on. Deliberately a SUPERSET of what the agent
+# currently encrypts (see Sentora/modules/enc_db.ENCRYPT_FIELDS_MAP).
+#
+# That asymmetry is safe and intentional: decrypt_row_fields skips any value
+# that does not carry the `enc::` prefix, so listing a plaintext column costs
+# nothing. Trimming this list to match the agent exactly would be the unsafe
+# direction — older agents encrypted a different set, and a field dropped from
+# here would render as raw ciphertext for any row written back then.
+#
+# Add to this map when the agent starts encrypting something new. Do not
+# remove from it.
 ENCRYPTED_FIELDS_MAP = {
     "siem_events": ["source", "timestamp", "message"],
     "critical_files": ["path", "owner", "grp", "permissions", "last_opened"],
@@ -185,9 +196,26 @@ async def init_hub_db():
                         severity    VARCHAR(16),
                         description TEXT,
                         created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        UNIQUE KEY uniq_intel (type, value)
+                        last_seen   TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE KEY uniq_intel (type, value),
+                        INDEX idx_intel_value (value),
+                        INDEX idx_intel_seen (last_seen)
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
                 """)
+                # `last_seen` drives staleness pruning and the freshness
+                # readout. It was added by the feed refresher's own ALTER,
+                # which only ran once a feed had actually returned something —
+                # so on a deployment whose feeds were failing, the column did
+                # not exist and anything querying it broke.
+                for ddl in (
+                    "ALTER TABLE threat_intel ADD COLUMN last_seen TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP",
+                    "ALTER TABLE threat_intel ADD INDEX idx_intel_value (value)",
+                    "ALTER TABLE threat_intel ADD INDEX idx_intel_seen (last_seen)",
+                ):
+                    try:
+                        cur.execute(ddl)
+                    except Exception:
+                        pass  # already present
 
                 conn.commit()
             finally:
@@ -2596,6 +2624,11 @@ async def close_db_pool(app):
         app.ctx.db_pool.close()
         await app.ctx.db_pool.wait_closed()
 
+# Decryption failures are rate-limited per field so a whole table of
+# undecryptable rows produces one line, not ten thousand.
+_decrypt_failures_seen: set = set()
+
+
 def decrypt_row_fields(row: dict, encrypted_fields: list, fernet: Fernet) -> dict:
     out = dict(row)
     for field in encrypted_fields or []:
@@ -2615,7 +2648,22 @@ def decrypt_row_fields(row: dict, encrypted_fields: list, fernet: Fernet) -> dic
                 decoded = pt.decode("utf-8")
             out[field] = decoded
         except InvalidToken:
-            out[field] = val
+            # Returning the raw ciphertext made a key mismatch look exactly
+            # like a field nobody decrypted — the operator sees `enc::gAAA...`
+            # either way, with nothing in the log to tell them which. That is
+            # worth a loud line: it usually means the agent was enrolled
+            # against a different Fernet key than the one this server holds,
+            # which no amount of UI work will fix.
+            if field not in _decrypt_failures_seen:
+                _decrypt_failures_seen.add(field)
+                print(
+                    f"[!] Decryption failed for `{field}` — the stored value was "
+                    f"encrypted with a different Fernet key than this server holds. "
+                    f"Check FERNET_KEY and the agent's bootstrap; re-enrol the agent "
+                    f"if it was registered against an older key.",
+                    flush=True,
+                )
+            out[field] = "<decryption failed — key mismatch>"
     return out
 
 async def stream_from_db_dec(table: str, agent: str,
@@ -6022,6 +6070,16 @@ async def get_all_alerts(request):
                     cursor.close()
         agents = await asyncio.to_thread(_list_agents)
 
+        # `events_alert` stores source/message/severity encrypted at rest. The
+        # per-agent endpoint runs them through stream_from_db_dec; this one did
+        # not, so Global Alerts rendered raw `enc::gAAAAA...` ciphertext in the
+        # Source and Message columns.
+        key_b64 = getattr(app.ctx, "fernet_key", None)
+        if not key_b64:
+            key_b64 = bootstrap_client.get_fernet_key()
+        fernet_obj = Fernet(key_b64.encode("utf-8") if isinstance(key_b64, str) else key_b64)
+        encrypted_fields = ENCRYPTED_FIELDS_MAP["events_alert"]
+
         all_alerts = []
 
         for agent in agents:
@@ -6036,7 +6094,7 @@ async def get_all_alerts(request):
                         await cursor.close()
 
                 for row in rows:
-                    alert = dict(zip(columns, row))
+                    alert = decrypt_row_fields(dict(zip(columns, row)), encrypted_fields, fernet_obj)
                     alert['agent'] = agent
                     all_alerts.append(alert)
 
@@ -6252,6 +6310,45 @@ async def purge_mock_threat_intel():
         print(f"[ThreatIntel] Could not purge mock indicators: {e}")
 
 
+def _write_threat_indicators(indicators: list) -> int:
+    """Upsert indicators and prune stale ones. Blocking; call via to_thread.
+
+    Shared by the hourly refresher and the manual one behind
+    POST /threat-intel/refresh, so the two cannot drift into writing different
+    things.
+    """
+    if not indicators:
+        return 0
+    with sync_mysql_conn("sentora_hub") as conn:
+        cur = conn.cursor()
+        try:
+            cur.executemany(
+                """INSERT INTO threat_intel
+                       (type, value, source, severity, description, last_seen)
+                   VALUES (%s, %s, %s, %s, %s, NOW())
+                   ON DUPLICATE KEY UPDATE
+                       source = VALUES(source),
+                       severity = VALUES(severity),
+                       description = VALUES(description),
+                       last_seen = NOW()""",
+                [(i.type, i.value, i.source, i.severity, i.description) for i in indicators],
+            )
+            written = cur.rowcount or 0
+            # Indicators that stopped appearing in the feeds. An address that
+            # hosted a C2 last quarter usually belongs to someone else now,
+            # and keeping it produces false positives indefinitely.
+            cur.execute(
+                "DELETE FROM threat_intel "
+                "WHERE source LIKE 'abuse.ch/%%' "
+                "AND last_seen < (NOW() - INTERVAL %s DAY)",
+                (threat_feeds.STALE_AFTER_DAYS,),
+            )
+            conn.commit()
+            return written
+        finally:
+            cur.close()
+
+
 async def periodic_threat_intel_update():
     """Refresh indicators from real feeds, hourly.
 
@@ -6271,45 +6368,9 @@ async def periodic_threat_intel_update():
                     print(f"[ThreatIntel] feed error — {err}")
 
                 if indicators:
-                    def _write():
-                        with sync_mysql_conn("sentora_hub") as conn:
-                            cur = conn.cursor()
-                            try:
-                                cur.execute(
-                                    "ALTER TABLE threat_intel ADD COLUMN last_seen "
-                                    "TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP"
-                                )
-                            except Exception:
-                                pass  # already present
-                            cur.executemany(
-                                """INSERT INTO threat_intel
-                                       (type, value, source, severity, description, last_seen)
-                                   VALUES (%s, %s, %s, %s, %s, NOW())
-                                   ON DUPLICATE KEY UPDATE
-                                       source = VALUES(source),
-                                       severity = VALUES(severity),
-                                       description = VALUES(description),
-                                       last_seen = NOW()""",
-                                [(i.type, i.value, i.source, i.severity, i.description)
-                                 for i in indicators],
-                            )
-                            written = cur.rowcount
-                            # Indicators that stopped appearing in the feeds.
-                            # An IP that hosted a C2 last quarter usually
-                            # belongs to someone else now.
-                            cur.execute(
-                                "DELETE FROM threat_intel "
-                                "WHERE source LIKE 'abuse.ch/%%' "
-                                "AND last_seen < (NOW() - INTERVAL %s DAY)",
-                                (threat_feeds.STALE_AFTER_DAYS,),
-                            )
-                            stale = cur.rowcount
-                            conn.commit()
-                            return written, stale
-
-                    written, stale = await asyncio.to_thread(_write)
+                    written = await asyncio.to_thread(_write_threat_indicators, indicators)
                     print(f"[ThreatIntel] {len(indicators)} indicator(s) from "
-                          f"{len(threat_feeds.enabled_feeds())} feed(s); pruned {stale} stale.")
+                          f"{len(threat_feeds.enabled_feeds())} feed(s); {written} row(s) written.")
                 elif not errors:
                     print("[ThreatIntel] Feeds returned no indicators.")
         except Exception as e:
@@ -6320,18 +6381,84 @@ async def periodic_threat_intel_update():
 @require_permission("read_telemetry")
 @app.route("/threat-intel")
 async def get_threat_intel(request):
+    """Indicators, filtered, plus the stats that say whether the feeds work.
+
+    Previously returned every row unfiltered — up to MAX_PER_FEED per feed —
+    and nothing about freshness. "Is this data current?" is the first question
+    an operator has about a threat feed, and until the mock seeder was removed
+    the honest answer was no.
+    """
+    q = (request.args.get("q") or "").strip()
+    ioc_type = (request.args.get("type") or "").strip()
+    source = (request.args.get("source") or "").strip()
+    limit = max(1, min(int(request.args.get("limit", 200) or 200), 1000))
+
+    where = []
+    params: list = []
+    if q:
+        where.append("(value LIKE %s OR description LIKE %s)")
+        params.extend([f"%{q}%", f"%{q}%"])
+    if ioc_type:
+        where.append("type = %s")
+        params.append(ioc_type)
+    if source:
+        where.append("source = %s")
+        params.append(source)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+
     try:
-        async with aiomysql.create_pool(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, db="sentora_hub", autocommit=True) as pool:
+        async with aiomysql.create_pool(
+            host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD,
+            db="sentora_hub", autocommit=True,
+        ) as pool:
             async with pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
-                    await cur.execute("SELECT * FROM threat_intel ORDER BY created_at DESC")
+                    await cur.execute(
+                        f"SELECT * FROM threat_intel {clause} "
+                        f"ORDER BY last_seen DESC, id DESC LIMIT %s",
+                        (*params, limit),
+                    )
                     rows = await cur.fetchall()
-        # `created_at` is a datetime, which the default serializer cannot
-        # encode — so this 500'd for every populated table and only ever
-        # looked healthy while threat_intel was empty. Every other endpoint
-        # in this file already passes CustomEncoder; this one was missed.
+
+                    await cur.execute(f"SELECT COUNT(*) AS n FROM threat_intel {clause}", params)
+                    matched = (await cur.fetchone() or {}).get("n", 0)
+
+                    # Per-source counts and freshness. A source that has
+                    # stopped refreshing shows an old last_seen here rather
+                    # than just silently shrinking as pruning catches up.
+                    await cur.execute(
+                        "SELECT source, COUNT(*) AS n, MAX(last_seen) AS newest "
+                        "FROM threat_intel GROUP BY source ORDER BY n DESC"
+                    )
+                    by_source = await cur.fetchall()
+
+                    await cur.execute(
+                        "SELECT type, COUNT(*) AS n FROM threat_intel GROUP BY type ORDER BY n DESC"
+                    )
+                    by_type = await cur.fetchall()
+
+                    await cur.execute("SELECT COUNT(*) AS n, MAX(last_seen) AS newest FROM threat_intel")
+                    totals = await cur.fetchone() or {}
+
         return sanic_json(
-            rows,
+            {
+                "status": "success",
+                "indicators": rows,
+                "matched": matched,
+                "returned": len(rows),
+                "stats": {
+                    "total": totals.get("n", 0),
+                    "newest": totals.get("newest"),
+                    "by_source": by_source,
+                    "by_type": by_type,
+                    "mode": threat_feeds.mode(),
+                    "feeds_enabled": threat_feeds.enabled_feeds(),
+                    "stale_after_days": threat_feeds.STALE_AFTER_DAYS,
+                },
+            },
+            # `last_seen` and `created_at` are datetimes; the default
+            # serializer cannot encode them, which is what made this endpoint
+            # 500 for every populated table.
             dumps=lambda obj: pyjson.dumps(obj, ensure_ascii=False, cls=CustomEncoder),
         )
     except Exception as e:
@@ -6339,6 +6466,39 @@ async def get_threat_intel(request):
         # one and surfaced as "Contact administrator" with the cause hidden.
         print(f"[!] threat-intel fetch failed: {e}")
         return sanic_json({"status": "error", "message": str(e)}, status=500)
+
+@app.post("/threat-intel/refresh")
+@require_permission("manage_system")
+async def refresh_threat_intel(request):
+    """Pull the feeds now instead of waiting for the hourly cycle.
+
+    Without this, confirming that a feed works — or that an abuse.ch auth key
+    fixed a 403 — means restarting the container or waiting an hour and
+    reading the log.
+    """
+    if threat_feeds.mode() == "off":
+        return sanic_json({
+            "status": "error",
+            "message": "Feeds are disabled (THREAT_INTEL_MODE=off).",
+        }, status=400)
+
+    try:
+        indicators, errors = await asyncio.to_thread(threat_feeds.fetch_all)
+        written = await asyncio.to_thread(_write_threat_indicators, indicators)
+        await audit_log(request, "THREAT_INTEL_REFRESH", "manual",
+                        f"{len(indicators)} indicator(s), {len(errors)} feed error(s)")
+        return sanic_json({
+            "status": "success",
+            "fetched": len(indicators),
+            "written": written,
+            # Surfaced rather than logged: a feed that needs an auth key is
+            # something the operator has to act on, and they are standing in
+            # front of this button.
+            "errors": errors,
+        })
+    except Exception as e:
+        return sanic_json({"status": "error", "message": str(e)}, status=500)
+
 
 @require_permission("read_telemetry")
 @app.route("/api/exposure/report", name="exposure_report")

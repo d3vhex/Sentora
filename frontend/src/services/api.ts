@@ -140,6 +140,13 @@ export const agentService = {
   // which returned a score that mapped to no framework and pinned to zero on
   // an ordinary fleet.
   getExposureReport: () => api.get('/api/exposure/report').then(res => res.data),
+
+  // Known-bad indicators pulled from abuse.ch. `stats` answers the first
+  // question anyone has about a feed — is this data current — which was
+  // unanswerable while the table was seeded with three hardcoded rows.
+  getThreatIntel: (params?: { q?: string; type?: string; source?: string; limit?: number }) =>
+    api.get('/threat-intel', { params }).then(res => res.data),
+  refreshThreatIntel: () => api.post('/threat-intel/refresh').then(res => res.data),
   getServerResources: () => api.get('/server/resources').then(res => res.data),
   getGlobalStats: () => api.get('/api/global/stats').then(res => res.data),
   runManualAnalysis: (agent: string, limit: number = 100) => api.post(`/analyze-logs/${agent}`, { limit }).then(res => res.data),
@@ -187,6 +194,8 @@ export const adminService = {
   getTableData: (db: string, table: string, limit: number = 100) => api.get(`/databases/${db}/tables/${table}/data`, { params: { limit } }).then(res => res.data.data),
   clearTable: (agent: string, table: string) => api.delete(`/${agent}/clear/${table}`).then(res => res.data),
   
+  refreshThreatIntel: () => api.post('/threat-intel/refresh').then(res => res.data),
+
   getLoginLogs: () => api.get('/login-logs').then(res => res.data),
   getAuditLogs: () => api.get('/audit-logs').then(res => res.data),
 };

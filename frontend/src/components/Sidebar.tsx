@@ -15,6 +15,7 @@ import {
   Zap,
   ClipboardList,
   Key,
+  Radar,
   X,
   Save,
   Download,
@@ -141,6 +142,7 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen }) => {
           {authService.hasPermission('read_telemetry') && <SidebarLink to="/assets" icon={<Database size={18} />} label="Asset Inventory" />}
           {authService.hasPermission('read_telemetry') && <SidebarLink to="/fim" icon={<ShieldAlert size={18} />} label="File Integrity" />}
           {authService.hasPermission('read_telemetry') && <SidebarLink to="/log-search" icon={<Search size={18} />} label="Log Explorer (OS)" />}
+          {authService.hasPermission('read_telemetry') && <SidebarLink to="/threat-intel" icon={<Radar size={18} />} label="Threat Intelligence" />}
           {authService.hasPermission('manage_agent') && <SidebarLink to="/deployment" icon={<Download size={18} />} label="Deploy Agent" />}
           {authService.hasPermission('analyze_logs') && <SidebarLink to="/ai-analysis" icon={<BrainCircuit size={18} />} label="AI Analysis" />}
         </div>
