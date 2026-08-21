@@ -1,7 +1,111 @@
 # Sentora Progress Report
 
 This document summarises the technical work and security improvements
-made to the Sentora platform.
+made to the Sentora platform, newest first.
+
+---
+
+## 2026-08 — Authentication, endpoint audit, honest metrics
+
+### Authentication rebuilt
+
+The UI had no real authentication. Login returned a plain user object, the
+frontend stored `userId` in `localStorage`, and every request asserted
+identity in an `X-User-ID` header the server trusted verbatim:
+
+```bash
+curl -H "X-User-ID: 1" http://server:8000/users   # full admin, no login
+```
+
+On a platform that can `ISOLATE_HOST`, `BLOCK_IP` and `KILL_PROCESS` on every
+enrolled endpoint, that was unauthenticated remote command execution across
+the fleet.
+
+Replaced with server-side sessions (`userdb.sessions`, SHA-256 of the token
+only, idle + absolute expiry enforced in SQL). `X-User-ID` is retained but
+validated against the session, which also backs up `SameSite` as a CSRF
+control. Every route is deny-by-default. Sessions are revoked on password
+change, admin reset, role change and account deletion.
+
+### RBAC was decorative
+
+The claim in the older section below — "more than 40 API routes are now
+guarded by `@require_permission`" — was not true in practice. The decorator
+sat **above** `@app.route` on 85 routes. `app.route` registers the bare
+handler at decoration time, so the wrapper `require_permission` returned was
+built and never called. The routes looked guarded in the source and were not,
+with no runtime symptom.
+
+Fixed by having the decorator record its requirement in a registry keyed by
+`__qualname__` and enforcing from middleware, which removes the failure mode
+rather than the 85 instances. A boot-time self-check now prints the tally so a
+regression is visible in the first lines of the container log.
+
+### Endpoint audit
+
+`scripts/api_smoke_test.py` enumerates every route from `app.py` via AST and
+calls it twice — anonymously across all verbs, then authenticated across
+read-only verbs. First run found seven endpoints returning 500:
+
+| Endpoint | Cause |
+| :--- | :--- |
+| `GET /ldap` | Queried `ldap_config ORDER BY updated_at`; the table is `ldap_conf`, the column `created_at`. Settings saved but never loaded. |
+| `/<agent>/notifications/templates` | `email_templates` was never created by `init_userdb.sql`, so `send_email()` had been failing at its SELECT — alert mail was silently dead. |
+| `/threat-intel` | No exception handler and no `CustomEncoder`; 500'd on the `datetime` in `created_at`. Worked only while the table was empty. |
+| `/api/compliance/report` | Queried `sentora_hub` for two tables that only exist per-agent. |
+| `/databases/*` (×3) | Returned 500 for a missing database or table; both are 404s. |
+
+Current state: 135 route/method pairs, 0 auth bypasses, 0 server errors.
+
+### Metrics that were not computed
+
+- Dashboard `Alert Coverage: 100%` and `DB Integrity: Verified` were literal
+  strings in the JSX. They read nothing and would have kept saying the same
+  with the database down.
+- `/api/compliance/report` returned `100 - vulns*2 - fim*5` as a "compliance
+  score" — no framework, no fleet-size scaling, pinned to zero on any real
+  fleet. Now `/api/exposure/report`, reporting measured counts with explicit
+  coverage and no score.
+- `periodic_threat_intel_update()` inserted three hardcoded IoCs hourly, one
+  of them the SHA-256 of the empty string marked CRITICAL malware. Replaced
+  with abuse.ch feeds; the mock rows are purged from existing databases.
+
+### Validation before anything leaves the server
+
+- **Agent configs.** `POST /<agent>/config/<type>` forwarded the body to the
+  sensor unread. Now parsed, shape-checked, and — the layer that matters —
+  regex-compiled, since an invalid regex is valid YAML and silently disables
+  the rule containing it.
+- **Outbound proxy.** `/_proxy/http` was unauthenticated SSRF. Now behind
+  `manage_system` plus a host allowlist, with loopback and link-local refused
+  even for allowlisted names, no redirect following, and `Set-Cookie` never
+  relayed back.
+- **Playbook steps.** Per-action parameter validation in the editor;
+  irreversible actions flagged before save.
+
+### Deployment hardening
+
+Supporting services bind to `BIND_ADDR` (loopback by default) since none of
+them authenticate. The whole-host bind mount (`/:/host_disk:ro`) is gone. The
+container runs as non-root. `.env` and `data/` are excluded from the image.
+RabbitMQ no longer runs on guest/guest. `data/` is now a named volume — it
+had none, so every recreate orphaned encrypted telemetry.
+
+### Test coverage
+
+125+ tests, none requiring MySQL or RabbitMQ. The ones that pull weight:
+session storage invariants, an AST guard that fails if a handler reads
+`X-User-ID` directly again, SSRF rules including the DNS-rebinding case,
+config validation (chiefly that a broken regex is caught although the YAML is
+valid), and threat-feed parsers under malformed input.
+
+**Known gap.** ~60 write-verb routes are checked anonymously but never with a
+session. Closing that needs a disposable database and a fake agent endpoint,
+not a wider allow list.
+
+---
+
+## Earlier work
 
 ## Security and IAM
 

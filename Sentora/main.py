@@ -186,21 +186,60 @@ class ServerBootstrapClient:
         })
         return fk
 
-    def validate_or_exit(self):
-        try:
-            data = self.status(reveal_key=True)
-            if not data.get("is_active"):
-                raise AgentBootstrapError("Server reported inactive bootstrap.")
-            self.cache.update({
-                "active": True,
-                "tier": data.get("tier") or "Community",
-                "expires_at": data.get("expires_at"),
-                "fernet_key": data.get("fernet_key"),
-            })
-            print(f"[+] Agent bootstrap OK ({self.cache['tier']})")
-        except Exception as e:
-            print(f"[!] Agent bootstrap failed: {e}")
-            sys.exit(1)
+    def validate_or_wait(self, max_delay: int = 60):
+        """Block until the server hands over a bootstrap, retrying forever.
+
+        This used to `sys.exit(1)` on any failure, which is why the agent did
+        not come back after a reboot. The scheduled task fires AtStartup as
+        SYSTEM — before the network stack settles, before Docker Desktop is
+        up, before a VPN connects. The first bootstrap call failed, the agent
+        died, and the task's three restarts were consumed inside the first
+        three minutes. After that the endpoint stayed blind until somebody
+        logged in and started it by hand.
+
+        A security agent must not take itself off the network because a
+        dependency was slow. The only genuinely fatal condition is missing
+        local enrolment config, which is checked before we ever get here.
+
+        Backoff is 2s doubling to `max_delay`, then steady — so a server that
+        comes back an hour later still gets picked up, without hammering it.
+        """
+        delay = 2
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                data = self.status(reveal_key=True)
+                if not data.get("is_active"):
+                    raise AgentBootstrapError("Server reported inactive bootstrap.")
+                self.cache.update({
+                    "active": True,
+                    "tier": data.get("tier") or "Community",
+                    "expires_at": data.get("expires_at"),
+                    "fernet_key": data.get("fernet_key"),
+                })
+                if attempt > 1:
+                    print(f"[+] Agent bootstrap OK ({self.cache['tier']}) after {attempt} attempts")
+                else:
+                    print(f"[+] Agent bootstrap OK ({self.cache['tier']})")
+                return
+            except Exception as e:
+                # A rejected key is reported differently because retrying will
+                # not fix a genuinely wrong one — but we still keep trying,
+                # since it is also what a server whose identity table has not
+                # finished loading looks like, and a dead agent is worse than
+                # a noisy one.
+                hint = ""
+                if isinstance(e, AgentBootstrapError) and "rejected" in str(e).lower():
+                    hint = "  (re-enrol this host if this persists)"
+                print(f"[!] Agent bootstrap attempt {attempt} failed: {e}{hint}"
+                      f" — retrying in {delay}s", flush=True)
+                time.sleep(delay)
+                delay = min(delay * 2, max_delay)
+
+    # Old name kept so any external caller or fork does not break. It no
+    # longer exits; the rename is the point.
+    validate_or_exit = validate_or_wait
 
 
 def _apply_fernet_key_to_enc_db(key: str) -> None:
@@ -472,6 +511,45 @@ def periodic_wrapped(func, interval: int, name: str):
 def handle_sigterm(signum, frame):
     print("[*] Received SIGTERM, exiting gracefully...", flush=True)
     os._exit(0)
+
+
+# Held for the lifetime of the process. Module-level so it is never garbage
+# collected — closing it would release the lock while the agent still runs.
+_instance_lock = None
+
+
+def acquire_single_instance_lock(port: int = 9098, wait_seconds: int = 10) -> bool:
+    """Return True if this process is the only agent, False if one is already up.
+
+    A bound socket is used rather than a PID file because it cannot go stale:
+    the OS releases it when the process dies, however it dies. SO_REUSEADDR is
+    deliberately *not* set — the bind failing is the signal we want.
+
+    This matters because the installer now registers a watchdog task that
+    launches the agent every 15 minutes. Without a guard, each tick would
+    start a second agent that runs the whole of startup — monitor threads,
+    telemetry sends — before dying on the port bind at the very end of main().
+    Worse, an instance that cannot reach the server now waits in the bootstrap
+    retry instead of exiting, so the duplicates would stack up indefinitely.
+
+    `wait_seconds` covers the deliberate-restart path: the outgoing agent may
+    still hold the socket for a moment after being signalled.
+    """
+    global _instance_lock
+
+    deadline = time.time() + wait_seconds
+    while True:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(("127.0.0.1", port))
+            s.listen(1)
+            _instance_lock = s
+            return True
+        except OSError:
+            s.close()
+            if time.time() >= deadline:
+                return False
+            time.sleep(1)
 
 
 def kill_old_agent_if_exists():
@@ -778,7 +856,7 @@ def perform_destruction():
 def _init_agent_bootstrap(server_url: str, agent_key: str):
     global _bootstrap_client, _key_refresher
     _bootstrap_client = ServerBootstrapClient(server_url, agent_key)
-    _bootstrap_client.validate_or_exit()
+    _bootstrap_client.validate_or_wait()
     fk = _bootstrap_client.cache.get("fernet_key") or _bootstrap_client.get_fernet_key()
     _apply_fernet_key_to_enc_db(fk)
     refresh_sec = int(os.getenv("FERNET_REFRESH_SEC", "600"))
@@ -1343,6 +1421,13 @@ def main():
             pass
 
     kill_old_agent_if_exists()
+
+    # Before any work: if another agent already holds the lock, this is the
+    # watchdog task firing while everything is healthy. Exit 0 so Task
+    # Scheduler does not record it as a failure.
+    if not acquire_single_instance_lock():
+        print("[*] Another Sentora agent instance is already running — nothing to do.", flush=True)
+        sys.exit(0)
 
     args = _parse_args()
 

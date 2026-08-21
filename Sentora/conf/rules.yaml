@@ -559,7 +559,7 @@ categories:
       /opt/tomcat/conf/tomcat-users\.xml
 
   META REFRESH:
-    severity: INFORMATIVE
+    severity: INFO
     weight: 1
     patterns: |
       <META HTTP-EQUIV="refresh" CONTENT="0;url=data:text/html;base64,[A-Za-z0-9+/=]+">
