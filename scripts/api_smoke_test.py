@@ -172,6 +172,13 @@ def main() -> int:
     # ---- Pass 1: unauthenticated -------------------------------------------
     anon = requests.Session()
     bypasses: list[str] = []
+    # A route the server never answered has NOT been shown to refuse anonymous
+    # access — the connection died before the question was asked. Counting it
+    # as a pass is how a harness ends up reporting a clean run it did not
+    # actually perform, so unreachable routes are tracked separately and make
+    # the whole run fail.
+    unreachable: list[str] = []
+    anon_refused = 0
     print("=== Pass 1: unauthenticated (expecting 401 on protected routes) ===")
 
     for method, path in routes:
@@ -181,16 +188,23 @@ def main() -> int:
         try:
             r = anon.request(method, url, timeout=args.timeout, allow_redirects=False)
         except requests.RequestException as e:
-            print(f"  ??  {method:6} {path}  — request failed: {e}")
+            unreachable.append(f"{method} {path} — {e}")
+            print(f"  ??  {method:6} {path}  — NOT CHECKED, request failed: {e}")
             continue
 
         if 200 <= r.status_code < 300:
             bypasses.append(f"{method} {path} -> {r.status_code}")
             print(f"  !!  {method:6} {path}  -> {r.status_code}  AUTH BYPASS")
-        elif args.verbose:
-            print(f"  ok  {method:6} {path}  -> {r.status_code}")
+        else:
+            anon_refused += 1
+            if args.verbose:
+                print(f"  ok  {method:6} {path}  -> {r.status_code}")
 
-    if not bypasses:
+    if unreachable:
+        print(f"\n  {len(unreachable)} route(s) could not be reached — their auth was "
+              f"NOT verified.\n  Is the server fully started? Re-run once "
+              f"`docker compose ps` shows app healthy.\n")
+    elif not bypasses:
         print("  All protected routes refused anonymous access.\n")
     else:
         print(f"\n  {len(bypasses)} route(s) served an anonymous request.\n")
@@ -268,7 +282,13 @@ def main() -> int:
 
     # ---- Report ------------------------------------------------------------
     print("\n" + "=" * 66)
-    print(f"  Anonymous check ....... {len(routes)} / {len(routes)} route+method pairs")
+    # Counted, not asserted. This line used to read `len(routes) / len(routes)`
+    # unconditionally, so it claimed full coverage even when every request in
+    # pass 1 had failed to connect.
+    anon_total = len([1 for m, p in routes if p not in PUBLIC])
+    print(f"  Anonymous check ....... {anon_refused + len(bypasses)} / {anon_total} protected pairs")
+    if unreachable:
+        print(f"    NOT CHECKED ......... {len(unreachable)}  (no response from server)")
     print(f"  auth bypasses ......... {len(bypasses)}")
     print(f"  Authenticated call .... {counts['ok'] + counts['client'] + counts['server']} / {len(routes)}")
     print(f"    2xx {counts['ok']}   4xx {counts['client']}   5xx {counts['server']}")
@@ -279,6 +299,11 @@ def main() -> int:
         print("\nAuth bypasses — a protected route served an anonymous caller:")
         for b in bypasses:
             print(f"  {b}")
+    if unreachable:
+        print("\nNot checked — the server did not respond, so these routes were "
+              "neither\nverified nor cleared:")
+        for u in unreachable:
+            print(f"  {u}")
     if errors:
         print("\nServer errors:")
         for e in errors:
@@ -290,18 +315,24 @@ def main() -> int:
             print(f"  {u}")
 
     print(
-        "\nNote on coverage: every route above was called anonymously and had to\n"
-        "refuse. The 'session-unchecked' ones are write verbs that were not also\n"
-        "called WITH a session, because doing so would dispatch real SOAR\n"
-        "actions, drop databases or delete users. Closing that gap needs an\n"
-        "isolated agent and a disposable database, not a wider allow list here.\n"
-        "Run with --list-unprobed to see exactly which routes those are."
+        "\nNote on coverage: every route the server answered was called\n"
+        "anonymously and had to refuse. The 'session-unchecked' ones are write\n"
+        "verbs that were not also called WITH a session, because doing so would\n"
+        "dispatch real SOAR actions, drop databases or delete users. Closing\n"
+        "that gap needs an isolated agent and a disposable database, not a wider\n"
+        "allow list here. Run with --list-unprobed to see exactly which routes\n"
+        "those are."
     )
 
-    if not bypasses and not errors:
+    if unreachable:
+        print(f"\nIncomplete run: {len(unreachable)} route(s) were never reached.")
+    elif not bypasses and not errors:
         print("\nNo auth bypasses and no 5xx responses.")
 
-    return 1 if (bypasses or errors) else 0
+    # Unreachable routes fail the run. A smoke test that cannot reach the
+    # server has not produced a green result, and saying otherwise is worse
+    # than saying nothing.
+    return 1 if (bypasses or errors or unreachable) else 0
 
 
 if __name__ == "__main__":
