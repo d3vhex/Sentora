@@ -1,0 +1,181 @@
+"""Pre-LLM triage: decide which events are worth an inference.
+
+Every SIEM event used to reach the model. On a busy endpoint that is thousands
+of inferences a day for telemetry that is overwhelmingly repeats of the same
+few lines, and a local 3B model takes ~47s each — so the queue never drains
+and genuinely interesting events wait behind routine noise.
+
+Two independent gates, in this order:
+
+1. **Severity floor.** Events below `AI_MIN_SEVERITY` are not analysed.
+2. **Deduplication.** An event whose fingerprint has been seen before is
+   counted against the existing verdict instead of producing a new one.
+
+The severity gate is the one that can lose a detection, and it is worth being
+precise about why: **severity is assigned by the agent's rule file, not by the
+model.** A log the rules label INFO is dropped here even if a human would have
+called it an intrusion, and the model never gets the chance to disagree. That
+is the trade being made — cost against the possibility that the rules are
+wrong about something.
+
+Three deliberate limits on that risk:
+
+- An event with a missing or unrecognised severity is **kept**, never dropped.
+  Fields go missing in this pipeline (see the `source` handling in
+  log_extractor), and "we could not read the severity" must not silently mean
+  "below the floor".
+- The default floor drops only INFO, the mildest setting that does anything.
+- Everything dropped is counted per severity and reported, so the size of the
+  blind spot is a number rather than a guess.
+"""
+
+from __future__ import annotations
+
+import os
+
+# Ordered lowest to highest. Position in this list is the comparison.
+SEVERITY_LADDER = ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
+
+# Events strictly below this are not sent for analysis. "INFO" disables the
+# gate entirely, which is the setting to use while you have no measurement of
+# what the model would have said about the events being dropped.
+MIN_SEVERITY = (os.getenv("AI_MIN_SEVERITY", "LOW") or "LOW").strip().upper()
+
+# Process-local tallies, kept only for the ingest process's own logging.
+#
+# These are NOT the source of truth and must not be reported as one: ingest
+# runs in server.py while the stats endpoint is served by app.py, so a counter
+# living in module state reads as zero from the API no matter how many events
+# were actually dropped. That is worse than having no counter, because it
+# looks like an answer. The durable counts live in the per-agent
+# `ai_triage_drops` and `ai_dedup` tables below.
+dropped_by_severity: dict[str, int] = {}
+suppressed_duplicates = 0
+
+
+def _rank(severity) -> int | None:
+    """Position on the ladder, or None when the value is not one we know."""
+    if severity is None:
+        return None
+    s = str(severity).strip().upper()
+    return SEVERITY_LADDER.index(s) if s in SEVERITY_LADDER else None
+
+
+def passes_severity(item: dict) -> tuple[bool, str]:
+    """Return (send_to_model, reason).
+
+    Fails open on anything it cannot read. A dropped event is invisible to the
+    whole AI pipeline, so ambiguity has to resolve towards keeping it.
+    """
+    floor = _rank(MIN_SEVERITY)
+    if floor is None or floor == 0:
+        # Unparseable config, or the gate is explicitly disabled at INFO.
+        return True, "severity gate off"
+
+    raw = item.get("severity") or item.get("level") or item.get("Severity")
+    rank = _rank(raw)
+    if rank is None:
+        # Missing or unrecognised. Keep it — see the module docstring.
+        return True, f"severity unreadable ({raw!r}), kept"
+
+    if rank < floor:
+        label = str(raw).strip().upper()
+        dropped_by_severity[label] = dropped_by_severity.get(label, 0) + 1
+        return False, f"severity {label} below floor {MIN_SEVERITY}"
+
+    return True, "above floor"
+
+
+DROPS_DDL = """
+CREATE TABLE IF NOT EXISTS ai_triage_drops (
+    severity     VARCHAR(16)     NOT NULL PRIMARY KEY,
+    dropped      BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    last_dropped TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+
+def record_drop(cursor, severity: str) -> None:
+    """Persist the fact that the severity gate discarded an event.
+
+    In the database rather than a counter in memory, for the reason given
+    above: the process that drops events is not the process that answers
+    /api/ai/triage-stats, so an in-process number would always report zero.
+
+    This is the only evidence that the gate is costing anything. Raising
+    AI_MIN_SEVERITY without being able to read it is raising it blind.
+    """
+    try:
+        cursor.execute(DROPS_DDL)
+        cursor.execute(
+            """INSERT INTO ai_triage_drops (severity, dropped)
+               VALUES (%s, 1)
+               ON DUPLICATE KEY UPDATE
+                   dropped = dropped + 1,
+                   last_dropped = NOW()""",
+            (str(severity).strip().upper()[:16],),
+        )
+    except Exception:
+        # Never let bookkeeping break ingest. The event is already dropped;
+        # losing the tally is bad but losing telemetry would be worse.
+        pass
+
+
+DEDUP_DDL = """
+CREATE TABLE IF NOT EXISTS ai_dedup (
+    fingerprint  CHAR(64) NOT NULL PRIMARY KEY,
+    table_name   VARCHAR(64)  NOT NULL,
+    occurrences  INT UNSIGNED NOT NULL DEFAULT 1,
+    first_seen   TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_dedup_seen (last_seen)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+
+def record_occurrence(cursor, table: str, fingerprint: str) -> tuple[bool, int]:
+    """Count this event and say whether it is the first of its kind.
+
+    Returns `(is_new, occurrences)`. Only a new fingerprint should be sent for
+    analysis; repeats attach to the verdict the first one produced.
+
+    The counter lives in the database rather than in a process dict, which the
+    previous implementation used. That dict had three problems: it was wiped
+    wholesale once it reached 1000 entries — so deduplication stopped working
+    exactly when volume made it matter — it was per-Sanic-worker, so it
+    divided by the worker count, and it was lost on every restart.
+
+    MySQL reports rowcount 1 for an INSERT and 2 for an ON DUPLICATE KEY
+    UPDATE that changed a row, which is what distinguishes the two cases
+    atomically. Doing it in one statement matters: two concurrent ingests of
+    the same event would otherwise both read "unseen" and both publish.
+    """
+    global suppressed_duplicates
+
+    cursor.execute(
+        """INSERT INTO ai_dedup (fingerprint, table_name, occurrences)
+           VALUES (%s, %s, 1)
+           ON DUPLICATE KEY UPDATE
+               occurrences = occurrences + 1,
+               last_seen = NOW()""",
+        (fingerprint, table),
+    )
+    is_new = cursor.rowcount == 1
+    if is_new:
+        return True, 1
+
+    suppressed_duplicates += 1
+    cursor.execute(
+        "SELECT occurrences FROM ai_dedup WHERE fingerprint = %s", (fingerprint,)
+    )
+    row = cursor.fetchone()
+    return False, int(row[0]) if row else 2
+
+
+def config() -> dict:
+    """How the funnel is configured. The counts come from the database — see
+    the note on `dropped_by_severity` for why they cannot come from here."""
+    return {
+        "min_severity": MIN_SEVERITY,
+        "severity_gate_enabled": (_rank(MIN_SEVERITY) or 0) > 0,
+    }
