@@ -97,6 +97,23 @@ QUEUES = {
 
 soar = SOARAutomation(SOARConfig())
 
+def _split_fingerprint(data):
+    """Pull the triage fingerprint out of the event before it becomes a prompt.
+
+    server.py attaches `_ai_fingerprint` so the verdict can be linked back to
+    the dedup counter. It must not reach the model — a 64-character hash in
+    the log body is pure noise the model will try to interpret, and it would
+    also change the prompt for otherwise identical events, defeating the
+    response cache.
+    """
+    if not isinstance(data, dict):
+        return data, None
+    fp = data.get("_ai_fingerprint")
+    if fp is None:
+        return data, None
+    return {k: v for k, v in data.items() if k != "_ai_fingerprint"}, fp
+
+
 def _parse_failure_entry(source_file: str, log_text: str, error: str, model: str) -> dict:
     """The row written when the model could not produce a usable verdict.
 
@@ -121,6 +138,7 @@ def _parse_failure_entry(source_file: str, log_text: str, error: str, model: str
 
 
 async def handle_automation(agent, table, data, api_key, endpoint, model=None):
+    data, fingerprint = _split_fingerprint(data)
     log_text = json.dumps(data, indent=2)
     model_name = model or os.getenv("OLLAMA_MODEL", "")
 
@@ -172,6 +190,7 @@ async def handle_automation(agent, table, data, api_key, endpoint, model=None):
         'confidence': verdict.confidence,
         'model': model_name,
         'payload': verdict.model_dump_json(),
+        'fingerprint': fingerprint,
     }
     try:
         await asyncio.to_thread(save_ai_results, agent, [result_entry])
@@ -253,6 +272,7 @@ SHADOW_MODE = os.getenv("AI_SHADOW_MODE", "0").lower() in ("1", "true", "yes", "
 
 
 async def handle_defensive(agent, table, data, api_key, endpoint, model=None):
+    data, fingerprint = _split_fingerprint(data)
     log_text = json.dumps(data, indent=2)
     model_name = model or os.getenv("OLLAMA_MODEL", "")
 
@@ -367,6 +387,7 @@ async def handle_defensive(agent, table, data, api_key, endpoint, model=None):
         'confidence': decision.confidence,
         'model': model_name,
         'payload': decision.model_dump_json(),
+        'fingerprint': fingerprint,
     }
     try:
         await asyncio.to_thread(save_ai_results, agent, [result_entry])

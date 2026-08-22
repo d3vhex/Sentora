@@ -44,8 +44,11 @@ ALLOWED_TABLES = {
 
 RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq/")
 
-RECENT_AI_TASKS = {}
-AI_DEDUP_WINDOW = 30
+# RECENT_AI_TASKS / AI_DEDUP_WINDOW used to live here: a process-local dict
+# with a 30-second window, wiped wholesale at 1000 entries. Deduplication
+# therefore stopped working precisely when volume made it matter, divided by
+# the Sanic worker count, and reset on every restart. Replaced by the
+# database-backed counter in core/triage.py.
 
 # asyncio holds only a *weak* reference to a running task, so a fire-and-forget
 # `create_task` can be garbage collected before it finishes. On the ingest path
@@ -200,6 +203,7 @@ def update_agent_info(agent: str, public_ip: str, os_info: str = None, hostname:
         conn.close()
 
 from core import mq as mq_utils
+from core import triage
 import core.opensearch as os_utils
 
 async def publish_to_ai_queue(agent: str, table: str, item: dict):
@@ -265,23 +269,43 @@ async def insert_data(agent: str, table: str, data: list, public_ip: str = None,
             cursor.execute(sql, list(item.values()))
 
             if table in {"siem_events", "events_alert"}:
-                ai_fp = compute_ai_fingerprint(table, item)
-                now = time.time()
-                cache_key = (agent, table, ai_fp)
+                # Gate 1 — severity floor. Cheap, and happens before anything
+                # touches the dedup table.
+                send, why = triage.passes_severity(item)
+                if not send:
+                    # Recorded in the agent's database, not a module counter:
+                    # this process is not the one that serves the stats
+                    # endpoint, so an in-memory tally would always read zero
+                    # there — an answer-shaped number measuring nothing.
+                    triage.record_drop(cursor, item.get("severity") or item.get("level") or "UNKNOWN")
+                    if debug:
+                        print(f"[Triage] skipped {agent}/{table}: {why}")
+                else:
+                    # Gate 2 — deduplication, counted in the database so it
+                    # survives restarts and is shared across Sanic workers.
+                    ai_fp = compute_ai_fingerprint(table, item)
+                    try:
+                        cursor.execute(triage.DEDUP_DDL)
+                        is_new, seen = triage.record_occurrence(cursor, table, ai_fp)
+                    except Exception as dedup_err:
+                        # Fail open: a broken counter must not stop analysis.
+                        if debug:
+                            print(f"[Triage] dedup unavailable ({dedup_err}), analysing anyway")
+                        is_new, seen = True, 1
 
-                last_time = RECENT_AI_TASKS.get(cache_key, 0)
-                if now - last_time > AI_DEDUP_WINDOW:
-                    RECENT_AI_TASKS[cache_key] = now
-                    # This is the whole AI pipeline's entry point. The task was
-                    # previously assigned to a local that went out of scope
-                    # immediately, leaving only asyncio's weak reference — so
-                    # an event could be dropped before it ever reached the
-                    # queue, while the line below claimed it had been sent.
-                    _spawn(publish_to_ai_queue(agent, table, item),
-                           label=f"ai-publish {agent}/{table}")
-
-                    if len(RECENT_AI_TASKS) > 1000:
-                        RECENT_AI_TASKS.clear()
+                    if is_new:
+                        # This is the whole AI pipeline's entry point. The task
+                        # was previously assigned to a local that went out of
+                        # scope immediately, leaving only asyncio's weak
+                        # reference — so an event could be dropped before it
+                        # ever reached the queue, while the log line below
+                        # claimed it had been sent.
+                        item["_ai_fingerprint"] = ai_fp
+                        _spawn(publish_to_ai_queue(agent, table, item),
+                               label=f"ai-publish {agent}/{table}")
+                    elif debug:
+                        print(f"[Triage] duplicate {agent}/{table} (x{seen}), "
+                              f"attached to the existing verdict")
 
             _spawn(os_utils.index_log(agent, table, item),
                    label=f"index {agent}/{table}")

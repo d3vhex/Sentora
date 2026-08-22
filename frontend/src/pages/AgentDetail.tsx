@@ -1486,6 +1486,19 @@ export const InsightCard: React.FC<{ insight: any }> = ({ insight }) => {
           )}
           {p.indicator && <Chip color="#60a5fa" bg="rgba(96,165,250,0.10)" mono>{p.indicator}</Chip>}
           {p.action && <Chip color="#f97316" bg="rgba(249,115,22,0.10)">{p.action}</Chip>}
+          {/* Repeats of this exact event attach to this verdict rather than
+              each costing an inference. The count is kept because a burst is
+              itself signal — one failed logon and four hundred are different
+              events, and collapsing them without saying so hides that. */}
+          {Number(insight.occurrences) > 1 && (
+            <Chip
+              color="var(--accent-warning)"
+              bg="rgba(245,158,11,0.10)"
+              mono
+            >
+              ×{Number(insight.occurrences).toLocaleString()}
+            </Chip>
+          )}
         </div>
       )}
 

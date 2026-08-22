@@ -3867,13 +3867,21 @@ async def get_all_ai_insights(request):
                     # `source_data` is excluded: it holds the entire raw log
                     # per insight, and the feed does not render it. It is
                     # fetched per insight by the View Source modal instead.
+                    # LEFT JOIN, not INNER: an insight whose event was never
+                    # deduplicated (or predates the dedup table) still has to
+                    # appear. `occurrences` is how many times this exact event
+                    # recurred — the repeats attach here instead of each
+                    # costing another inference.
                     await acur.execute(
-                        """SELECT id, timestamp, source_file, critical_summary,
-                                  verdict, severity, confidence, model,
-                                  proposed_action, proposed_target, shadow_status,
-                                  created_at
-                             FROM ai_analysis_results
-                            ORDER BY created_at DESC, id DESC
+                        """SELECT r.id, r.timestamp, r.source_file, r.critical_summary,
+                                  r.verdict, r.severity, r.confidence, r.model,
+                                  r.proposed_action, r.proposed_target, r.shadow_status,
+                                  r.created_at,
+                                  COALESCE(d.occurrences, 1) AS occurrences,
+                                  d.last_seen AS last_occurrence
+                             FROM ai_analysis_results r
+                             LEFT JOIN ai_dedup d ON d.fingerprint = r.fingerprint
+                            ORDER BY r.created_at DESC, r.id DESC
                             LIMIT %s""",
                         (per_agent,),
                     )
@@ -3887,11 +3895,13 @@ async def get_all_ai_insights(request):
 
             for r in rows:
                 r['agent'] = agent
-                for field in ('created_at', 'timestamp'):
+                for field in ('created_at', 'timestamp', 'last_occurrence'):
                     if r.get(field) and hasattr(r[field], 'isoformat'):
                         r[field] = r[field].isoformat()
                 if r.get('confidence') is not None:
                     r['confidence'] = float(r['confidence'])
+                if r.get('occurrences') is not None:
+                    r['occurrences'] = int(r['occurrences'])
             return rows
 
         buckets = await gather_over_agents(_for_agent, agents)
@@ -6610,6 +6620,95 @@ async def refresh_threat_intel(request):
             # front of this button.
             "errors": errors,
         })
+    except Exception as e:
+        return sanic_json({"status": "error", "message": str(e)}, status=500)
+
+
+@app.get("/api/ai/triage-stats")
+@require_permission("read_telemetry")
+async def get_triage_stats(request):
+    """What the pre-LLM funnel discarded, and how much it saved.
+
+    A filter you cannot see is a blind spot. The severity gate drops events
+    based on a label the agent's rule file assigned — not the model — so the
+    number of events the model never got to judge has to be inspectable, not
+    inferred from a quiet queue.
+
+    Counters are per server process and reset on restart; they measure the
+    current run, not lifetime totals.
+    """
+    try:
+        from core import triage
+        data = triage.config()
+
+        # Every count below is read from the agent databases. Ingest runs in
+        # server.py and this endpoint is served by app.py, so any counter held
+        # in module state would report zero here regardless of what the funnel
+        # actually did.
+        agents = await _list_agent_names_sync()
+
+        async def _for_agent(agent):
+            async with agent_conn(agent) as cnx:
+                cur = await cnx.cursor(dictionary=True)
+                try:
+                    await cur.execute(
+                        "SELECT COUNT(*) AS distinct_events, "
+                        "       COALESCE(SUM(occurrences), 0) AS total_events "
+                        "  FROM ai_dedup"
+                    )
+                    row = await cur.fetchone() or {}
+                except Exception:
+                    return None      # table not provisioned on this agent yet
+
+                try:
+                    await cur.execute(
+                        "SELECT severity, dropped FROM ai_triage_drops"
+                    )
+                    drops = await cur.fetchall() or []
+                except Exception:
+                    drops = []       # nothing has been dropped on this agent
+                finally:
+                    await cur.close()
+            return {
+                "agent": agent,
+                "distinct_events": int(row.get("distinct_events") or 0),
+                "total_events": int(row.get("total_events") or 0),
+                "drops": {d["severity"]: int(d["dropped"]) for d in drops},
+            }
+
+        per_agent = await gather_over_agents(_for_agent, agents)
+        distinct = sum(a["distinct_events"] for a in per_agent)
+        total = sum(a["total_events"] for a in per_agent)
+
+        by_severity: dict = {}
+        for a in per_agent:
+            for sev, n in a["drops"].items():
+                by_severity[sev] = by_severity.get(sev, 0) + n
+
+        data["severity_gate"] = {
+            "dropped_by_severity": by_severity,
+            "dropped_total": sum(by_severity.values()),
+            # The events the model was never given a chance to judge. Read
+            # this before raising AI_MIN_SEVERITY.
+            "note": ("Severity is assigned by the agent's rule file, not the "
+                     "model. These events were not analysed."),
+        }
+
+        data["dedup"] = {
+            "distinct_events": distinct,
+            "total_events": total,
+            "inferences_avoided": max(0, total - distinct),
+            # What fraction of ingested events did NOT need their own
+            # inference. This is the funnel's actual payoff.
+            "suppression_rate": round(1 - (distinct / total), 4) if total else 0.0,
+            "by_agent": sorted(per_agent, key=lambda a: a["total_events"], reverse=True),
+        }
+        # A zero here is ambiguous on its own — it means either that nothing
+        # fell below the floor, or that no telemetry has arrived at all. The
+        # dedup totals disambiguate it, so they are stated together.
+        if total == 0:
+            data["severity_gate"]["note"] += " No events ingested yet."
+        return sanic_json({"status": "success", **data})
     except Exception as e:
         return sanic_json({"status": "error", "message": str(e)}, status=500)
 

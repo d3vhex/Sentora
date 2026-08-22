@@ -475,6 +475,11 @@ def save_ai_results(agent: str, results: list):
                     "ALTER TABLE ai_analysis_results ADD COLUMN model VARCHAR(64) NULL",
                     "ALTER TABLE ai_analysis_results ADD COLUMN prompt_version VARCHAR(16) NULL",
                     "ALTER TABLE ai_analysis_results ADD COLUMN payload JSON NULL",
+                    # Links a verdict back to the ai_dedup counter, so repeats
+                    # of the same event attach to this insight instead of
+                    # producing another inference.
+                    "ALTER TABLE ai_analysis_results ADD COLUMN fingerprint CHAR(64) NULL",
+                    "ALTER TABLE ai_analysis_results ADD INDEX idx_air_fp (fingerprint)",
                     "ALTER TABLE ai_analysis_results ADD INDEX idx_air_verdict (verdict)",
                     "ALTER TABLE ai_analysis_results ADD INDEX idx_air_created (created_at)",
                 ):
@@ -488,8 +493,9 @@ def save_ai_results(agent: str, results: list):
                         INSERT INTO ai_analysis_results
                             (timestamp, source_file, critical_summary, source_data,
                              proposed_action, proposed_target, shadow_status,
-                             verdict, severity, confidence, model, prompt_version, payload)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                             verdict, severity, confidence, model, prompt_version,
+                             payload, fingerprint)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
                             res['timestamp'],
@@ -505,6 +511,7 @@ def save_ai_results(agent: str, results: list):
                             res.get('model'),
                             res.get('prompt_version', PROMPT_VERSION),
                             res.get('payload'),
+                            res.get('fingerprint'),
                         ),
                     )
                 conn.commit()
