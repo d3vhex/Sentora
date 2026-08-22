@@ -320,7 +320,13 @@ categories:
       `\s*(\w+)\s*`
       \$\(.*?\)
       &gt;|&lt;|&amp;
-      \|(?:\s*|)(\w+)
+      # Was `\|(?:\s*|)(\w+)` - a pipe followed by any word. This module joins
+      # Windows event fields with " | ", so the agent matched its own field
+      # separator and stamped COMMAND INJECTION / CRITICAL on 89 of 100 sampled
+      # events, almost all of them routine licensing and shadow-copy records.
+      # Narrowed to a named command, matching the `&\s*(?:whoami|...)` rule
+      # a few lines above.
+      \|\s*(?:whoami|id|ipconfig|ifconfig|uname|hostname|ps|ls|dir|cat|type|echo|pwd|nc|netcat|bash|sh|cmd|powershell|curl|wget|python|perl|base64)\b
       (\%0a|\%0d|\n|\r)\s*(?:cmd|sh|bash|powershell)
       exec\s*\(["'](?:cmd\.exe|sh|bash|powershell)
       system\s*\(["'].*?["']\)
@@ -1277,7 +1283,10 @@ categories:
       
       # PII patterns
       \b\d{3}-\d{2}-\d{4}\b
-      \b\d{9}\b
+      # `\b\d{9}\b` was here: any nine-digit number. Event IDs, process IDs,
+      # ports, byte counts and timestamps are all nine digits often enough
+      # that it flagged ordinary telemetry as PII disclosure. An unformatted
+      # nine-digit run carries no evidence that it is an identifier.
       \b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|3(?:0[0-5]|[68][0-9])[0-9]{11}|6(?:011|5[0-9]{2})[0-9]{12}|(?:2131|1800|35\d{3})\d{11})\b
       \b[A-Z]{1,2}\d{1,2}\s?\d{1,2}[A-Z]{2}\b
       
@@ -1451,22 +1460,22 @@ categories:
     weight: 2
     patterns: |
       # CRLF injection
+      #
+      # The bare `\r\n`, `\r` and `\n` that used to be here matched any
+      # multi-line text at all, which is most log records. CRLF injection is
+      # about *encoded* line breaks smuggled through a parameter - a literal
+      # newline in a log body is just a log body.
       %0d%0a
       %0a
       %0d
-      \r\n
-      \r
-      \n
       %0d%0aContent-Length:
       %0d%0aHTTP\/1\.1\s+200
       %0d%0aLocation:
       %0d%0aSet-Cookie:
       
-      # Header injection
-      \r\n\r\n
+      # Header injection. The literal `\r\n\r\n`, `\n\n` and `\r\r` forms were
+      # removed for the same reason: a blank line is not an attack.
       %0d%0a%0d%0a
-      \n\n
-      \r\r
       
       # Response splitting
       %0d%0aContent-Type:\s*text\/html
@@ -1581,7 +1590,11 @@ categories:
       \.(?:jsp|jspx|jsw|jsv|jspf)$
       \.(?:cfm|cfml|cfc)$
       \.(?:pl|cgi|py|rb|sh|bash)$
-      \.(?:exe|dll|com|bat|cmd|vbs|ps1)$
+      # Was `\.(?:exe|dll|com|bat|cmd|vbs|ps1)$`, which matched the name of
+      # every Windows binary in every event log line - svchost.exe, taskhostw.exe,
+      # services.exe. These extensions only indicate an upload when they arrive
+      # as one, so the filename now has to appear in an upload context.
+      filename=["']?[^"'\s]+\.(?:exe|dll|com|bat|cmd|vbs|ps1)["']?
       \.(?:svg|xml|xsl|xslt)$
       \.(?:swf|jar|class)$
       

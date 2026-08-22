@@ -1466,6 +1466,19 @@ def main():
 
     _init_agent_bootstrap(cfg["server_url"], cfg["agent_key"])
 
+    # Bring the local database up to the shipped schema before any collector
+    # writes to it. Postgres runs docker-entrypoint-initdb.d only on an empty
+    # data directory, so an upgraded agent on an existing machine otherwise
+    # keeps the schema it was first installed with, and every insert that
+    # touches a newer column fails into agent.log where the server cannot see
+    # it. Failures here are reported, not fatal: a partial schema still
+    # collects most of the telemetry.
+    try:
+        from modules.db import apply_schema
+        apply_schema()
+    except Exception as e:
+        print(f"[!] Could not apply the agent schema: {e}", flush=True)
+
     print(f"[*] Agent Name: {AGENT_NAME}")
     print(f"[*] Server IP: {SERVER_IP}")
     print(f"[*] Ingest Port: {SERVER_PORT}")
