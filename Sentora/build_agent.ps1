@@ -82,10 +82,17 @@ if (-not $NoClean) {
 
 $confPath    = Join-Path $ScriptDir "conf"
 $modulesPath = Join-Path $ScriptDir "modules"
+# db/init.sql ships with the binary so the agent can bring its own database up
+# to date on start. Postgres only runs docker-entrypoint-initdb.d on an empty
+# data directory, so without this a column added in a later release never
+# appeared on a machine where the agent had run before - every insert then
+# failed into agent.log while the platform still reported the agent healthy.
+$dbPath      = Join-Path $ScriptDir "db"
 
 $addData = @(
     "${confPath};conf",
-    "${modulesPath};modules"
+    "${modulesPath};modules",
+    "${dbPath};db"
 )
 
 $collectAll = @(

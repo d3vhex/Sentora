@@ -84,9 +84,15 @@ def main() -> int:
                     help="MySQL port (default: 3307, the published port)")
     args = ap.parse_args()
 
-    key = os.getenv("FERNET_KEY")
-    if not key:
-        print("[!] FERNET_KEY is not set; events would be unreadable.")
+    # NOT os.getenv("FERNET_KEY"): that key protects server-side secrets. The
+    # one agent telemetry is encrypted with lives in data/fernet.key and is
+    # what /api/agents/bootstrap hands out. Reading the wrong one produced a
+    # corpus of "<undecryptable>" strings that still looked like a corpus.
+    from core.agent_key import KeyNotFound, find_agent_key
+    try:
+        key = find_agent_key()
+    except KeyNotFound as e:
+        print(f"[!] {e}")
         return 2
     fernet = Fernet(key.encode() if isinstance(key, str) else key)
 

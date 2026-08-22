@@ -482,7 +482,9 @@ async def _execute_automation_record(agent: str, rec: dict) -> dict:
             target=target,
             comment=comment_full,
             event_id=event_id,
-            ttl=rec.get("ttl")
+            ttl=rec.get("ttl"),
+            # Already queued - see the note in run_due_automations.
+            background_queue=False,
         )
 
         ok = result.get("ok", False)
@@ -959,6 +961,11 @@ async def register_agent(request):
     hostname = (body.get("hostname") or "").strip()[:255] or None
     os_type = (body.get("os_type") or "").strip()[:32] or None
     req_name = (body.get("agent_name") or "").strip()[:128] or None
+    # An upgrading agent sends the identity it already holds. Possession of
+    # the key is the proof, so this cannot be used to claim someone else's
+    # name; without a matching key the request falls through to a normal
+    # fresh enrolment below.
+    existing_key = (body.get("agent_key") or "").strip()[:128] or None
 
     if req_name and not re.match(r"^[A-Za-z0-9_.-]{1,128}$", req_name):
         return sanic_json({"status": "error", "message": "Invalid agent_name"}, status=400)
@@ -979,6 +986,40 @@ async def register_agent(request):
                     return sanic_json({"status": "error", "message": "Token already used"}, status=409)
                 if row["expires_at"] and row["expires_at"] < datetime.now():
                     return sanic_json({"status": "error", "message": "Token expired"}, status=410)
+
+                # Re-enrolment of a known agent: the installer took the
+                # upgrade path and is closing out the token it was given.
+                # Without this the token stayed unused forever and the
+                # Deploy page reported "waiting" after a deployment that had
+                # in fact succeeded - the UI contradicting reality.
+                if req_name and existing_key:
+                    cur.execute(
+                        "SELECT agent_name FROM agent_identities "
+                        "WHERE agent_name=%s AND agent_key=%s",
+                        (req_name, existing_key),
+                    )
+                    if cur.fetchone():
+                        cur.execute(
+                            """UPDATE enrollment_tokens
+                               SET used_at=NOW(), used_by_agent=%s, used_from_ip=%s
+                               WHERE id=%s""",
+                            (req_name, client_ip, row["id"]),
+                        )
+                        conn.commit()
+                        await audit_log(request, "AGENT_UPGRADE", req_name,
+                                        f"existing identity kept, from {client_ip}")
+                        proto = "https" if request.scheme == "https" else "http"
+                        return sanic_json({
+                            "status": "success",
+                            "agent_name": req_name,
+                            "agent_key": existing_key,
+                            "server_url": f"{proto}://{request.host}",
+                            "server_ip": request.host.split(":")[0],
+                            "upgraded": True,
+                        })
+                    # Key did not match. Not an error worth failing on - fall
+                    # through and enrol as a new agent, which is what a
+                    # machine restored from a stale backup should get.
 
                 if not req_name:
                     base = hostname or f"Agent-{token[:8]}"
@@ -1180,6 +1221,14 @@ def _render_windows_install(server_url: str, server_ip: str, token: str) -> str:
     $InstallDir = "C:\\Program Files\\Sentora-Agent"
     $Hostname  = $env:COMPUTERNAME
     $OsType    = "windows"
+    # Set $env:SENTORA_REENROLL=1 before running to discard the existing
+    # identity and take a new one. Only needed when the agent's key has been
+    # revoked; a plain upgrade keeps the identity it already has.
+    #
+    # Compared against explicit values, not cast with [bool]: in PowerShell
+    # any non-empty string is true, so [bool]"0" is $true and setting the
+    # variable to 0 to mean "no" would have forced a re-enrolment.
+    $ReEnroll  = ($env:SENTORA_REENROLL -in @("1", "true", "yes", "on"))
     $LogPath   = Join-Path $env:TEMP "sentora-install.log"
     Start-Transcript -Path $LogPath -Force | Out-Null
 
@@ -1207,23 +1256,64 @@ def _render_windows_install(server_url: str, server_ip: str, token: str) -> str:
             return
         }}
 
-        Write-Host "[*] Registering with server..." -ForegroundColor Cyan
-        $RegBody = @{{ token = $Token; hostname = $Hostname; os_type = $OsType }} | ConvertTo-Json -Compress
-        try {{
-            $Reg = Invoke-RestMethod -Method Post -Uri "$ServerUrl/api/agents/register" -ContentType "application/json" -Body $RegBody
-        }} catch {{
-            Write-Host "[!] Registration call failed: $($_.Exception.Message)" -ForegroundColor Red
-            return
+        # An upgrade is not an enrolment. This used to call /register
+        # unconditionally, and the server allocates a fresh name whenever the
+        # requested one is taken - so re-running this one-liner on a machine
+        # that already had an agent produced DESKTOP-X-2, then -3, then -4.
+        # One physical host ended up as four "agents": telemetry split across
+        # four databases, the fleet view counting it four times, and
+        # deduplication running separately in each.
+        #
+        # If this machine already holds credentials, keep them. Enrolment is
+        # for machines that have none.
+        $AgentName = $null
+        $AgentKey  = $null
+        $ExistingConfig = Join-Path $InstallDir "config.json"
+        if ((Test-Path $ExistingConfig) -and -not $ReEnroll) {{
+            try {{
+                $Prev = Get-Content $ExistingConfig -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($Prev.agent_name -and $Prev.agent_key) {{
+                    $AgentName = $Prev.agent_name
+                    $AgentKey  = $Prev.agent_key
+                    Write-Host "[+] Upgrading existing agent: $AgentName" -ForegroundColor Green
+                    Write-Host "    Identity kept. Set SENTORA_REENROLL=1 to force a new one." -ForegroundColor DarkGray
+
+                    # Close out the token anyway. Skipping the call left it
+                    # unused forever, so the Deploy page kept reporting
+                    # "waiting" after a deployment that had already succeeded.
+                    # The server verifies the key before accepting this.
+                    $UpBody = @{{ token = $Token; agent_name = $AgentName; agent_key = $AgentKey; hostname = $Hostname; os_type = $OsType }} | ConvertTo-Json -Compress
+                    try {{
+                        Invoke-RestMethod -Method Post -Uri "$ServerUrl/api/agents/register" -ContentType "application/json" -Body $UpBody | Out-Null
+                    }} catch {{
+                        # Not fatal: the agent already holds working credentials.
+                        Write-Host "    (could not mark the enrolment token used: $($_.Exception.Message))" -ForegroundColor DarkGray
+                    }}
+                }}
+            }} catch {{
+                Write-Host "[!] Existing config.json is unreadable, enrolling fresh." -ForegroundColor Yellow
+            }}
         }}
 
-        if (-not $Reg.agent_name -or -not $Reg.agent_key) {{
-            Write-Host "[!] Registration response missing identity: $($Reg | ConvertTo-Json -Compress)" -ForegroundColor Red
-            return
-        }}
+        if (-not $AgentName) {{
+            Write-Host "[*] Registering with server..." -ForegroundColor Cyan
+            $RegBody = @{{ token = $Token; hostname = $Hostname; os_type = $OsType }} | ConvertTo-Json -Compress
+            try {{
+                $Reg = Invoke-RestMethod -Method Post -Uri "$ServerUrl/api/agents/register" -ContentType "application/json" -Body $RegBody
+            }} catch {{
+                Write-Host "[!] Registration call failed: $($_.Exception.Message)" -ForegroundColor Red
+                return
+            }}
 
-        $AgentName = $Reg.agent_name
-        $AgentKey  = $Reg.agent_key
-        Write-Host "[+] Enrolled as: $AgentName" -ForegroundColor Green
+            if (-not $Reg.agent_name -or -not $Reg.agent_key) {{
+                Write-Host "[!] Registration response missing identity: $($Reg | ConvertTo-Json -Compress)" -ForegroundColor Red
+                return
+            }}
+
+            $AgentName = $Reg.agent_name
+            $AgentKey  = $Reg.agent_key
+            Write-Host "[+] Enrolled as: $AgentName" -ForegroundColor Green
+        }}
 
         if (!(Test-Path $InstallDir)) {{ New-Item -ItemType Directory -Path $InstallDir | Out-Null }}
         Set-Location $InstallDir
@@ -4548,6 +4638,9 @@ async def execute_automation(request, agent, auto_id):
             target=rec["target"],
             comment=f"{prefix} | {rec.get('comment') or ''}".strip(),
             event_id=rec.get("event_id"),
+            # Already queued - this row is what is being executed. Leaving the
+            # default on made every dispatch enqueue its own successor.
+            background_queue=False,
         )
 
         auto_status = "completed" if result.get("ok") else "failed"
@@ -4609,6 +4702,8 @@ async def run_due_automations(request, agent):
                     target=rec["target"],
                     comment=f"{prefix} | {rec.get('comment') or ''}".strip(),
                     event_id=rec.get("event_id"),
+                    # Already queued - see the note in run_due_automations.
+                    background_queue=False,
                 )
                 auto_status = "completed" if r.get("ok") else "failed"
                 final_comment = (rec.get("comment") or "").strip()
@@ -6241,6 +6336,17 @@ async def _run_due_automations_logic(agent):
             target=rec["target"],
             comment=f"automation#{rec['id']} | {rec.get('comment') or ''}".strip(),
             event_id=rec.get("event_id"),
+            # This row IS the queue entry being dispatched. call_agent_soar
+            # defaults to background_queue=True, which inserts a fresh
+            # 'pending' automation so an agent that missed the push can still
+            # poll for it - correct when something new is being ordered, and a
+            # loop when the dispatcher does it: every execution queued its own
+            # successor, one row per cycle, forever.
+            #
+            # A manually triggered self_destruct therefore kept re-arming
+            # itself and destroyed the agent again on every reinstall, with
+            # the comment chain growing an `automation#N |` prefix each time.
+            background_queue=False,
         )
 
         status = "completed" if result.get("ok") else "failed"
