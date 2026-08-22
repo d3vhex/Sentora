@@ -82,6 +82,52 @@ def test_severity_is_case_and_space_insensitive():
     assert triage.passes_severity({"severity": "info"})[0] is False
 
 
+def test_severity_is_read_from_the_json_body_when_the_column_is_empty():
+    """The bug the eval corpus exposed.
+
+    log_extractor put the enriched event into `message` as JSON and left the
+    severity column NULL, so reading only the column made this gate silently
+    inert for every siem_events row. It found nothing to compare and kept
+    everything, which is indistinguishable from a correctly-configured floor
+    with nothing below it.
+    """
+    triage.MIN_SEVERITY = "HIGH"
+    row = {"source": None, "severity": None,
+           "message": '{"source": "Application", "severity": "INFO", '
+                      '"message": "routine"}'}
+    send, why = triage.passes_severity(row)
+    assert send is False
+    assert "INFO" in why
+
+
+def test_json_body_severity_can_also_keep_an_event():
+    triage.MIN_SEVERITY = "HIGH"
+    row = {"message": '{"severity": "CRITICAL"}'}
+    assert triage.passes_severity(row)[0] is True
+
+
+@pytest.mark.parametrize("body", [
+    "not json at all",
+    '{"severity": ',          # truncated
+    '["a", "list"]',
+    '{"no_severity_here": 1}',
+    None,
+    123,
+])
+def test_unparseable_body_keeps_the_event(body):
+    """A parse failure must not become a silent drop."""
+    triage.MIN_SEVERITY = "CRITICAL"
+    assert triage.passes_severity({"message": body})[0] is True
+
+
+def test_the_column_wins_over_the_body():
+    """Once the agent populates the column it is authoritative; the body is
+    only the fallback for rows written before that."""
+    triage.MIN_SEVERITY = "HIGH"
+    row = {"severity": "CRITICAL", "message": '{"severity": "INFO"}'}
+    assert triage.passes_severity(row)[0] is True
+
+
 def test_alternative_field_names_are_read():
     """log_extractor writes `severity`; some producers use `level`."""
     triage.MIN_SEVERITY = "HIGH"

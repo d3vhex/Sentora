@@ -29,8 +29,8 @@ services:
     ports:
       - "${BIND_ADDR:-127.0.0.1}:3307:3306"
     volumes:
-      - ./init_userdb.sql:/docker-entrypoint-initdb.d/1-init_userdb.sql
-      - ./init.sql:/docker-entrypoint-initdb.d/2-init.sql
+      - ./db/init_userdb.sql:/docker-entrypoint-initdb.d/1-init_userdb.sql
+      - ./db/init.sql:/docker-entrypoint-initdb.d/2-init.sql
       - mysql_data:/var/lib/mysql
     healthcheck:
       # Expanded by the shell *inside* the db container, so it has to name a

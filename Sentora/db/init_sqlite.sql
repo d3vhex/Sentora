@@ -100,6 +100,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_vr_dup_not_null
 CREATE TABLE IF NOT EXISTS siem_events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     source     TEXT,
+    severity   TEXT,
     "timestamp" TEXT,
     message    TEXT,
     dup_fp     CHAR(64),

@@ -152,6 +152,7 @@ CREATE TABLE IF NOT EXISTS siem_events (
 );
 ALTER TABLE siem_events
     ADD COLUMN IF NOT EXISTS source      TEXT,
+    ADD COLUMN IF NOT EXISTS severity    TEXT,
     ADD COLUMN IF NOT EXISTS "timestamp" TEXT,
     ADD COLUMN IF NOT EXISTS message     TEXT,
     ADD COLUMN IF NOT EXISTS dup_fp      CHAR(64),
