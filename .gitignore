@@ -54,3 +54,13 @@ docs/TODO.md
 docs/sentora_marketing_strategy.md
 
 # Sentora Specific
+
+# Evaluation data is per-deployment: real telemetry, hand-labelled.
+# The harness is versioned, the corpus and run results are not.
+evals/corpus.jsonl
+evals/runs/*.json
+
+# SonarQube scanner working files. Written on every scan and specific to one
+# run; they were tracked, so each scan produced a spurious diff.
+.sonar/
+.scannerwork/

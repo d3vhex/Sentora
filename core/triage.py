@@ -31,6 +31,7 @@ Three deliberate limits on that risk:
 
 from __future__ import annotations
 
+import json
 import os
 
 # Ordered lowest to highest. Position in this list is the comparison.
@@ -61,6 +62,22 @@ def _rank(severity) -> int | None:
     return SEVERITY_LADDER.index(s) if s in SEVERITY_LADDER else None
 
 
+def _severity_from_body(message):
+    """Severity out of the JSON event body, when the column is empty.
+
+    Only used as a fallback. Anything unreadable returns None, which
+    passes_severity treats as "keep" — a parse failure must not become a
+    silent drop.
+    """
+    if not isinstance(message, str) or not message.lstrip().startswith("{"):
+        return None
+    try:
+        body = json.loads(message)
+    except (ValueError, TypeError):
+        return None
+    return body.get("severity") if isinstance(body, dict) else None
+
+
 def passes_severity(item: dict) -> tuple[bool, str]:
     """Return (send_to_model, reason).
 
@@ -73,6 +90,14 @@ def passes_severity(item: dict) -> tuple[bool, str]:
         return True, "severity gate off"
 
     raw = item.get("severity") or item.get("level") or item.get("Severity")
+    if raw is None:
+        # log_extractor puts the enriched event into `message` as JSON and,
+        # until recently, left the severity column NULL. Reading only the
+        # column made this gate silently inert for every siem_events row —
+        # it found nothing to compare and kept everything, which looked
+        # exactly like a correctly-configured floor with nothing below it.
+        raw = _severity_from_body(item.get("message"))
+
     rank = _rank(raw)
     if rank is None:
         # Missing or unrecognised. Keep it — see the module docstring.

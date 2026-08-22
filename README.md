@@ -429,8 +429,8 @@ Operational docs:
 
 ```bash
 # 1. Database
-mysql -u root -p < init_userdb.sql
-mysql -u root -p < init.sql
+mysql -u root -p < db/init_userdb.sql
+mysql -u root -p < db/init.sql
 
 # 2. Backend
 pip install -r requirements.txt

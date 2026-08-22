@@ -515,8 +515,19 @@ def enhanced_output_worker(output_cfg: Dict, metrics: MetricsCollector,
             if dest in ['db', 'both']:
                 dup_fp = make_dup_fp_for_event(output)
                 if not is_duplicate_event(output):
+                    # `source` and `severity` are real columns and were never
+                    # populated: the whole event went into `message` as JSON
+                    # and the columns stayed NULL. That is why alerts rendered
+                    # "Source: Unknown", why the idx_siem_src index matched
+                    # nothing, and why the server-side severity gate saw no
+                    # severity to compare and kept every event.
+                    #
+                    # The JSON body is unchanged, so anything already reading
+                    # it keeps working.
                     insert_record_enc('siem_events', {
                         'timestamp': event.timestamp,
+                        'source': event.source_file,
+                        'severity': event.severity,
                         'message': output,
                         'dup_fp': dup_fp
                     })

@@ -106,18 +106,25 @@ def create_tables_if_not_exist(db_name):
     conn = connect_db(db_name)
     cursor = conn.cursor()
     try:
+        # Resolved against this file, not the working directory. It used to be
+        # a bare relative "init.sql" whose FileNotFoundError was swallowed, so
+        # running the server from anywhere but the repo root created no tables
+        # at all and said nothing about it.
+        schema_path = pathlib.Path(__file__).resolve().parent / "db" / "init.sql"
         try:
-            with open("init.sql", "r", encoding="utf-8") as f:
-                sql = f.read()
-            for statement in sql.split(';'):
-                stmt = statement.strip()
-                if stmt:
-                    try:
-                        cursor.execute(stmt)
-                    except mysql.connector.Error as e:
-                        print(f"[!] SQL Execution Error: {e}")
+            sql = schema_path.read_text(encoding="utf-8")
         except FileNotFoundError:
-            pass
+            # Loud: every agent table comes from this file.
+            print(f"[!] Schema {schema_path} is missing — agent tables will not "
+                  f"be created. This is not recoverable at runtime.")
+            sql = ""
+        for statement in sql.split(';'):
+            stmt = statement.strip()
+            if stmt:
+                try:
+                    cursor.execute(stmt)
+                except mysql.connector.Error as e:
+                    print(f"[!] SQL Execution Error: {e}")
 
         try:
             cursor.execute("""
