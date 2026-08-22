@@ -11,6 +11,8 @@ const AIAnalysis: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [analyzing, setAnalyzing] = useState(false);
   const [filter, setFilter] = useState('');
+  const [verdictFilter, setVerdictFilter] = useState<string>('all');
+  const [minConfidence, setMinConfidence] = useState(0);
   const [refreshTick, setRefreshTick] = useState(0);
 
   useEffect(() => {
@@ -139,14 +141,25 @@ const AIAnalysis: React.FC = () => {
     return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [insights, agents]);
 
+  // Verdict and confidence are columns now, so this is a real filter rather
+  // than a substring search over a rendered line. Rows written before those
+  // columns exist carry NULL and are excluded once a verdict filter is on —
+  // showing them would imply a verdict nobody recorded.
   const filteredInsights = insights.filter(i => {
     if (agentFilter !== 'all' && i.agent !== agentFilter) return false;
+    if (verdictFilter !== 'all' && (i.verdict || '') !== verdictFilter) return false;
+    if (minConfidence > 0 && Number(i.confidence ?? 0) < minConfidence) return false;
     if (!filter) return true;
     const needle = filter.toLowerCase();
     return (i.agent || '').toLowerCase().includes(needle)
       || (i.critical_summary || '').toLowerCase().includes(needle)
       || (i.source_file || '').toLowerCase().includes(needle);
   });
+
+  // How many rows the verdict filter simply cannot speak for. Stating this is
+  // the difference between "no CRITICAL findings" and "no CRITICAL findings
+  // among the rows that carry a verdict".
+  const legacyRows = insights.filter(i => i.verdict == null).length;
 
   return (
     <div style={{ paddingBottom: '60px' }}>
@@ -221,7 +234,61 @@ const AIAnalysis: React.FC = () => {
                 </option>
               ))}
             </select>
+
+            {/* Verdict and confidence are stored columns, so these filter on
+                what the model actually decided rather than on text that
+                happens to appear in the rendered summary. */}
+            <select
+              value={verdictFilter}
+              onChange={(e) => setVerdictFilter(e.target.value)}
+              style={{
+                backgroundColor: 'var(--card-bg)',
+                border: '1px solid var(--border-color)',
+                borderRadius: '12px',
+                padding: '14px 18px',
+                color: 'var(--text-primary)',
+                fontSize: '0.875rem',
+                outline: 'none',
+                cursor: 'pointer',
+              }}
+            >
+              <option value="all">Any verdict</option>
+              {['CRITICAL', 'SUSPICIOUS', 'ACT', 'MONITOR', 'NOT_CRITICAL', 'IGNORE', 'INSUFFICIENT_DATA'].map(v => {
+                const n = insights.filter(i => i.verdict === v).length;
+                return <option key={v} value={v}>{v.replace(/_/g, ' ')} ({n})</option>;
+              })}
+            </select>
+
+            <select
+              value={minConfidence}
+              onChange={(e) => setMinConfidence(Number(e.target.value))}
+              title="Minimum model confidence"
+              style={{
+                backgroundColor: 'var(--card-bg)',
+                border: '1px solid var(--border-color)',
+                borderRadius: '12px',
+                padding: '14px 18px',
+                color: 'var(--text-primary)',
+                fontSize: '0.875rem',
+                outline: 'none',
+                cursor: 'pointer',
+              }}
+            >
+              <option value={0}>Any confidence</option>
+              <option value={0.5}>conf ≥ 0.50</option>
+              <option value={0.8}>conf ≥ 0.80</option>
+              <option value={0.9}>conf ≥ 0.90</option>
+            </select>
           </div>
+
+          {/* A filter that silently drops rows it cannot evaluate would let
+              "no CRITICAL findings" stand in for "no verdict recorded". */}
+          {(verdictFilter !== 'all' || minConfidence > 0) && legacyRows > 0 && (
+            <p style={{ fontSize: '0.75rem', color: 'var(--accent-warning)', marginBottom: '12px', paddingLeft: '4px' }}>
+              {legacyRows} older insight{legacyRows === 1 ? '' : 's'} carry no verdict column and
+              are not included in this filter.
+            </p>
+          )}
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
             {loading ? (

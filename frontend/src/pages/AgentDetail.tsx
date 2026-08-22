@@ -1274,6 +1274,60 @@ function parseInsight(raw: string): ParsedInsight {
   return r;
 }
 
+/** Schema defaults that mean "absent" — they should not become chips. */
+const isPlaceholder = (v?: string) =>
+  !v || ['none', 'null', 'n/a', ''].includes(v.trim().toLowerCase());
+
+/**
+ * Fields for one insight, preferring the real columns over the rendered line.
+ *
+ * `verdict` / `severity` / `confidence` are columns now, and `payload` holds
+ * the whole validated verdict. Reading those is both cheaper and correct:
+ * parseInsight is reconstructing fields out of a string that was *derived*
+ * from them, so anything the renderer dropped — a MONITOR action, a `none`
+ * indicator — was unrecoverable, and a summary containing "conf=" or "-> "
+ * could confuse the regexes outright.
+ *
+ * Rows written before those columns existed have nothing else to read, so
+ * they keep the string path. That is why parseInsight stays.
+ */
+function insightFields(insight: any): ParsedInsight {
+  const parsed = parseInsight(insight?.critical_summary || '');
+  if (insight?.verdict == null) return parsed;
+
+  let payload: any = {};
+  try {
+    if (insight.payload) {
+      payload = typeof insight.payload === 'string'
+        ? JSON.parse(insight.payload)
+        : insight.payload;
+    }
+  } catch {
+    payload = {};   // malformed payload falls back to the parsed line below
+  }
+
+  const pick = (fromPayload: any, fromString: string) =>
+    isPlaceholder(fromPayload) ? fromString : String(fromPayload);
+
+  return {
+    ...parsed,
+    verdict: insight.verdict || parsed.verdict,
+    severity: insight.severity || parsed.severity,
+    confidence: insight.confidence != null ? Number(insight.confidence) : parsed.confidence,
+    indicator: pick(payload.indicator ?? payload.kill_chain_stage, parsed.indicator),
+    summary: pick(payload.summary, '') || pick(payload.reason, parsed.summary),
+    reason: pick(payload.reason, parsed.reason),
+    action: pick(payload.recommended_action ?? payload.action, parsed.action),
+    target: pick(payload.target, parsed.target),
+    techniques: payload.techniques?.length ? payload.techniques : parsed.techniques,
+    iocs: payload.iocs?.length ? payload.iocs : parsed.iocs,
+    next_steps: payload.next_steps?.length ? payload.next_steps : parsed.next_steps,
+    // Dispatch state is not in the verdict — the worker decides it after the
+    // model has answered — so it still comes from source_file.
+    auto_dispatched: insight.source_file === 'AI_DEFENSIVE_AUTO' || parsed.auto_dispatched,
+  };
+}
+
 const SEVERITY_STYLE: Record<string, { color: string, bg: string }> = {
   CRITICAL: { color: '#ef4444', bg: 'rgba(239,68,68,0.10)' },
   HIGH:     { color: '#f97316', bg: 'rgba(249,115,22,0.10)' },
@@ -1344,7 +1398,8 @@ export const InsightCard: React.FC<{ insight: any }> = ({ insight }) => {
       setSourceLoading(false);
     }
   };
-  const p = parseInsight(insight.critical_summary || '');
+  // Columns first, rendered line only as the fallback for pre-column rows.
+  const p = insightFields(insight);
   const sevKey = (p.severity || '').toUpperCase();
   const sevStyle = SEVERITY_STYLE[sevKey] || SEVERITY_STYLE.INFO;
   const accent = p.auto_dispatched ? '#ef4444' : sevStyle.color;
