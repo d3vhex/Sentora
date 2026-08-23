@@ -109,6 +109,9 @@ from security import session as session_store
 from security import ssrf
 from core import config_validation
 from core import threat_feeds
+# Installer templating: pure string generation, extracted so app.py is not
+# also 420 lines of PowerShell. See core/installers.py.
+from core.installers import _render_linux_install, _render_windows_install
 
 # Cookies are only marked Secure when the platform is actually served over
 # TLS; a Secure cookie on a plain-http lab deployment is silently dropped by
@@ -1110,428 +1113,8 @@ async def agent_bootstrap(request):
     })
 
 
-def _render_linux_install(server_url: str, server_ip: str, token: str) -> str:
-    return f"""#!/usr/bin/env bash
-# Sentora Agent — Token-Based Installer
-set -euo pipefail
-
-if [ "$(id -u)" -ne 0 ]; then
-  echo "[!] Please run as root (use: curl ... | sudo bash)"
-  exit 1
-fi
-
-TOKEN="{token}"
-SERVER_URL="{server_url}"
-SERVER_IP="{server_ip}"
-INSTALL_DIR="/opt/sentora-agent"
-HOSTNAME_VAL="$(hostname)"
-OS_TYPE="linux"
-
-echo "[*] Sentora Agent Installer"
-echo "[*] Server : $SERVER_URL"
-echo "[*] Host   : $HOSTNAME_VAL"
-
-# Dependencies
-if ! command -v curl >/dev/null 2>&1; then
-  apt-get update -y && apt-get install -y curl
-fi
-if ! command -v unzip >/dev/null 2>&1; then
-  apt-get update -y && apt-get install -y unzip
-fi
-
-# Allow overriding token via --token (for local execution)
-for arg in "$@"; do
-  case "$arg" in
-    --token=*) TOKEN="${{arg#--token=}}" ;;
-  esac
-done
-if [ -z "$TOKEN" ]; then
-  echo "[!] Missing enrollment token"; exit 1
-fi
-
-echo "[*] Registering with server..."
-REG_RESP="$(curl -fsSL -X POST "$SERVER_URL/api/agents/register" \\
-  -H 'Content-Type: application/json' \\
-  -d "{{\\"token\\":\\"$TOKEN\\",\\"hostname\\":\\"$HOSTNAME_VAL\\",\\"os_type\\":\\"$OS_TYPE\\"}}")"
-
-AGENT_NAME="$(echo "$REG_RESP" | sed -n 's/.*"agent_name"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p')"
-AGENT_KEY="$(echo "$REG_RESP"  | sed -n 's/.*"agent_key"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p')"
-
-if [ -z "$AGENT_NAME" ] || [ -z "$AGENT_KEY" ]; then
-  echo "[!] Registration failed: $REG_RESP"
-  exit 1
-fi
-
-echo "[+] Enrolled as: $AGENT_NAME"
-
-mkdir -p "$INSTALL_DIR"
-cd "$INSTALL_DIR"
-
-echo "[*] Downloading agent binary..."
-curl -fsSL -H "X-Agent-Key: $AGENT_KEY" -o agent.zip "$SERVER_URL/api/agent/download/linux"
-unzip -q -o agent.zip
-chmod +x main 2>/dev/null || true
-
-# Write identity config
-umask 077
-cat > "$INSTALL_DIR/config.json" <<EOF
-{{
-  "agent_name": "$AGENT_NAME",
-  "agent_key":  "$AGENT_KEY",
-  "server_url": "$SERVER_URL",
-  "server_ip":  "$SERVER_IP"
-}}
-EOF
-chmod 600 "$INSTALL_DIR/config.json"
-
-SERVICE_FILE="/etc/systemd/system/sentora-agent.service"
-cat > "$SERVICE_FILE" <<EOF
-[Unit]
-Description=Sentora Agent
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=$INSTALL_DIR
-ExecStart=$INSTALL_DIR/main --config $INSTALL_DIR/config.json
-Restart=on-failure
-RestartSec=5
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable sentora-agent
-systemctl restart sentora-agent
-
-rm -f agent.zip
-echo "[+] Sentora Agent installed and running as: $AGENT_NAME"
-"""
 
 
-def _render_windows_install(server_url: str, server_ip: str, token: str) -> str:
-    return f"""# Sentora Agent - Token-Based Installer (Windows)
-& {{
-    $ErrorActionPreference = "Stop"
-    $Token     = "{token}"
-    $ServerUrl = "{server_url}"
-    $ServerIp  = "{server_ip}"
-    $InstallDir = "C:\\Program Files\\Sentora-Agent"
-    $Hostname  = $env:COMPUTERNAME
-    $OsType    = "windows"
-    # Set $env:SENTORA_REENROLL=1 before running to discard the existing
-    # identity and take a new one. Only needed when the agent's key has been
-    # revoked; a plain upgrade keeps the identity it already has.
-    #
-    # Compared against explicit values, not cast with [bool]: in PowerShell
-    # any non-empty string is true, so [bool]"0" is $true and setting the
-    # variable to 0 to mean "no" would have forced a re-enrolment.
-    $ReEnroll  = ($env:SENTORA_REENROLL -in @("1", "true", "yes", "on"))
-    $LogPath   = Join-Path $env:TEMP "sentora-install.log"
-    Start-Transcript -Path $LogPath -Force | Out-Null
-
-    try {{
-        Write-Host "[*] Sentora Agent Installer" -ForegroundColor Cyan
-        Write-Host "[*] Server : $ServerUrl"
-        Write-Host "[*] Host   : $Hostname"
-        Write-Host "[*] Log    : $LogPath"
-
-        # Elevation: if not admin, relaunch the one-liner in an elevated window
-        $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-        if (-not $isAdmin) {{
-            Write-Host "[!] Not elevated. Relaunching in an Administrator window..." -ForegroundColor Yellow
-            $url = "$ServerUrl/api/agent/deploy/windows?token=$Token"
-            $cmd = "iwr -useb '$url' | iex; Read-Host 'Press Enter to close'"
-            try {{
-                Start-Process -FilePath "powershell.exe" `
-                    -ArgumentList "-NoProfile","-ExecutionPolicy","Bypass","-NoExit","-Command",$cmd `
-                    -Verb RunAs | Out-Null
-                Write-Host "[*] A new elevated window has opened. Follow installation there." -ForegroundColor Green
-            }} catch {{
-                Write-Host "[!] Could not auto-elevate: $($_.Exception.Message)" -ForegroundColor Red
-                Write-Host "    Please open PowerShell as Administrator and run the one-liner again." -ForegroundColor Yellow
-            }}
-            return
-        }}
-
-        # An upgrade is not an enrolment. This used to call /register
-        # unconditionally, and the server allocates a fresh name whenever the
-        # requested one is taken - so re-running this one-liner on a machine
-        # that already had an agent produced DESKTOP-X-2, then -3, then -4.
-        # One physical host ended up as four "agents": telemetry split across
-        # four databases, the fleet view counting it four times, and
-        # deduplication running separately in each.
-        #
-        # If this machine already holds credentials, keep them. Enrolment is
-        # for machines that have none.
-        $AgentName = $null
-        $AgentKey  = $null
-        $ExistingConfig = Join-Path $InstallDir "config.json"
-        if ((Test-Path $ExistingConfig) -and -not $ReEnroll) {{
-            try {{
-                $Prev = Get-Content $ExistingConfig -Raw -Encoding UTF8 | ConvertFrom-Json
-                if ($Prev.agent_name -and $Prev.agent_key) {{
-                    $AgentName = $Prev.agent_name
-                    $AgentKey  = $Prev.agent_key
-                    Write-Host "[+] Upgrading existing agent: $AgentName" -ForegroundColor Green
-                    Write-Host "    Identity kept. Set SENTORA_REENROLL=1 to force a new one." -ForegroundColor DarkGray
-
-                    # Close out the token anyway. Skipping the call left it
-                    # unused forever, so the Deploy page kept reporting
-                    # "waiting" after a deployment that had already succeeded.
-                    # The server verifies the key before accepting this.
-                    $UpBody = @{{ token = $Token; agent_name = $AgentName; agent_key = $AgentKey; hostname = $Hostname; os_type = $OsType }} | ConvertTo-Json -Compress
-                    try {{
-                        Invoke-RestMethod -Method Post -Uri "$ServerUrl/api/agents/register" -ContentType "application/json" -Body $UpBody | Out-Null
-                    }} catch {{
-                        # Not fatal: the agent already holds working credentials.
-                        Write-Host "    (could not mark the enrolment token used: $($_.Exception.Message))" -ForegroundColor DarkGray
-                    }}
-                }}
-            }} catch {{
-                Write-Host "[!] Existing config.json is unreadable, enrolling fresh." -ForegroundColor Yellow
-            }}
-        }}
-
-        if (-not $AgentName) {{
-            Write-Host "[*] Registering with server..." -ForegroundColor Cyan
-            $RegBody = @{{ token = $Token; hostname = $Hostname; os_type = $OsType }} | ConvertTo-Json -Compress
-            try {{
-                $Reg = Invoke-RestMethod -Method Post -Uri "$ServerUrl/api/agents/register" -ContentType "application/json" -Body $RegBody
-            }} catch {{
-                Write-Host "[!] Registration call failed: $($_.Exception.Message)" -ForegroundColor Red
-                return
-            }}
-
-            if (-not $Reg.agent_name -or -not $Reg.agent_key) {{
-                Write-Host "[!] Registration response missing identity: $($Reg | ConvertTo-Json -Compress)" -ForegroundColor Red
-                return
-            }}
-
-            $AgentName = $Reg.agent_name
-            $AgentKey  = $Reg.agent_key
-            Write-Host "[+] Enrolled as: $AgentName" -ForegroundColor Green
-        }}
-
-        if (!(Test-Path $InstallDir)) {{ New-Item -ItemType Directory -Path $InstallDir | Out-Null }}
-        Set-Location $InstallDir
-
-        Write-Host "[*] Downloading agent binary..." -ForegroundColor Cyan
-        try {{
-            Invoke-WebRequest -Uri "$ServerUrl/api/agent/download/windows" `
-                -Headers @{{ "X-Agent-Key" = $AgentKey }} -OutFile "agent.zip" -UseBasicParsing
-        }} catch {{
-            $srv = ""
-            try {{ $srv = (New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())).ReadToEnd() }} catch {{}}
-            Write-Host "[!] Binary download failed: $($_.Exception.Message)" -ForegroundColor Red
-            if ($srv) {{ Write-Host "    Server said: $srv" -ForegroundColor Yellow }}
-            return
-        }}
-
-        # Stop any previously installed agent BEFORE extracting, otherwise the
-        # running main.exe locks itself and Expand-Archive blows up with
-        # UnauthorizedAccessException. This is the upgrade-in-place path.
-        $existingExe = Join-Path $InstallDir "main.exe"
-        if (Test-Path $existingExe) {{
-            Write-Host "[*] Stopping previous agent to release main.exe..." -ForegroundColor Cyan
-            try {{
-                $prevTask = Get-ScheduledTask -TaskName "SentoraAgent" -ErrorAction SilentlyContinue
-                if ($prevTask) {{
-                    Stop-ScheduledTask -TaskName "SentoraAgent" -ErrorAction SilentlyContinue
-                    Unregister-ScheduledTask -TaskName "SentoraAgent" -Confirm:$false -ErrorAction SilentlyContinue
-                }}
-            }} catch {{}}
-            try {{
-                Get-Process -Name "main" -ErrorAction SilentlyContinue | Where-Object {{
-                    try {{ $_.Path -eq $existingExe }} catch {{ $false }}
-                }} | Stop-Process -Force -ErrorAction SilentlyContinue
-            }} catch {{}}
-
-            # Wait until the file is no longer locked. Up to 10s — Windows
-            # releases the handle a beat after the process exits.
-            for ($i = 0; $i -lt 20; $i++) {{
-                try {{
-                    $fs = [System.IO.File]::Open($existingExe, 'Open', 'ReadWrite', 'None')
-                    $fs.Close()
-                    break
-                }} catch {{
-                    Start-Sleep -Milliseconds 500
-                }}
-            }}
-        }}
-
-        try {{
-            Expand-Archive -Path "agent.zip" -DestinationPath "." -Force
-        }} catch {{
-            Write-Host "[!] Failed to extract agent.zip: $($_.Exception.Message)" -ForegroundColor Red
-            Write-Host "    The previous agent may still be locking main.exe." -ForegroundColor Yellow
-            Write-Host "    Manually stop it and retry: Stop-ScheduledTask -TaskName SentoraAgent; Get-Process main | Stop-Process -Force" -ForegroundColor Yellow
-            return
-        }}
-
-        if (-not (Test-Path (Join-Path $InstallDir "main.exe"))) {{
-            Write-Host "[!] main.exe missing after extraction. Server did not ship a binary." -ForegroundColor Red
-            return
-        }}
-
-        $Config = @{{
-            agent_name      = $AgentName
-            agent_key       = $AgentKey
-            server_url      = $ServerUrl
-            server_ip       = $ServerIp
-            ingest_port     = 5001
-        }} | ConvertTo-Json -Depth 3
-        $ConfigPath = Join-Path $InstallDir "config.json"
-        # PS5.1 `Set-Content -Encoding UTF8` writes a BOM which Python's
-        # json.load rejects with "Unexpected UTF-8 BOM". Use .NET to write
-        # BOM-less UTF-8.
-        [System.IO.File]::WriteAllText($ConfigPath, $Config, (New-Object System.Text.UTF8Encoding $false))
-
-        # Bootstrap the agent's local postgres. Sentora/docker-compose.yml is
-        # shipped inside the zip and defines the `sentora-db-agent` container
-        # on localhost:5432 — modules/db.py hard-connects to that. Without it
-        # every insert_record/fetch_unsent raises "connection refused".
-        $composePath = Join-Path $InstallDir "docker-compose.yml"
-        if (Test-Path $composePath) {{
-            if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {{
-                Write-Host "[!] Docker not found on PATH. Install Docker Desktop and retry." -ForegroundColor Red
-                Write-Host "    The agent needs a local postgres (sentora-db-agent) to store its state." -ForegroundColor Yellow
-                return
-            }}
-            Write-Host "[*] Starting local agent database (postgres on :5432)..." -ForegroundColor Cyan
-            # NOTE: do NOT redirect stderr with 2>&1. PowerShell 5.1 + Stop
-            # action turns every native-cmd stderr line into a NativeCommandError
-            # — and `docker compose` writes progress ("Network ... Creating",
-            # "Container ... Started") to stderr. We check $LASTEXITCODE instead.
-            Push-Location $InstallDir
-            $prevEA = $ErrorActionPreference
-            $ErrorActionPreference = "Continue"
-            & docker compose up -d
-            $composeExit = $LASTEXITCODE
-            $ErrorActionPreference = $prevEA
-            Pop-Location
-            if ($composeExit -ne 0) {{
-                Write-Host "[!] docker compose up failed (exit $composeExit)." -ForegroundColor Red
-                Write-Host "    Run manually: cd `"$InstallDir`" ; docker compose up -d" -ForegroundColor Yellow
-                return
-            }}
-
-            Write-Host "[*] Waiting for postgres on localhost:5432..." -ForegroundColor Cyan
-            $dbReady = $false
-            for ($i = 0; $i -lt 30; $i++) {{
-                if (Test-NetConnection -ComputerName localhost -Port 5432 -InformationLevel Quiet -WarningAction SilentlyContinue) {{
-                    $dbReady = $true
-                    break
-                }}
-                Start-Sleep -Seconds 2
-            }}
-            if (-not $dbReady) {{
-                Write-Host "[!] Postgres did not become reachable within 60s." -ForegroundColor Red
-                Write-Host "    Check: docker logs sentora-db-agent" -ForegroundColor Yellow
-                return
-            }}
-            Write-Host "[+] Agent database ready (sentora-db-agent)." -ForegroundColor Green
-        }} else {{
-            Write-Host "[!] docker-compose.yml missing in $InstallDir — agent will crash on DB connect." -ForegroundColor Red
-            return
-        }}
-
-        # Persistence via Scheduled Task (SYSTEM, AtStartup). main.py is a plain
-        # console app — it does not implement the Windows Service Control
-        # Protocol, so sc.exe create + Start-Service silently fails. Scheduled
-        # Task runs the binary as SYSTEM at every boot and we kick it off now.
-        $taskName = "SentoraAgent"
-        $exePath  = Join-Path $InstallDir "main.exe"
-        $workDir  = $InstallDir
-
-        # Remove legacy sc.exe service if it exists from a previous install
-        $legacy = Get-Service -Name $taskName -ErrorAction SilentlyContinue
-        if ($legacy) {{
-            Stop-Service -Name $taskName -Force -ErrorAction SilentlyContinue
-            & sc.exe delete $taskName | Out-Null
-        }}
-
-        # Remove previous scheduled task (if any) so we can re-register cleanly
-        $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-        if ($existingTask) {{
-            try {{ Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue }} catch {{}}
-            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-        }}
-
-        try {{
-            $action    = New-ScheduledTaskAction -Execute $exePath -Argument "--config `"$ConfigPath`"" -WorkingDirectory $workDir
-
-            # Two triggers. AtStartup is the normal path. The repeating one is
-            # a watchdog: if the agent is ever not running -- crash, manual
-            # stop, a failed upgrade -- the next tick starts it again. Without
-            # it, a single unhandled exit left the endpoint blind until
-            # somebody noticed, which is the worst failure mode a sensor has.
-            #
-            # MultipleInstances=IgnoreNew below makes the watchdog a no-op
-            # while the agent is already up, so this costs nothing when
-            # everything is fine.
-            $bootTrigger  = New-ScheduledTaskTrigger -AtStartup
-            $watchTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
-                                -RepetitionInterval (New-TimeSpan -Minutes 15)
-            $triggers = @($bootTrigger, $watchTrigger)
-
-            $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-
-            # RestartCount is deliberately generous: the agent now retries its
-            # own server bootstrap internally, so a restart here means the
-            # process actually died, and a sensor that gives up after three
-            # tries is a sensor you cannot rely on.
-            $settings = New-ScheduledTaskSettingsSet `
-                            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                            -StartWhenAvailable `
-                            -ExecutionTimeLimit ([TimeSpan]::Zero) `
-                            -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1) `
-                            -MultipleInstances IgnoreNew
-
-            Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $triggers -Principal $principal -Settings $settings -Force | Out-Null
-        }} catch {{
-            Write-Host "[!] Failed to register scheduled task: $($_.Exception.Message)" -ForegroundColor Red
-            return
-        }}
-
-        # Kill any stale main.exe before starting
-        Get-Process -Name "main" -ErrorAction SilentlyContinue | Where-Object {{
-            try {{ $_.Path -eq $exePath }} catch {{ $false }}
-        }} | Stop-Process -Force -ErrorAction SilentlyContinue
-
-        try {{
-            Start-ScheduledTask -TaskName $taskName
-            Start-Sleep -Seconds 3
-        }} catch {{
-            Write-Host "[!] Failed to start scheduled task: $($_.Exception.Message)" -ForegroundColor Red
-            return
-        }}
-
-        # Verify the agent process is actually running
-        $proc = Get-Process -Name "main" -ErrorAction SilentlyContinue | Where-Object {{
-            try {{ $_.Path -eq $exePath }} catch {{ $false }}
-        }} | Select-Object -First 1
-        if (-not $proc) {{
-            Write-Host "[!] Agent process did not start. Check $InstallDir\\agent.log" -ForegroundColor Red
-            Write-Host "    You can also inspect: Get-ScheduledTaskInfo -TaskName $taskName" -ForegroundColor Yellow
-            return
-        }}
-
-        Remove-Item -Path "agent.zip" -Force -ErrorAction SilentlyContinue
-        Write-Host "[+] Sentora Agent installed and running as: $AgentName" -ForegroundColor Green
-        Write-Host "    Task   : $taskName (PID $($proc.Id))"
-        Write-Host "    Config : $ConfigPath"
-        Write-Host "    Log    : $InstallDir\\agent.log"
-    }} catch {{
-        Write-Host "[!] Unexpected error: $($_.Exception.Message)" -ForegroundColor Red
-        Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray
-    }} finally {{
-        Stop-Transcript | Out-Null
-    }}
-}}
-"""
 
 
 @app.get("/api/agent/deploy/linux")
@@ -2454,6 +2037,9 @@ import collections
 
 _POOL_MAXSIZE      = 10
 _POOL_IDLE_SEC     = 60
+# Shorter than Sanic's response timeout, so an exhausted pool surfaces as its
+# own error rather than as a generic request timeout.
+_POOL_ACQUIRE_TIMEOUT = float(os.getenv("DB_POOL_ACQUIRE_TIMEOUT", "5"))
 
 
 class _PooledConn:
@@ -2495,7 +2081,23 @@ class _AsyncMySQLPool:
         self._max_idle_sec = max_idle_sec
 
     async def acquire(self):
-        await self._sem.acquire()
+        # Bounded. An unbounded `await self._sem.acquire()` turns a leaked
+        # connection into a hang: once ten handlers had failed to release,
+        # every subsequent request waited forever and Sanic returned 500 at
+        # its own response timeout, ten seconds later, with a message that
+        # said nothing about the pool. Agents polling `automations/pending`
+        # then saw nothing but 500s.
+        #
+        # Failing fast does not fix the leak, but it names it.
+        try:
+            await asyncio.wait_for(self._sem.acquire(), timeout=_POOL_ACQUIRE_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"No database connection available after "
+                f"{_POOL_ACQUIRE_TIMEOUT}s (pool size {_POOL_MAXSIZE}, "
+                f"{len(self._idle)} idle). A handler is acquiring connections "
+                f"without releasing them on its error path."
+            ) from None
         try:
             now = time.time()
             async with self._lock:
@@ -6067,22 +5669,28 @@ async def get_pending_automations_for_agent(request, agent):
     table hasn't been created yet (the schema is provisioned lazily). Without
     this, agents log a flood of `fetch_pending_tasks failed ... 500 ...`.
     """
+    # `async with` rather than a close on the happy path. This endpoint is
+    # polled by every agent every few seconds, so it was the fastest way to
+    # drain the connection pool: any error between acquiring the connection
+    # and the explicit close leaked it permanently, and once ten had leaked
+    # every request in the server waited on an empty pool.
     try:
-        cnx = await connect_db_for_agent(agent)
-        cur = await cnx.cursor(dictionary=True)
-        try:
-            await cur.execute(
-                "SELECT id as task_id, action as type, target as target, comment as params_comment FROM automations "
-                "WHERE status='pending' AND `timestamp` <= NOW()"
-            )
-        except Exception as qerr:
-            err_str = str(qerr)
-            if "1146" in err_str or "doesn't exist" in err_str.lower():
-                await cur.close(); await cnx.close()
-                return sanic_json({"status": "success", "tasks": []})
-            raise
-        rows = await cur.fetchall()
-        await cur.close(); await cnx.close()
+        async with agent_conn(agent) as cnx:
+            cur = await cnx.cursor(dictionary=True)
+            try:
+                try:
+                    await cur.execute(
+                        "SELECT id as task_id, action as type, target as target, comment as params_comment FROM automations "
+                        "WHERE status='pending' AND `timestamp` <= NOW()"
+                    )
+                except Exception as qerr:
+                    err_str = str(qerr)
+                    if "1146" in err_str or "doesn't exist" in err_str.lower():
+                        return sanic_json({"status": "success", "tasks": []})
+                    raise
+                rows = await cur.fetchall()
+            finally:
+                await _close_async_quiet(cur)
 
         def _params_for(action: str, target_raw):
             params: dict = {"target": target_raw}
@@ -6137,13 +5745,16 @@ async def report_automation_result_by_id(request, task_id):
         return sanic_json({"status": "error", "message": "agent name required"}, status=400)
 
     try:
-        cnx = await connect_db_for_agent(agent)
-        cur = await cnx.cursor()
-        await cur.execute(
-            "UPDATE automations SET status=%s, comment=CONCAT(comment, %s), updated_at=NOW() WHERE id=%s",
-            (status, f" | Agent Report: {output}"[:200], task_id)
-        )
-        await cnx.commit(); await cur.close(); await cnx.close()
+        async with agent_conn(agent) as cnx:
+            cur = await cnx.cursor()
+            try:
+                await cur.execute(
+                    "UPDATE automations SET status=%s, comment=CONCAT(comment, %s), updated_at=NOW() WHERE id=%s",
+                    (status, f" | Agent Report: {output}"[:200], task_id)
+                )
+                await cnx.commit()
+            finally:
+                await _close_async_quiet(cur)
         return sanic_json({"status": "success"})
     except Exception as e:
         return sanic_json({"status": "error", "message": str(e)}, status=500)
@@ -6446,7 +6057,9 @@ async def _run_due_automations_logic(agent):
                 await cur.close()
 
 @app.before_server_start
-async def setup_background_tasks(app, _):
+async def setup_background_tasks(app):
+    # Single argument: Sanic deprecated the `loop` parameter on listeners and
+    # removes it in v26.6. Nothing here used it.
     worker_name = os.environ.get("SANIC_WORKER_NAME", "")
     if "0-0" in worker_name or not worker_name:
         print(f"[*] Starting background tasks in worker: {worker_name or 'single'}")
@@ -8910,6 +8523,106 @@ async def drop_database(request, db_name):
         return sanic_json({"status": "error", "message": str(e)}, status=500)
 
 
+def _agent_name_forms(agent: str) -> tuple[str, str, set]:
+    """Every spelling of one agent, because the platform uses two.
+
+    `agent_identities.agent_name` stores `DESKTOP-EVS8H9J-4` while the
+    database is `DESKTOP_EVS8H9J_4_db`. Deleting by one spelling leaves the
+    other behind, which is how a "deleted" agent keeps appearing in the fleet
+    view with its telemetry still on disk.
+
+    Returns (hyphen form, underscore form, candidate database names).
+    """
+    safe = re.sub(r"[^A-Za-z0-9_-]", "", str(agent or "")).strip("-_")
+    hyphen = safe.replace("_", "-")
+    underscore = safe.replace("-", "_")
+    dbs = set()
+    for form in (safe, hyphen, underscore):
+        if not form:
+            continue
+        base = form[:-3] if form.endswith("_db") else form
+        dbs.add(f"{base}_db")
+    return hyphen, underscore, dbs
+
+
+@require_permission("manage_agent")
+@app.route("/api/agents/<agent>", methods=["DELETE"])
+async def delete_agent(request, agent):
+    """Remove an agent: its telemetry database and its enrolment identity.
+
+    Three agent databases were left behind by the installer minting a new
+    identity on every re-run, and nothing in the platform could remove them.
+    The fleet view counted one host four times and there was no way to say so.
+
+    Irreversible, so it requires the agent name repeated in the body. That is
+    not ceremony: the destructive half is `DROP DATABASE`, and the operator
+    picking the wrong row in a list of near-identical names
+    (`DESKTOP-EVS8H9J`, `-2`, `-3`, `-4`) is the realistic mistake.
+
+    `enrollment_tokens` rows are kept. They record who enrolled what and when,
+    which is audit history that outlives the agent; only `used_by_agent` is
+    left pointing at a name that no longer exists, which is accurate.
+    """
+    hyphen, underscore, db_candidates = _agent_name_forms(agent)
+    if not hyphen:
+        return sanic_json({"status": "error", "message": "Invalid agent name"},
+                          status=400)
+
+    body = request.json or {}
+    if str(body.get("confirm", "")).strip() not in (hyphen, underscore, str(agent)):
+        return sanic_json({
+            "status": "error",
+            "message": "Send {\"confirm\": \"<agent name>\"} to delete. "
+                       "This drops the agent's telemetry database and cannot "
+                       "be undone.",
+        }, status=400)
+
+    def _purge():
+        dropped, identities = [], 0
+        with sync_mysql_conn() as conn:
+            cursor = conn.cursor()
+            try:
+                for name in sorted(db_candidates):
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM information_schema.schemata "
+                        "WHERE schema_name = %s", (name,))
+                    if cursor.fetchone()[0]:
+                        # Identifier, so it cannot be parameterised. The name
+                        # came through _agent_name_forms, which strips
+                        # everything outside [A-Za-z0-9_-].
+                        cursor.execute(f"DROP DATABASE `{name}`")
+                        dropped.append(name)
+                cursor.execute(
+                    "DELETE FROM userdb.agent_identities WHERE agent_name IN (%s, %s)",
+                    (hyphen, underscore))
+                identities = cursor.rowcount
+                conn.commit()
+            finally:
+                cursor.close()
+        return dropped, identities
+
+    try:
+        dropped, identities = await asyncio.to_thread(_purge)
+    except Exception as e:
+        print(f"[!] delete_agent {agent} failed: {e}", flush=True)
+        return sanic_json({"status": "error", "message": str(e)}, status=500)
+
+    await audit_log(request, "DELETE_AGENT", hyphen,
+                    f"databases={dropped or 'none'} identities={identities}")
+
+    if not dropped and not identities:
+        return sanic_json({
+            "status": "error",
+            "message": f"No agent named {hyphen} found.",
+        }, status=404)
+
+    return sanic_json({
+        "status": "success",
+        "agent": hyphen,
+        "databases_dropped": dropped,
+        "identities_removed": identities,
+    })
+
 
 @app.websocket("/vnc-proxy/<agent>")
 @require_permission("read_telemetry")
@@ -9028,6 +8741,27 @@ if __name__ == "__main__":
     ssl_config = None
     if tls_enabled:
         try:
+            if not (os.path.exists(cert_path) and os.path.exists(key_path)):
+                # Generate rather than ship. A private key committed to the
+                # repository gives every deployment the same TLS identity, and
+                # publishes it - anyone with a clone can impersonate the
+                # server. Each install now mints its own on first boot, and
+                # the key never leaves the machine that made it.
+                #
+                # Only when the operator has not pointed TLS_CERT/TLS_KEY at a
+                # real certificate. If they have and it is missing, that is a
+                # deployment mistake and inventing a self-signed replacement
+                # would hide it.
+                default_cert = os.path.join("certs", "server.crt")
+                default_key = os.path.join("certs", "server.key")
+                if (cert_path, key_path) == (default_cert, default_key):
+                    from certs.generate_certs import ensure_certs
+                    generated = ensure_certs(cn=os.getenv("TLS_CN", "localhost"))
+                    cert_path, key_path = generated["crt"], generated["key"]
+                else:
+                    print(f"[!] TLS_CERT/TLS_KEY point at {cert_path} / {key_path}, "
+                          f"which do not exist. Not generating a substitute.")
+
             if os.path.exists(cert_path) and os.path.exists(key_path):
                 ssl_config = {"cert": cert_path, "key": key_path}
                 print(f"[i] TLS enabled with cert={cert_path} key={key_path}")

@@ -5,7 +5,9 @@ import {
   Filter,
   Clock,
   RefreshCw,
-  ChevronRight
+  ChevronRight,
+  Trash2,
+  AlertTriangle
 } from 'lucide-react';
 import { agentService } from '../services/api';
 import { Link } from 'react-router-dom';
@@ -14,6 +16,11 @@ const Agents: React.FC = () => {
   const [agents, setAgents] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
+  // The agent awaiting confirmation. Deleting drops its telemetry database,
+  // so the destructive click is never the first one.
+  const [pendingDelete, setPendingDelete] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   useEffect(() => {
     fetchAgents(true);
@@ -32,6 +39,23 @@ const Agents: React.FC = () => {
       console.error("Failed to fetch agents", err);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const confirmDelete = async () => {
+    if (!pendingDelete) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await agentService.deleteAgent(pendingDelete);
+      setPendingDelete(null);
+      await fetchAgents(false);
+    } catch (err: any) {
+      // Shown rather than swallowed: a failed delete that closes the dialog
+      // looks exactly like a successful one until the row reappears.
+      setDeleteError(err?.response?.data?.message || err?.message || 'Delete failed');
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -127,9 +151,21 @@ const Agents: React.FC = () => {
                       </div>
                     </td>
                     <td style={{ padding: '16px 20px', textAlign: 'right' }}>
-                      <Link to={`/agent/${agent.name}`} style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: 'var(--accent-secondary)', fontWeight: 600, fontSize: '0.8125rem' }}>
-                        Manage <ChevronRight size={14} />
-                      </Link>
+                      <div style={{ display: 'inline-flex', alignItems: 'center', gap: '16px' }}>
+                        <Link to={`/agent/${agent.name}`} style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', color: 'var(--accent-secondary)', fontWeight: 600, fontSize: '0.8125rem' }}>
+                          Manage <ChevronRight size={14} />
+                        </Link>
+                        <button
+                          title={`Delete ${agent.name} and its telemetry`}
+                          aria-label={`Delete ${agent.name}`}
+                          onClick={() => { setDeleteError(null); setPendingDelete(agent.name); }}
+                          style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)', display: 'inline-flex', padding: '4px' }}
+                          onMouseOver={e => e.currentTarget.style.color = 'var(--accent-color)'}
+                          onMouseOut={e => e.currentTarget.style.color = 'var(--text-secondary)'}
+                        >
+                          <Trash2 size={16} />
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 );
@@ -138,6 +174,60 @@ const Agents: React.FC = () => {
           </table>
         </div>
       </div>
+
+      {pendingDelete && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="delete-agent-title"
+          onClick={() => !deleting && setPendingDelete(null)}
+          style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: '20px' }}
+        >
+          <div className="card" onClick={e => e.stopPropagation()} style={{ maxWidth: '480px', width: '100%', padding: '24px' }}>
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: '14px', marginBottom: '16px' }}>
+              <AlertTriangle size={22} color="var(--accent-color)" style={{ flexShrink: 0, marginTop: '2px' }} />
+              <div>
+                <h3 id="delete-agent-title" style={{ fontSize: '1.125rem', fontWeight: 700, marginBottom: '8px' }}>
+                  Delete {pendingDelete}?
+                </h3>
+                <p style={{ color: 'var(--text-secondary)', fontSize: '0.875rem', lineHeight: 1.6 }}>
+                  This drops the agent's telemetry database and removes its
+                  enrolment identity. Every event, alert and AI verdict it
+                  produced is deleted. This cannot be undone.
+                </p>
+                <p style={{ color: 'var(--text-secondary)', fontSize: '0.8125rem', lineHeight: 1.6, marginTop: '10px' }}>
+                  A running agent will re-enrol under a new name. Uninstall it
+                  first, or use Self-Destruct from its detail page.
+                </p>
+              </div>
+            </div>
+
+            {deleteError && (
+              <div style={{ padding: '10px 12px', borderRadius: '4px', border: '1px solid var(--accent-color)', color: 'var(--accent-color)', fontSize: '0.8125rem', marginBottom: '16px' }}>
+                {deleteError}
+              </div>
+            )}
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '12px' }}>
+              <button
+                className="btn-secondary"
+                disabled={deleting}
+                onClick={() => setPendingDelete(null)}
+                style={{ padding: '8px 16px', borderRadius: '6px', cursor: deleting ? 'not-allowed' : 'pointer' }}
+              >
+                Cancel
+              </button>
+              <button
+                disabled={deleting}
+                onClick={confirmDelete}
+                style={{ padding: '8px 16px', borderRadius: '6px', border: 'none', backgroundColor: 'var(--accent-color)', color: 'white', fontWeight: 600, cursor: deleting ? 'not-allowed' : 'pointer', opacity: deleting ? 0.7 : 1 }}
+              >
+                {deleting ? 'Deleting...' : 'Delete permanently'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

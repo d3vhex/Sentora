@@ -1128,8 +1128,12 @@ class SOARAutomation:
         return actions_taken
 
     def process_events(self) -> Dict[str, int]:
-        self.logger.info("=" * 60)
-        self.logger.info("Starting SOAR event processing cycle")
+        # This cycle runs every ~30s and used to emit four lines plus two
+        # 60-character rules every time, whether or not anything happened:
+        # about 7400 lines in thirteen hours saying "nothing happened". The
+        # summary at the end now carries the same information, and only when
+        # there is some.
+        self.logger.debug("Starting SOAR event processing cycle")
 
         stats = {
             'expired_resolved': 0,
@@ -1151,7 +1155,9 @@ class SOARAutomation:
             self.logger.info("No events to process")
             return stats
 
-        self.logger.info(f"Retrieved {len(events)} events for processing")
+        # debug: one line per cycle saying "Retrieved 0 events" 1487 times
+        # in thirteen hours is not information.
+        self.logger.debug(f"Retrieved {len(events)} events for processing")
 
         for event in reversed(events):
             try:
@@ -1187,8 +1193,14 @@ class SOARAutomation:
                 self.logger.error(f"Error processing event {event.get('id', 'unknown')}: {exc}")
                 stats['errors'] += 1
 
-        self.logger.info(f"Processing complete: {stats['events_processed']} events, {stats['actions_taken']} actions, {stats['errors']} errors")
-        self.logger.info("=" * 60)
+        # Only when the cycle did something. An idle cycle is the normal case
+        # and saying so repeatedly buries the cycles that are not idle.
+        if stats['events_processed'] or stats['actions_taken'] or stats['errors']:
+            self.logger.info(
+                f"SOAR cycle: {stats['events_processed']} events, "
+                f"{stats['actions_taken']} actions, {stats['errors']} errors")
+        else:
+            self.logger.debug("SOAR cycle: idle")
 
         return stats
 

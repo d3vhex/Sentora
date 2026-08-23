@@ -104,6 +104,80 @@ def generate_server_cert(cn: str, days: int, ca_key, ca_cert):
     return key, cert
 
 
+def ensure_certs(outdir: str = None, cn: str = "localhost", days: int = 365,
+                 force: bool = False, log=print) -> dict:
+    """Create the CA and server certificate if they are not already there.
+
+    Returns the paths. Idempotent unless `force`.
+
+    This exists so nothing has to ship a private key. A working
+    `certs/server.key` used to be committed to the repository, which meant the
+    TLS identity of every deployment was the same file, published, and known
+    to anyone who had ever cloned it - a certificate that anyone can
+    impersonate is not protecting a connection, it is describing one.
+
+    Generating on first boot gives each deployment its own key, and the key
+    never exists anywhere except the machine that made it.
+
+    The CA is self-signed and the certificate is for local use. Browsers will
+    warn unless the CA is trusted explicitly; that is honest, and preferable
+    to a shared secret that produces no warning at all. Put a real
+    certificate in TLS_CERT/TLS_KEY for anything public.
+    """
+    outdir = outdir or os.path.dirname(os.path.abspath(__file__))
+    os.makedirs(outdir, exist_ok=True)
+
+    paths = {
+        "root_key": os.path.join(outdir, "rootCA.key"),
+        "root_crt": os.path.join(outdir, "rootCA.crt"),
+        "key": os.path.join(outdir, "server.key"),
+        "crt": os.path.join(outdir, "server.crt"),
+        "fullchain": os.path.join(outdir, "server-fullchain.crt"),
+    }
+
+    if not force and all(os.path.exists(p) for p in
+                         (paths["root_key"], paths["root_crt"], paths["key"], paths["crt"])):
+        return paths
+
+    log("[i] No TLS certificate found; generating a local one.")
+    ca_key, ca_cert = generate_root_ca(common_name="Sentora-Local-RootCA", days=days * 5)
+    write_pem(paths["root_key"], ca_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
+    write_pem(paths["root_crt"], ca_cert.public_bytes(serialization.Encoding.PEM))
+
+    srv_key, srv_cert = generate_server_cert(cn, days, ca_key, ca_cert)
+    write_pem(paths["key"], srv_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
+    write_pem(paths["crt"], srv_cert.public_bytes(serialization.Encoding.PEM))
+    write_pem(paths["fullchain"],
+              srv_cert.public_bytes(serialization.Encoding.PEM) + b"\n"
+              + ca_cert.public_bytes(serialization.Encoding.PEM))
+
+    _restrict(paths["root_key"])
+    _restrict(paths["key"])
+
+    log(f"[+] Generated {paths['crt']} (CN={cn}, {days} days)")
+    return paths
+
+
+def _restrict(path: str) -> None:
+    """Make a private key owner-readable where the platform supports it.
+
+    Best effort: on Windows the POSIX mode is largely cosmetic, and failing to
+    tighten permissions must not stop the server from starting.
+    """
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate a Root CA and a server certificate (beginner style)")
     parser.add_argument("--cn", default="localhost", help="Server certificate Common Name (default: localhost)")

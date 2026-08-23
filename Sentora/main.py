@@ -37,7 +37,21 @@ AGENT_LOG_PATH = os.path.join(AGENT_DIR, "agent.log")
 for h in logging.root.handlers[:]: logging.root.removeHandler(h)
 _log_fmt = logging.Formatter('%(asctime)s [%(levelname)s] [%(name)s] %(message)s')
 try:
-    fh = logging.FileHandler(AGENT_LOG_PATH, encoding="utf-8", mode="a")
+    # Rotating, not append-forever. A plain FileHandler in mode="a" took
+    # agent.log to 55 MB on an endpoint that had been running for a few weeks:
+    # about 5 MB a day, on a machine the agent is supposed to be unobtrusive
+    # on, and nothing ever reclaimed it.
+    #
+    # 5 MB x 3 caps the total at 20 MB including the live file. That is enough
+    # to cover roughly the last four days at the current rate, which is the
+    # window anyone actually reads back when diagnosing something.
+    from logging.handlers import RotatingFileHandler
+    fh = RotatingFileHandler(
+        AGENT_LOG_PATH,
+        maxBytes=int(os.getenv("AGENT_LOG_MAX_BYTES", str(5 * 1024 * 1024))),
+        backupCount=int(os.getenv("AGENT_LOG_BACKUPS", "3")),
+        encoding="utf-8",
+    )
     fh.setFormatter(_log_fmt)
     logging.root.addHandler(fh)
 except Exception as _log_err:
@@ -423,9 +437,54 @@ def get_public_ip() -> str:
 
     return ip or "127.0.0.1"
 
-def send_alert(source, severity, message, metadata=None):
+# How long an identical alert stays suppressed. The detectors that use
+# send_alert re-scan on a timer and re-report conditions that are still true,
+# so without this the same finding is written on every pass forever.
+ALERT_REPEAT_WINDOW_SEC = int(os.getenv("ALERT_REPEAT_WINDOW_SEC", "3600"))
+
+# fingerprint -> monotonic time it was last written
+_recent_alerts: dict = {}
+_recent_alerts_lock = threading.Lock()
+
+
+def _alert_recently_sent(fingerprint: str) -> bool:
+    """True if this exact alert was written inside the repeat window.
+
+    In memory rather than a database query: send_alert runs on several
+    detector threads and this is on their hot path. The cost of forgetting on
+    restart is one duplicate alert per finding, which is acceptable; the cost
+    of a query per alert is not.
+
+    The dict is pruned rather than left to grow, and pruning is what the
+    previous in-process dedup got wrong - it cleared the whole thing at 1000
+    entries, so deduplication stopped exactly when volume made it matter.
     """
-    Helper function to send alerts to the local DB for ingestion.
+    now = time.monotonic()
+    with _recent_alerts_lock:
+        seen = _recent_alerts.get(fingerprint)
+        if seen is not None and now - seen < ALERT_REPEAT_WINDOW_SEC:
+            return True
+        # Drop only what has actually expired.
+        if len(_recent_alerts) > 512:
+            for fp, ts in list(_recent_alerts.items()):
+                if now - ts >= ALERT_REPEAT_WINDOW_SEC:
+                    _recent_alerts.pop(fp, None)
+        _recent_alerts[fingerprint] = now
+        return False
+
+
+def send_alert(source, severity, message, metadata=None):
+    """Write an alert to the local DB for ingestion, at most once per window.
+
+    The detectors behind this report *state*, not events: `lateral_movement`
+    lists established connections on sensitive ports every 300s, so a normal
+    persistent loopback SMB connection produced an identical alert roughly 288
+    times a day, per agent. 370 of 430 stored alerts on one endpoint were
+    repeats of two findings.
+
+    Nothing downstream could absorb that either: the alerts are encrypted
+    before they reach the server, so the server's deduplication could not see
+    that they were identical.
     """
     try:
         rec = {
@@ -437,7 +496,16 @@ def send_alert(source, severity, message, metadata=None):
         }
         if metadata:
             rec["message"] += f" | {json.dumps(metadata)}"
-            
+
+        # Computed before the timestamp is considered, so two sightings of the
+        # same condition at different times produce the same value. This is
+        # also the value the server deduplicates on, so the agent and the
+        # platform agree on what "the same alert" means.
+        fingerprint = enc_db.content_fingerprint("events_alert", rec)
+        if _alert_recently_sent(fingerprint):
+            return
+        rec["dup_fp"] = fingerprint
+
         if hasattr(enc_db, "insert_record_enc"):
             enc_db.insert_record_enc("events_alert", rec)
         else:
@@ -480,7 +548,11 @@ def send_table(table: str):
 
         mark_sent(table, [r['id'] for r in rows])
         if debug:
-            print(f"[+] {table} sent (IP: {public_ip}, OS: {OS_INFO})")
+            # The IP/OS/HOST/MAC banner used to be repeated here. It is
+            # constant for the life of the process and was the single largest
+            # thing in agent.log: 4376 copies of the same 120-character string
+            # in thirteen hours. It is logged once at startup instead.
+            print(f"[+] {table} sent ({len(rows)} rows)")
 
     except Exception as e:
         if debug:
@@ -763,10 +835,16 @@ def soar_events_loop(interval_sec: int = 30):
     while True:
         try:
             stats = _soar.process_events()
-            print(f"[*] SOAR cycle: events={stats.get('events_processed', 0)} "
-                  f"actions={stats.get('actions_taken', 0)} "
-                  f"expired_resolved={stats.get('expired_resolved', 0)} "
-                  f"errors={stats.get('errors', 0)}")
+            # Only when the cycle did something. process_events already logs
+            # its own summary on the same condition; this printed
+            # unconditionally, duplicating it and adding a fourth line to
+            # every idle cycle.
+            if any(stats.get(k, 0) for k in
+                   ("events_processed", "actions_taken", "expired_resolved", "errors")):
+                print(f"[*] SOAR cycle: events={stats.get('events_processed', 0)} "
+                      f"actions={stats.get('actions_taken', 0)} "
+                      f"expired_resolved={stats.get('expired_resolved', 0)} "
+                      f"errors={stats.get('errors', 0)}")
         except Exception as e:
             print(f"[!] soar_events_loop error: {e}")
         time.sleep(interval_sec)
@@ -1428,6 +1506,10 @@ def main():
     if not acquire_single_instance_lock():
         print("[*] Another Sentora agent instance is already running — nothing to do.", flush=True)
         sys.exit(0)
+
+    # Once, here, rather than on every table send. This is the banner that
+    # used to be repeated thousands of times a day in agent.log.
+    print(f"[*] Host: {OS_INFO}")
 
     args = _parse_args()
 

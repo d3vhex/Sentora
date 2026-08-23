@@ -8,10 +8,15 @@
 data/
 *.pem
 
-# Note: certs/ is deliberately NOT excluded. app.py's optional TLS defaults to
-# certs/server.{crt,key}, and the bundled pair is the public self-signed dev
-# cert documented in the README — it grants no trust. Supply real certs by
-# mounting them over certs/ or by pointing TLS_CERT / TLS_KEY elsewhere.
+# TLS material. No certificate or key ships any more: a committed private key
+# gave every deployment the same TLS identity and published it, so anyone with
+# a clone could impersonate the server. app.py generates a local pair on first
+# boot when TLS is enabled and none is present (certs/generate_certs.py, which
+# is source and stays in the image). Supply a real certificate by mounting it
+# over certs/ or by pointing TLS_CERT / TLS_KEY elsewhere.
+certs/*.key
+certs/*.crt
+certs/*.pem
 
 # Build output and dependencies (rebuilt inside the image)
 node_modules/

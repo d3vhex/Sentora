@@ -98,7 +98,16 @@ export const agentService = {
   restartAgent: (agent: string) => api.post(`/${agent}/restart`).then(res => res.data),
   reloadAgentLicense: (agent: string) => api.post(`/${agent}/reload_license`).then(res => res.data),
   selfDestructAgent: (agent: string) => api.post(`/${agent}/self_destruct`).then(res => res.data),
-  
+  // Removes the agent from the platform: drops its telemetry database and
+  // deletes its enrolment identity. Distinct from selfDestruct, which tells a
+  // live agent to uninstall itself and leaves its data here.
+  //
+  // The name is sent in the body as well as the path. The server rejects the
+  // request unless they match: the realistic mistake is picking the wrong row
+  // from a list of DESKTOP-EVS8H9J, -2, -3, -4, and this is irreversible.
+  deleteAgent: (agent: string) =>
+    api.delete(`/api/agents/${agent}`, { data: { confirm: agent } }).then(res => res.data),
+
   // Agent Config
   getAgentYamlConfig: (agent: string, type: string) => api.get(`/${agent}/config/${type}`).then(res => res.data),
   setAgentYamlConfig: (agent: string, type: string, content: string) => api.post(`/${agent}/config/${type}`, { content }).then(res => res.data),
