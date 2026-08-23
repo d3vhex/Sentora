@@ -138,6 +138,46 @@ SCHEMAS: dict[str, type[_Base]] = {
 }
 
 
+# Verdicts that satisfy the schema and still say nothing
+# -----------------------------------------------------
+# Constraining generation guarantees *shape*, not *sense*. A real stored row:
+#
+#   {"summary": "NOT_RELEVANT", "verdict": "NOT_CRITICAL",
+#    "severity": "CRITICAL", "indicator": "NOT_INDOMINANT",
+#    "confidence": 0.0, "recommended_action": "NOT_RECOMMENDED"}
+#
+# The model pattern-matched "answer NOT_something" into every field, coining
+# "NOT_INDOMINANT" on the way. Every value is schema-valid. The verdict is
+# still nonsense, and because `severity` happened to land on CRITICAL it
+# surfaced anywhere the console filters on severity.
+#
+# Rewriting severity to agree with the verdict would be worse: that invents an
+# answer the model did not give, which is the habit `_lazy()` was removed for.
+# Instead this reports the contradiction, and the caller records an honest
+# INSUFFICIENT_DATA row.
+#
+# Deliberately narrow. Only a flat contradiction between two fields counts.
+# Low confidence on its own is a weak verdict, not an incoherent one, and
+# discarding those would throw away the model's genuine uncertainty.
+
+_ESCALATED = ("CRITICAL", "HIGH")
+
+
+def coherence_problem(verdict: _Base) -> Optional[str]:
+    """Describe how a verdict contradicts itself, or None if it holds together."""
+    outcome = str(getattr(verdict, "verdict", "") or "").upper()
+    severity = str(getattr(verdict, "severity", "") or "").upper()
+
+    quiet = outcome in ("NOT_CRITICAL", "IGNORE")
+    loud = outcome in ("CRITICAL", "SUSPICIOUS", "ACT")
+
+    if quiet and severity in _ESCALATED:
+        return f"verdict {outcome} contradicts severity {severity}"
+    if loud and severity == "INFO":
+        return f"verdict {outcome} contradicts severity INFO"
+    return None
+
+
 def constrained_schema(model: type[BaseModel]) -> dict:
     """JSON schema for Ollama's `format`, with every field required.
 

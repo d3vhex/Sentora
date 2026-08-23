@@ -195,3 +195,90 @@ def test_payload_round_trips():
                             summary="powershell download cradle",
                             next_steps=["pull the parent process tree"])
     assert DeepAnalysis.model_validate_json(original.model_dump_json()) == original
+
+
+# --------------------------------------------------------------------------
+# Schema-valid verdicts that still say nothing
+# --------------------------------------------------------------------------
+
+class TestCoherence:
+    """Constrained generation guarantees shape, not sense.
+
+    The case that prompted this was stored in production:
+
+        {"summary": "NOT_RELEVANT", "verdict": "NOT_CRITICAL",
+         "severity": "CRITICAL", "indicator": "NOT_INDOMINANT",
+         "confidence": 0.0, "recommended_action": "NOT_RECOMMENDED"}
+
+    Every field validates. `severity` landing on CRITICAL put it in front of
+    anyone filtering the console by severity.
+    """
+
+    def test_the_production_row_is_rejected(self):
+        from ai.schemas import TriageVerdict, coherence_problem
+        v = TriageVerdict(summary="NOT_RELEVANT", verdict="NOT_CRITICAL",
+                          severity="CRITICAL", indicator="NOT_INDOMINANT",
+                          confidence=0.0, recommended_action="NOT_RECOMMENDED")
+        problem = coherence_problem(v)
+        assert problem and "NOT_CRITICAL" in problem and "CRITICAL" in problem
+
+    def test_escalating_verdict_with_info_severity_is_rejected(self):
+        from ai.schemas import TriageVerdict, coherence_problem
+        v = TriageVerdict(verdict="CRITICAL", severity="INFO", confidence=0.9)
+        assert coherence_problem(v)
+
+    def test_act_with_info_severity_is_rejected(self):
+        """The defensive path dispatches on this; INFO is not an instruction."""
+        from ai.schemas import DefensiveDecision, coherence_problem
+        d = DefensiveDecision(verdict="ACT", severity="INFO", action="BLOCK_IP",
+                              target="10.0.0.5", confidence=0.9)
+        assert coherence_problem(d)
+
+    def test_ignore_with_critical_severity_is_rejected(self):
+        from ai.schemas import DefensiveDecision, coherence_problem
+        d = DefensiveDecision(verdict="IGNORE", severity="CRITICAL", confidence=0.8)
+        assert coherence_problem(d)
+
+    # ---- what must survive -------------------------------------------------
+
+    def test_ordinary_verdicts_pass(self):
+        from ai.schemas import DefensiveDecision, TriageVerdict, coherence_problem
+        assert coherence_problem(
+            TriageVerdict(verdict="CRITICAL", severity="HIGH", confidence=0.9)) is None
+        assert coherence_problem(
+            TriageVerdict(verdict="NOT_CRITICAL", severity="INFO", confidence=0.8)) is None
+        assert coherence_problem(
+            TriageVerdict(verdict="SUSPICIOUS", severity="MEDIUM", confidence=0.5)) is None
+        assert coherence_problem(
+            DefensiveDecision(verdict="ACT", severity="CRITICAL", action="ISOLATE")) is None
+
+    def test_low_confidence_alone_is_not_incoherent(self):
+        """Uncertainty is a real answer; discarding it would lose information."""
+        from ai.schemas import TriageVerdict, coherence_problem
+        v = TriageVerdict(verdict="SUSPICIOUS", severity="LOW", confidence=0.05)
+        assert coherence_problem(v) is None
+
+    def test_not_critical_with_medium_severity_survives(self):
+        """Only a flat contradiction counts. MEDIUM is a judgement, not one."""
+        from ai.schemas import TriageVerdict, coherence_problem
+        v = TriageVerdict(verdict="NOT_CRITICAL", severity="MEDIUM", confidence=0.6)
+        assert coherence_problem(v) is None
+
+    def test_insufficient_data_is_never_incoherent(self):
+        from ai.schemas import TriageVerdict, coherence_problem
+        for sev in ("INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"):
+            v = TriageVerdict(verdict="INSUFFICIENT_DATA", severity=sev)
+            assert coherence_problem(v) is None
+
+    def test_every_handler_checks(self):
+        """All three worker handlers, not just the one that produced the row."""
+        import ast
+        import pathlib
+        src = pathlib.Path(__file__).resolve().parent.parent / "ai_worker.py"
+        tree = ast.parse(src.read_text(encoding="utf-8"))
+        for name in ("handle_automation", "handle_manual", "handle_defensive"):
+            fn = next(n for n in ast.walk(tree)
+                      if isinstance(n, ast.AsyncFunctionDef) and n.name == name)
+            called = {getattr(n.func, "id", "") for n in ast.walk(fn)
+                      if isinstance(n, ast.Call)}
+            assert "coherence_problem" in called, f"{name} does not check coherence"

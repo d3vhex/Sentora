@@ -239,3 +239,219 @@ def test_distinct_fingerprints_are_independent():
     cur = FakeCursor()
     assert triage.record_occurrence(cur, "siem_events", "c" * 64)[0] is True
     assert triage.record_occurrence(cur, "siem_events", "d" * 64)[0] is True
+
+
+# --------------------------------------------------------------------------
+# Fingerprint agreement between the two paths that feed the AI queue
+# --------------------------------------------------------------------------
+
+class TestFingerprintAgreement:
+    """The defensive sweep and ingest must agree on what "already seen" means.
+
+    They read the same event from different places: ingest fingerprints the
+    payload the agent posted, the sweep fingerprints the row it read back out
+    of MySQL. MySQL has added `id`, `dup_fp`, `created_at`, `sent` and the
+    `ai_analyzed*` flags by then. If those reach the hash, the two paths
+    produce different fingerprints, the sweep treats every alert as new, and
+    the dedup check runs without preventing anything - which is worse than no
+    check, because the queue still runs away while the code looks correct.
+    """
+
+    def _ingest_payload(self):
+        return {
+            "source": "Security/Microsoft-Windows-Security-Auditing",
+            "timestamp": "2026-08-22 21:27:18",
+            "severity": "HIGH",
+            "score": 7,
+            "categories": "LOGON FAILURE",
+            "message": "EventID=4625 | Account=svc_backup | Status=0xC000006D",
+        }
+
+    def _stored_row(self):
+        row = self._ingest_payload()
+        row.update({
+            "id": 4711,
+            "sent": 1,
+            "dup_fp": "a" * 64,
+            "created_at": "2026-08-22 21:27:20",
+            "ai_analyzed": 1,
+            "ai_analyzed_at": "2026-08-22 21:28:02",
+        })
+        return row
+
+    def test_the_stored_row_and_the_posted_payload_agree(self):
+        from core.triage import compute_ai_fingerprint
+        assert compute_ai_fingerprint("events_alert", self._ingest_payload()) == \
+            compute_ai_fingerprint("events_alert", self._stored_row())
+
+    def test_a_later_sighting_of_the_same_event_agrees(self):
+        """Same alert, different time and row id - one fingerprint."""
+        from core.triage import compute_ai_fingerprint
+        later = self._stored_row()
+        later.update(id=9999, timestamp="2026-08-23 04:00:00",
+                     created_at="2026-08-23 04:00:01", dup_fp="b" * 64)
+        assert compute_ai_fingerprint("events_alert", self._stored_row()) == \
+            compute_ai_fingerprint("events_alert", later)
+
+    def test_a_genuinely_different_alert_does_not_collide(self):
+        """The ignore list must not have eaten the content."""
+        from core.triage import compute_ai_fingerprint
+        other = self._stored_row()
+        other["message"] = "EventID=4625 | Account=administrator | Status=0xC000006D"
+        assert compute_ai_fingerprint("events_alert", self._stored_row()) != \
+            compute_ai_fingerprint("events_alert", other)
+
+    def test_severity_is_part_of_the_identity(self):
+        from core.triage import compute_ai_fingerprint
+        escalated = self._stored_row()
+        escalated["severity"] = "CRITICAL"
+        assert compute_ai_fingerprint("events_alert", self._stored_row()) != \
+            compute_ai_fingerprint("events_alert", escalated)
+
+    def test_the_same_event_in_two_tables_is_two_fingerprints(self):
+        from core.triage import compute_ai_fingerprint
+        assert compute_ai_fingerprint("events_alert", self._stored_row()) != \
+            compute_ai_fingerprint("siem_events", self._stored_row())
+
+    def test_there_is_only_one_implementation(self):
+        """server.py must import it, not define its own.
+
+        Two copies would drift, and the drift would show up as the queue
+        filling with repeats rather than as a failing import.
+        """
+        import pathlib
+        server = pathlib.Path(__file__).resolve().parent.parent / "server.py"
+        text = server.read_text(encoding="utf-8")
+        assert "from core.triage import compute_ai_fingerprint" in text
+        assert "def compute_ai_fingerprint" not in text
+
+
+class TestDefensiveSweepIsIdempotent:
+    """The sweep must not re-queue alerts it has already queued.
+
+    It re-reads the same "most recent N" rows every 300s. Publishing all of
+    them each time put 4130 duplicate messages on ai_soar_queue and grew
+    ai_analysis_results by ~1000 rows an hour, all describing the same handful
+    of events.
+    """
+
+    def test_the_sweep_does_not_force(self):
+        import ast
+        import pathlib
+        app_py = pathlib.Path(__file__).resolve().parent.parent / "app.py"
+        tree = ast.parse(app_py.read_text(encoding="utf-8"))
+
+        sweep = next(n for n in ast.walk(tree)
+                     if isinstance(n, ast.AsyncFunctionDef)
+                     and n.name == "_defensive_auto_sweep")
+        calls = [n for n in ast.walk(sweep) if isinstance(n, ast.Call)
+                 and getattr(n.func, "id", "") == "_push_recent_alerts_to_defensive"]
+        assert calls, "the sweep no longer calls _push_recent_alerts_to_defensive"
+        for call in calls:
+            forced = [k for k in call.keywords if k.arg == "force"]
+            assert not forced, (
+                "the timed sweep must never force re-analysis; only a person "
+                "pressing the button may"
+            )
+
+    def test_the_sweep_runs_in_one_worker_only(self):
+        """Otherwise each Sanic worker queues the same alerts."""
+        import ast
+        import pathlib
+        app_py = pathlib.Path(__file__).resolve().parent.parent / "app.py"
+        tree = ast.parse(app_py.read_text(encoding="utf-8"))
+        starter = next(n for n in ast.walk(tree)
+                       if isinstance(n, ast.AsyncFunctionDef)
+                       and n.name == "start_defensive_sweep")
+        src = ast.dump(starter)
+        assert "SANIC_WORKER_NAME" in src, (
+            "start_defensive_sweep has no worker guard, so the sweep runs once "
+            "per worker"
+        )
+
+
+class TestClaimVersusRecord:
+    """`claim_for_analysis` must not inflate the occurrence counter.
+
+    The sweep calls it on the same rows every five minutes. If it counted
+    those passes, `occurrences` would measure the sweep's loop rate rather
+    than how often the event happened, and `inferences_avoided` - which is
+    derived from it - would climb on its own with no events arriving.
+    """
+
+    class FakeCursor:
+        """Enough MySQL to exercise the rowcount convention."""
+
+        def __init__(self):
+            self.rows = {}     # fingerprint -> occurrences
+            self.rowcount = 0
+
+        def execute(self, sql, params=()):
+            s = " ".join(sql.split())
+            if s.startswith("CREATE TABLE"):
+                self.rowcount = 0
+                return
+            if s.startswith("INSERT INTO ai_dedup"):
+                fp = params[0]
+                if fp not in self.rows:
+                    self.rows[fp] = 1
+                    self.rowcount = 1          # inserted
+                else:
+                    if "occurrences = occurrences + 1" in s:
+                        self.rows[fp] += 1
+                    self.rowcount = 2          # updated
+                return
+            if s.startswith("SELECT occurrences"):
+                self._selected = self.rows.get(params[0], 0)
+                return
+            raise AssertionError(f"unexpected SQL: {s}")
+
+        def fetchone(self):
+            return (self._selected,)
+
+    def test_claim_is_true_once_then_false(self):
+        from core.triage import claim_for_analysis
+        cur = self.FakeCursor()
+        assert claim_for_analysis(cur, "events_alert", "f" * 64) is True
+        assert claim_for_analysis(cur, "events_alert", "f" * 64) is False
+
+    def test_repeated_claims_do_not_move_the_counter(self):
+        from core.triage import claim_for_analysis
+        cur = self.FakeCursor()
+        for _ in range(50):        # ~4 hours of sweeps over the same alert
+            claim_for_analysis(cur, "events_alert", "f" * 64)
+        assert cur.rows["f" * 64] == 1, (
+            "the sweep inflated occurrences; inferences_avoided would climb "
+            "with no events arriving"
+        )
+
+    def test_record_occurrence_does_count(self):
+        """The contrast: ingest sightings are real and must be counted."""
+        from core.triage import record_occurrence
+        cur = self.FakeCursor()
+        for _ in range(5):
+            record_occurrence(cur, "events_alert", "f" * 64)
+        assert cur.rows["f" * 64] == 5
+
+    def test_a_claim_blocks_a_later_ingest_from_re_analysing(self):
+        """Both paths share one table, which is the point."""
+        from core.triage import claim_for_analysis, record_occurrence
+        cur = self.FakeCursor()
+        assert claim_for_analysis(cur, "events_alert", "f" * 64) is True
+        is_new, _ = record_occurrence(cur, "events_alert", "f" * 64)
+        assert is_new is False
+
+
+def test_the_sweep_claims_rather_than_records():
+    """Guard against someone swapping the call back."""
+    import ast
+    import pathlib
+    app_py = pathlib.Path(__file__).resolve().parent.parent / "app.py"
+    tree = ast.parse(app_py.read_text(encoding="utf-8"))
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "_filter_unseen_alerts")
+    called = {getattr(n.func, "id", "") for n in ast.walk(fn) if isinstance(n, ast.Call)}
+    assert "claim_for_analysis" in called
+    assert "record_occurrence" not in called, (
+        "the sweep must not count its own passes as event occurrences"
+    )

@@ -178,3 +178,44 @@ def test_cases_absent_from_the_baseline_are_ignored():
     diff = compare(baseline, candidate)
     assert diff["newly_missed"] == []
     assert diff["regression"] is False
+
+
+# --------------------------------------------------------------------------
+# The harness has to be runnable
+# --------------------------------------------------------------------------
+
+def test_prompts_import_without_the_worker_runtime():
+    """The eval harness must not need a RabbitMQ client to read a prompt.
+
+    PROMPTS lived in ai_worker.py, which imports aio_pika and the SOAR module.
+    `run_eval.py` pulled it from there, so the first real eval run died with
+    ModuleNotFoundError on a host that had no broker client installed - the
+    harness was unrunnable anywhere except inside the worker container, which
+    is the one place nobody wants to iterate on prompts.
+
+    Prompts are data. This pins them somewhere data can be read from.
+    """
+    import importlib
+    import subprocess
+    import sys
+    import textwrap
+
+    # A subprocess, not an import: aio_pika may already be in this process's
+    # sys.modules via another test, which would make the check pass while the
+    # real failure remained.
+    src = textwrap.dedent("""
+        import sys
+        from ai.prompts import PROMPTS
+        assert set(PROMPTS) >= {"automation", "manual", "defensive"}, sorted(PROMPTS)
+        heavy = [m for m in ("aio_pika", "mysql.connector", "sanic") if m in sys.modules]
+        assert not heavy, f"ai.prompts dragged in {heavy}"
+    """)
+    r = subprocess.run([sys.executable, "-c", src], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+    # And the harness reaches for that module rather than the worker.
+    import pathlib
+    run_eval = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "run_eval.py"
+    text = run_eval.read_text(encoding="utf-8")
+    assert "from ai.prompts import PROMPTS" in text
+    assert "from ai_worker import" not in text

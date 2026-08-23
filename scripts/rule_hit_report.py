@@ -94,10 +94,13 @@ def messages_from_db(agent: str, table: str, limit: int, host, port):
         raise SystemExit(f"[!] {e}")
     fernet = Fernet(key.encode() if isinstance(key, str) else key)
 
-    in_container = pathlib.Path("/.dockerenv").exists()
-    env_host = os.getenv("DB_HOST", "127.0.0.1")
-    host = host or (env_host if (in_container or env_host != "db") else "127.0.0.1")
-    port = port or (int(os.getenv("DB_PORT", "3306")) if in_container else 3307)
+    # See core/netloc.py: `db` resolves on the compose network only, and the
+    # DNS error it produces on the host does not hint at that.
+    from core.netloc import resolve_host
+    env_host, env_port = resolve_host(os.getenv("DB_HOST", "127.0.0.1"),
+                                      int(os.getenv("DB_PORT", "3306")))
+    host = host or env_host
+    port = port or env_port
 
     conn = mysql.connector.connect(
         host=host, port=port, user=os.getenv("DB_USER", "root"),

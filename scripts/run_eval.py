@@ -10,15 +10,21 @@ judge an edit was to read a few insight cards and form an impression, which
 cannot distinguish "better" from "different".
 
 Exit codes: 0 clean, 1 a regression against the compared baseline, 2 setup
-failure. The regression case is deliberately loud — a change that catches
+failure. The regression case is deliberately loud - a change that catches
 three new detections and loses three others leaves recall flat, and that
 should not read as neutral.
+
+A run where the model answered nothing also exits non-zero. The first live
+run scored 10/10 NO_VERDICT because the endpoint was unreachable, printed a
+scoreboard of zeroes, and exited 0. An eval that cannot reach the model has
+not measured the model, and must not be reportable as a result.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import sys
 import time
@@ -31,6 +37,7 @@ load_dotenv()
 from core.evaluation import (                      # noqa: E402
     NO_VERDICT, Case, compare, summarise,
 )
+from core.netloc import resolve_url                # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CORPUS = ROOT / "evals" / "corpus.jsonl"
@@ -78,6 +85,9 @@ def main() -> int:
     ap.add_argument("--save", default=None, help="write this run to a JSON file")
     ap.add_argument("--compare", default=None, help="baseline run to compare against")
     ap.add_argument("--limit", type=int, default=0, help="stop after N cases")
+    ap.add_argument("--endpoint", default=None,
+                    help="Ollama base URL (default: OLLAMA_BASE_URL, with "
+                         "compose service names mapped to their published port)")
     args = ap.parse_args()
 
     cases, problems = load_corpus(pathlib.Path(args.corpus))
@@ -87,14 +97,20 @@ def main() -> int:
         print("\n[!] Nothing labelled to evaluate.")
         return 2
 
+    from ai.prompts import PROMPTS
     from ai.schemas import TriageVerdict
     from ai.utils import AITransientError, analyze_structured
-    from ai_worker import PROMPTS
 
     if args.limit:
         cases = cases[:args.limit]
 
-    print(f"\n[*] Replaying {len(cases)} labelled case(s) through the model...\n")
+    # `.env` points at http://ollama:11434, which resolves on the compose
+    # network only. Run from the host, every case failed to connect and the
+    # error blamed DNS. See core/netloc.py.
+    endpoint = args.endpoint or resolve_url(os.getenv("OLLAMA_BASE_URL", ""))
+
+    print(f"\n[*] Replaying {len(cases)} labelled case(s) through the model...")
+    print(f"    endpoint: {endpoint or '(ai.utils default)'}\n")
 
     results: list[Case] = []
     for i, row in enumerate(cases, 1):
@@ -107,6 +123,7 @@ def main() -> int:
                 # eval. A cached answer from a previous prompt would make the
                 # new one look identical to it.
                 agent=None,
+                endpoint=endpoint or None,
             )
             actual = verdict.verdict if verdict else NO_VERDICT
             if error:
@@ -155,6 +172,18 @@ def main() -> int:
         print("\nUnwarranted escalations - the cost of the recall above:")
         for c in report.spurious[:10]:
             print(f"  {c.id}  expected {c.expected}, model said {c.actual}")
+
+    # A run that reached the model for nothing has measured nothing. Saving it
+    # would be worse than useless: `--compare` against a baseline of all
+    # NO_VERDICT makes any working run look like a huge improvement.
+    if report.no_verdict == report.total and report.total:
+        print("\n[!] Every case failed to produce a verdict, so this run "
+              "measured nothing.")
+        print(f"    Endpoint tried: {endpoint or '(ai.utils default)'}")
+        print("    Check the model is reachable from here - from the host,")
+        print("    Ollama is published on 127.0.0.1:11434, not http://ollama.")
+        print("    Not saved, and not comparable.")
+        return 2
 
     if args.save:
         out = pathlib.Path(args.save)
