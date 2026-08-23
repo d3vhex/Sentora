@@ -78,7 +78,30 @@ def compute_ai_fingerprint(table: str, item: dict) -> str:
     seen" would not match ingest's, and every alert ingest had already
     analysed would look new to the sweep - which is the exact failure that
     put 4130 duplicate messages on ai_soar_queue.
+
+    `dup_fp` is preferred when the agent supplied one, because **hashing the
+    row we received cannot work for encrypted tables.** `source` and `message`
+    arrive as `enc::gAAAA...`, and Fernet's random IV makes the ciphertext of
+    the same plaintext different every time - so a fingerprint taken over it
+    is unique by construction and deduplication matches nothing, which is
+    exactly what a night of telemetry showed: 517 fingerprints, all seen once,
+    over a handful of alerts repeating hundreds of times.
+
+    The agent computes `dup_fp` over the plaintext before encrypting (see
+    enc_db.content_fingerprint) and it is stored in the clear.
+
+    Falling back to hashing the item keeps older agents working. Their events
+    still will not deduplicate if the row is encrypted - that cannot be fixed
+    from this side - but nothing breaks, and mixed-version fleets behave the
+    same as before.
     """
+    fp = item.get("dup_fp")
+    if isinstance(fp, str) and fp.strip():
+        # Re-hashed with the table so the AI namespace stays separate from the
+        # agent's own use of dup_fp, and so the value is the same width as the
+        # fallback below.
+        return hashlib.sha256(table.encode() + b"|AI|dup:" + fp.strip().encode()).hexdigest()
+
     data = {k: v for k, v in item.items() if k not in FINGERPRINT_IGNORE}
     blob = json.dumps(data, sort_keys=True, separators=(",", ":"),
                       default=_json_default).encode("utf-8")

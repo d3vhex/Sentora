@@ -102,6 +102,72 @@ def create_agent_db_if_not_exists(agent: str) -> str:
         conn.close()
     return db_name
 
+def _split_sql_statements(sql: str) -> list[str]:
+    """Split a schema file into statements, with comment lines removed.
+
+    Deliberately duplicated from the agent's `modules/db.py`: the agent ships
+    as a standalone binary and cannot import from here. Both had the same
+    trap, in different forms - see the note at the call site.
+    """
+    out: list[str] = []
+    for chunk in sql.split(';'):
+        body = "\n".join(
+            line for line in chunk.splitlines()
+            if not line.strip().startswith("--")
+        ).strip()
+        if body:
+            out.append(body)
+    return out
+
+
+AUTOMATION_STATUSES = ("pending", "active", "paused", "completed", "failed", "cancelled")
+
+
+def _migrate_automation_status(cursor, db_name: str) -> None:
+    """Widen `automations.status` to include 'cancelled', at most once.
+
+    Kept out of init.sql and guarded, because that file is re-executed on
+    every call to create_tables_if_not_exist. An unconditional
+    `ALTER TABLE ... MODIFY` there took a metadata lock on `automations` each
+    time; with one leaked connection holding an open transaction on the table,
+    the ALTER queued behind it - and a *waiting* DDL in MySQL blocks every
+    reader that arrives after it, not just writers.
+
+    The result was total: agents polling /automations/pending got no answer
+    at all, and a 500 ten seconds later when Sanic gave up. Killing the
+    blocked ALTER did not help, because the next call re-issued it.
+
+    Reading information_schema costs nothing and takes no lock, so the normal
+    path - the column is already correct - never touches the table.
+    """
+    cursor.execute(
+        "SELECT column_type FROM information_schema.columns "
+        "WHERE table_schema = %s AND table_name = 'automations' "
+        "AND column_name = 'status'",
+        (db_name,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return                      # no table yet; init.sql creates it correct
+    if "cancelled" in str(row[0]):
+        return                      # already migrated
+
+    values = ",".join(f"'{v}'" for v in AUTOMATION_STATUSES)
+    try:
+        # Never wait on a metadata lock. If the table is busy, skipping is
+        # correct: the next start tries again, and blocking here would take
+        # the polling endpoints down with it.
+        cursor.execute("SET SESSION lock_wait_timeout = 3")
+        cursor.execute(
+            f"ALTER TABLE automations "
+            f"MODIFY status ENUM({values}) NOT NULL DEFAULT 'pending'"
+        )
+        print(f"[+] {db_name}: automations.status widened to include 'cancelled'")
+    except mysql.connector.Error as e:
+        print(f"[!] {db_name}: could not widen automations.status ({e}); "
+              f"will retry on the next start")
+
+
 def create_tables_if_not_exist(db_name):
     conn = connect_db(db_name)
     cursor = conn.cursor()
@@ -118,13 +184,24 @@ def create_tables_if_not_exist(db_name):
             print(f"[!] Schema {schema_path} is missing — agent tables will not "
                   f"be created. This is not recoverable at runtime.")
             sql = ""
-        for statement in sql.split(';'):
-            stmt = statement.strip()
-            if stmt:
-                try:
-                    cursor.execute(stmt)
-                except mysql.connector.Error as e:
-                    print(f"[!] SQL Execution Error: {e}")
+        # Comment lines are stripped rather than the chunk being skipped when
+        # it starts with one. Splitting on ';' leaves a statement's leading
+        # comment attached to it, so "skip chunks beginning with --" silently
+        # discards every documented statement - that bug cost 19 of 52
+        # statements in the agent's copy of this loop. Here the risk was the
+        # milder one: a chunk that is only a comment was sent to MySQL and
+        # produced a syntax error on every startup.
+        for statement in _split_sql_statements(sql):
+            try:
+                cursor.execute(statement)
+            except mysql.connector.Error as e:
+                print(f"[!] SQL Execution Error: {e}")
+
+        # Guarded, and after the CREATEs so the table exists on a fresh DB.
+        try:
+            _migrate_automation_status(cursor, db_name)
+        except mysql.connector.Error as e:
+            print(f"[!] automations.status migration skipped: {e}")
 
         try:
             cursor.execute("""

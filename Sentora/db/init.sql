@@ -230,11 +230,21 @@ CREATE TABLE IF NOT EXISTS automations (
   action TEXT NOT NULL,
   target TEXT NOT NULL,
   comment TEXT,
-  status TEXT NOT NULL CHECK (status IN ('pending','active','paused','completed','failed')),
+  -- 'cancelled' is distinct from 'failed': we stopped the action, it did not
+  -- go wrong. See the note in the server's db/init.sql.
+  status TEXT NOT NULL CHECK (status IN ('pending','active','paused','completed','failed','cancelled')),
   "timestamp" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Existing agents: CREATE TABLE IF NOT EXISTS leaves the old CHECK in place.
+-- Postgres cannot widen a constraint, so it is dropped and re-added. Both
+-- statements are idempotent, which apply_schema requires - it runs this file
+-- on every agent start.
+ALTER TABLE automations DROP CONSTRAINT IF EXISTS automations_status_check;
+ALTER TABLE automations ADD CONSTRAINT automations_status_check
+  CHECK (status IN ('pending','active','paused','completed','failed','cancelled'));
 
 -- =============================================================================
 -- YENİ EDR & ENVANTER TABLOLARI

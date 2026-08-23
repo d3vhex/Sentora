@@ -7,8 +7,8 @@ physical machine became four "agents": telemetry split across four databases,
 the fleet view counting it four times, and deduplication running separately
 in each.
 
-The installer template is a PowerShell string built in app.py, so it is
-checked by parsing the rendered output rather than by running it.
+The installer template is a PowerShell string built in core/installers.py,
+so it is checked by parsing the rendered output rather than by running it.
 """
 from __future__ import annotations
 
@@ -18,16 +18,18 @@ import re
 
 import pytest
 
-APP = pathlib.Path(__file__).resolve().parent.parent / "app.py"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+APP = ROOT / "app.py"
+INSTALLERS = ROOT / "core" / "installers.py"
 
 
 def _render() -> str:
-    """Render the Windows installer without importing app.py.
+    """Render the Windows installer without importing the module.
 
-    Importing it pulls in bcrypt, sanic, mysql and the rest, none of which
-    this test needs.
+    core/installers.py has no imports of its own, but reading it this way
+    keeps the test independent of anything else that module might grow.
     """
-    src = APP.read_text(encoding="utf-8-sig")
+    src = INSTALLERS.read_text(encoding="utf-8-sig")
     fn = next(n for n in ast.parse(src).body
               if isinstance(n, ast.FunctionDef) and n.name == "_render_windows_install")
     ns: dict = {}

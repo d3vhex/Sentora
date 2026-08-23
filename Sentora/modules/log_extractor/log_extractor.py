@@ -627,10 +627,27 @@ def follow_windows_eventlog(rules_list: List[Dict], exclude_patterns, log_type,
                 except: pass
 
 def stats_reporter(metrics: MetricsCollector, interval: int = 60):
+    """Periodic counters, on one line, and only when they moved.
+
+    This used `json.dumps(indent=2)`, so each report was eight lines. At one
+    report a minute that was 6300 lines of agent.log in thirteen hours,
+    almost all of it reporting that nothing had happened since the last one.
+    """
+    last_processed = None
     while True:
         time.sleep(interval)
         stats = metrics.get_stats()
-        logging.info("SIEM Stats: %s", json.dumps(stats, indent=2))
+        processed = stats.get('events_processed', 0)
+        if processed == last_processed:
+            continue        # nothing new since the last report
+        last_processed = processed
+        logging.info(
+            "SIEM stats: processed=%s output=%s duplicates=%s rate_limited=%s "
+            "uptime=%.0fs rate=%.2f/s",
+            processed, stats.get('events_output', 0),
+            stats.get('duplicate_events', 0), stats.get('rate_limited_events', 0),
+            stats.get('runtime_seconds', 0), stats.get('events_per_second', 0),
+        )
 
 def create_health_check_data(metrics: MetricsCollector) -> Dict:
     stats = metrics.get_stats()

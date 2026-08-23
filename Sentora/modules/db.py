@@ -30,6 +30,36 @@ def _schema_path():
     )
 
 
+def _split_statements(sql: str) -> list[str]:
+    """Split a schema file into executable statements, dropping comments.
+
+    The naive version of this was `if stmt.startswith("--"): continue`, meant
+    to skip chunks that are only a comment. Splitting on `;` puts a
+    statement's *leading* comment in the same chunk as the statement, so any
+    statement documented with a comment above it began with `--` and was
+    discarded along with its comment.
+
+    That silently skipped 19 of the 52 statements in the agent schema -
+    siem_events, events_alert, soar_actions, fim_data, network_connections
+    and docker_containers among them - while reporting "33 statements, 0
+    skipped", because the 19 were never counted as statements at all. It
+    only escaped notice because those tables already existed from the
+    initdb run that happens on a fresh data directory.
+
+    Comment lines are stripped instead, and what remains decides whether
+    there is a statement to run.
+    """
+    out: list[str] = []
+    for chunk in sql.split(";"):
+        body = "\n".join(
+            line for line in chunk.splitlines()
+            if not line.strip().startswith("--")
+        ).strip()
+        if body:
+            out.append(body)
+    return out
+
+
 def apply_schema(verbose: bool = True) -> tuple[int, int]:
     """Bring the local database up to the shipped schema. Returns (ok, skipped).
 
@@ -68,10 +98,8 @@ def apply_schema(verbose: bool = True) -> tuple[int, int]:
         # open, so doing this inside the loop failed on every statement after
         # the first and reported them all as "skipped".
         conn.autocommit = True
-        for statement in sql.split(";"):
-            stmt = statement.strip()
-            if not stmt or stmt.startswith("--"):
-                continue
+        for statement in _split_statements(sql):
+            stmt = statement
             try:
                 with conn.cursor() as cur:
                     cur.execute(stmt)
