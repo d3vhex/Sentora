@@ -192,7 +192,53 @@ def _decrypt_rows(table: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return [_decrypt_row(table, r) for r in rows]
 
 
+# Fields that vary between two sightings of the same event, or that the
+# server adds on the way in. Mirrors core/triage.FINGERPRINT_IGNORE.
+FINGERPRINT_IGNORE = {
+    "id", "sent", "dup_fp", "created_at", "ai_analyzed", "ai_analyzed_at",
+    "timestamp", "@timestamp", "TimeGenerated", "time",
+    "PID", "ProcessID", "process_id",
+}
+
+# Tables the server deduplicates before spending an inference on them.
+FINGERPRINTED_TABLES = ("siem_events", "events_alert")
+
+
+def content_fingerprint(table: str, data: dict) -> str:
+    """A stable hash of an event's content, computed before encryption.
+
+    This has to happen here, on the agent, because **the server cannot do it.**
+
+    The server used to fingerprint the row it received, but `source` and
+    `message` arrive as `enc::gAAAA...`. Fernet uses a random IV and embeds a
+    timestamp, so encrypting the same plaintext twice produces different
+    ciphertext - and the fingerprint of an encrypted row is therefore unique
+    by construction. Deduplication was structurally incapable of matching
+    anything: 517 fingerprints, every one seen exactly once, over a night in
+    which the same two alerts repeated hundreds of times.
+
+    Giving the server the decryption key would have fixed it too, at the cost
+    of widening what a compromise of the ingest service yields. The party that
+    already holds the plaintext is the right one to hash it.
+
+    Written into `dup_fp`, which is not an encrypted column, so the server can
+    read it without a key.
+    """
+    import hashlib
+
+    payload = {k: v for k, v in data.items() if k not in FINGERPRINT_IGNORE}
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(f"{table}|{blob}".encode("utf-8")).hexdigest()
+
+
 def insert_record_enc(table: str, data: dict):
+    # Only when the producer has not set one. Several modules compute a
+    # narrower dup_fp of their own for local deduplication (alert.py hashes
+    # event type, source and IP), and those are also plaintext-derived and
+    # stable, so they serve equally well. Overwriting them would break the
+    # local dedup that depends on their exact semantics.
+    if table in FINGERPRINTED_TABLES and not data.get("dup_fp"):
+        data = dict(data, dup_fp=content_fingerprint(table, data))
     return _db.insert_record(table, _encrypt_row(table, data))
 
 

@@ -64,3 +64,12 @@ evals/runs/*.json
 # run; they were tracked, so each scan produced a spurious diff.
 .sonar/
 .scannerwork/
+
+# TLS material is generated per deployment on first boot, never committed.
+# A private key in the repository gives every install the same TLS identity
+# and publishes it: anyone with a clone can impersonate the server. The
+# generator (certs/generate_certs.py) is versioned; its output is not.
+certs/*.key
+certs/*.crt
+certs/*.pem
+certs/*.csr

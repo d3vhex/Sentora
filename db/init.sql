@@ -196,7 +196,11 @@ CREATE TABLE IF NOT EXISTS automations (
   action VARCHAR(64) NOT NULL,
   target VARCHAR(255) NOT NULL,
   comment TEXT NULL,
-  status ENUM('pending','active','paused','completed','failed') NOT NULL DEFAULT 'pending',
+  -- 'cancelled' is distinct from 'failed': the action did not run because we
+  -- stopped it, not because it went wrong. Without it, cancelling a runaway
+  -- dispatch had to be recorded as 'failed' with the real reason buried in a
+  -- comment prefix, which is not something a query can filter on.
+  status ENUM('pending','active','paused','completed','failed','cancelled') NOT NULL DEFAULT 'pending',
   `timestamp` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   payload LONGTEXT NULL,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -205,6 +209,18 @@ CREATE TABLE IF NOT EXISTS automations (
   KEY idx_device_event (device, event_id),
   KEY idx_timestamp (`timestamp`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- The ALTER that widens this ENUM on existing deployments is NOT here. It
+-- lives in server.py:_migrate_automation_status, guarded by a check of
+-- information_schema.
+--
+-- MODIFY is idempotent in the sense that re-running it leaves the same
+-- definition, but it is not free: it takes a metadata lock every time, and
+-- this whole file is executed on every call to create_tables_if_not_exist.
+-- With one connection holding an open transaction on `automations`, the
+-- repeated ALTER queued behind it - and in MySQL a *waiting* DDL blocks the
+-- readers that arrive after it. Agents polling /automations/pending stopped
+-- getting answers and saw 500s at the response timeout instead.
 
 -- ================== playbooks (merkezi tanım) ==================
 CREATE TABLE IF NOT EXISTS playbooks (

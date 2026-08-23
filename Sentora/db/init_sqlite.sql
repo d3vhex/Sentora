@@ -160,7 +160,12 @@ CREATE TABLE IF NOT EXISTS automations (
   action TEXT NOT NULL,
   target TEXT NOT NULL,
   comment TEXT,
-  status TEXT NOT NULL CHECK (status IN ('pending','active','paused','completed','failed')),
+  -- NOTE: SQLite cannot alter a CHECK constraint, so unlike the MySQL and
+  -- Postgres schemas there is no migration to widen this on an existing
+  -- file - a database created before 'cancelled' was added keeps the old
+  -- constraint until it is recreated. This path is the local fallback; the
+  -- deployed agent runs Postgres.
+  status TEXT NOT NULL CHECK (status IN ('pending','active','paused','completed','failed','cancelled')),
   "timestamp" DATETIME NOT NULL DEFAULT NOW(),
   created_at DATETIME NOT NULL DEFAULT NOW(),
   updated_at DATETIME NOT NULL DEFAULT NOW()

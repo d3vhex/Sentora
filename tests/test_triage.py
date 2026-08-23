@@ -268,11 +268,17 @@ class TestFingerprintAgreement:
         }
 
     def _stored_row(self):
+        """The row as MySQL hands it back.
+
+        No `dup_fp`: this class tests the content-hash fallback, which is what
+        runs for an agent old enough not to send one. When `dup_fp` is present
+        it takes precedence and none of the field handling below is reached -
+        that path is covered by TestEncryptedRowsDeduplicate.
+        """
         row = self._ingest_payload()
         row.update({
             "id": 4711,
             "sent": 1,
-            "dup_fp": "a" * 64,
             "created_at": "2026-08-22 21:27:20",
             "ai_analyzed": 1,
             "ai_analyzed_at": "2026-08-22 21:28:02",
@@ -289,7 +295,7 @@ class TestFingerprintAgreement:
         from core.triage import compute_ai_fingerprint
         later = self._stored_row()
         later.update(id=9999, timestamp="2026-08-23 04:00:00",
-                     created_at="2026-08-23 04:00:01", dup_fp="b" * 64)
+                     created_at="2026-08-23 04:00:01")
         assert compute_ai_fingerprint("events_alert", self._stored_row()) == \
             compute_ai_fingerprint("events_alert", later)
 
@@ -455,3 +461,134 @@ def test_the_sweep_claims_rather_than_records():
     assert "record_occurrence" not in called, (
         "the sweep must not count its own passes as event occurrences"
     )
+
+
+class TestEncryptedRowsDeduplicate:
+    """Deduplication has to survive encryption, and could not.
+
+    `source` and `message` reach the server as `enc::gAAAA...`. Fernet uses a
+    random IV, so encrypting the same plaintext twice gives different
+    ciphertext - and a fingerprint taken over the received row is therefore
+    unique by construction. One of the two triage gates had never suppressed
+    anything: a night of telemetry produced 517 fingerprints, every one seen
+    exactly once, over a handful of alerts that repeated hundreds of times.
+
+    The fix is that the agent hashes the plaintext before encrypting and sends
+    the result in `dup_fp`, which is not an encrypted column. The alternative
+    - giving the ingest service the decryption key - would have widened what a
+    compromise of it yields.
+    """
+
+    AGENT_FP = "a" * 64
+
+    def _encrypted_row(self, ciphertext_seed: str, when: str, fp=AGENT_FP):
+        row = {
+            "source": f"enc::gAAAAB_{ciphertext_seed}",
+            "message": f"enc::gAAAAC_{ciphertext_seed}",
+            "timestamp": when,
+            "severity": "MEDIUM",
+            "categories": "LateralMovement",
+            "sent": 0,
+        }
+        if fp is not None:
+            row["dup_fp"] = fp
+        return row
+
+    def test_the_same_event_re_encrypted_has_one_fingerprint(self):
+        from core.triage import compute_ai_fingerprint
+        first = compute_ai_fingerprint(
+            "events_alert", self._encrypted_row("iv1", "2026-08-23 12:00:00"))
+        second = compute_ai_fingerprint(
+            "events_alert", self._encrypted_row("iv2", "2026-08-23 12:05:00"))
+        assert first == second
+
+    def test_without_dup_fp_the_ciphertext_defeats_it(self):
+        """The behaviour being replaced, pinned so the reason stays visible."""
+        from core.triage import compute_ai_fingerprint
+        first = compute_ai_fingerprint(
+            "events_alert", self._encrypted_row("iv1", "2026-08-23 12:00:00", fp=None))
+        second = compute_ai_fingerprint(
+            "events_alert", self._encrypted_row("iv2", "2026-08-23 12:00:00", fp=None))
+        assert first != second, (
+            "if these ever match, this test no longer demonstrates anything"
+        )
+
+    def test_a_different_alert_gets_a_different_fingerprint(self):
+        from core.triage import compute_ai_fingerprint
+        a = compute_ai_fingerprint("events_alert", self._encrypted_row("iv1", "t"))
+        b = compute_ai_fingerprint(
+            "events_alert", self._encrypted_row("iv1", "t", fp="b" * 64))
+        assert a != b
+
+    def test_the_sweep_and_ingest_agree_on_a_dup_fp_row(self):
+        """Ingest sees the encrypted payload, the sweep the decrypted row."""
+        from core.triage import compute_ai_fingerprint
+        ingest = self._encrypted_row("iv1", "2026-08-23 12:00:00")
+        sweep = {
+            "id": 4711, "source": "LateralMovement",
+            "message": "Established connection on sensitive port 445 from ::1",
+            "timestamp": "2026-08-23 12:00:00", "severity": "MEDIUM",
+            "score": None, "categories": "LateralMovement", "sent": 1,
+            "dup_fp": self.AGENT_FP, "created_at": "2026-08-23 12:00:02",
+        }
+        assert compute_ai_fingerprint("events_alert", ingest) == \
+            compute_ai_fingerprint("events_alert", sweep)
+
+    def test_an_agent_that_sends_no_dup_fp_still_works(self):
+        """Mixed-version fleets must not break; they just do not dedup."""
+        from core.triage import compute_ai_fingerprint
+        fp = compute_ai_fingerprint(
+            "events_alert", self._encrypted_row("iv1", "t", fp=None))
+        assert len(fp) == 64
+
+    def test_a_blank_dup_fp_is_not_treated_as_a_fingerprint(self):
+        """Otherwise every row with an empty column collapses into one."""
+        from core.triage import compute_ai_fingerprint
+        a = compute_ai_fingerprint("events_alert", self._encrypted_row("iv1", "t", fp="  "))
+        b = compute_ai_fingerprint("events_alert", self._encrypted_row("iv2", "t", fp=""))
+        assert a != b
+
+    def test_the_agent_and_the_server_share_the_ignore_list(self):
+        """They are separate deployables and cannot import each other."""
+        import ast
+        import pathlib
+
+        from core.triage import FINGERPRINT_IGNORE
+
+        enc_db = pathlib.Path(__file__).resolve().parent.parent / \
+            "Sentora" / "modules" / "enc_db.py"
+        tree = ast.parse(enc_db.read_text(encoding="utf-8"))
+        node = next(n for n in tree.body if isinstance(n, ast.Assign)
+                    and getattr(n.targets[0], "id", "") == "FINGERPRINT_IGNORE")
+        agent_ignore = set(ast.literal_eval(node.value))
+        assert agent_ignore == set(FINGERPRINT_IGNORE), (
+            "the agent and server ignore different fields; drift here means "
+            f"they hash different content. Only on one side: "
+            f"{agent_ignore ^ set(FINGERPRINT_IGNORE)}"
+        )
+
+
+def test_dup_fp_takes_precedence_over_content():
+    """A documented consequence, not an accident.
+
+    When the agent supplies `dup_fp`, that value decides identity and the
+    row's contents are not consulted. Most producers now send a content hash
+    (enc_db.content_fingerprint), so the two agree.
+
+    `alert.py` is the exception: its dup_fp is md5(event_type, source, ip),
+    deliberately coarser, because its own policy is "do not re-alert on the
+    same kind of thing from the same place". Reusing it here inherits that
+    policy - two alerts it considers the same produce one AI verdict.
+
+    That is acceptable because alert.py already suppresses the second one
+    locally, so it never reaches the server. It is pinned here so the
+    inheritance is a decision on the record rather than a surprise to whoever
+    next changes make_alert_fingerprint.
+    """
+    from core.triage import compute_ai_fingerprint
+
+    base = {"source": "Windows", "message": "first", "severity": "HIGH",
+            "dup_fp": "c" * 64}
+    different_content = dict(base, message="completely different")
+    assert compute_ai_fingerprint("events_alert", base) == \
+        compute_ai_fingerprint("events_alert", different_content)
