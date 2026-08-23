@@ -3403,15 +3403,34 @@ async def analyze_logs_all_agents(request):
         }, status=500)
 
 
-async def _push_recent_alerts_to_defensive(agent: str, limit: int = 25) -> dict:
-    """Fetch the most-recent events_alert rows for an agent and queue each one
-    on the AI_SOAR (defensive) RabbitMQ queue. This is the single mechanism
-    behind both the manual `/analyze-defensive/<agent>` endpoint and the
-    periodic auto-sweep, so they behave identically.
+async def _push_recent_alerts_to_defensive(agent: str, limit: int = 25,
+                                           force: bool = False) -> dict:
+    """Queue the most-recent events_alert rows for defensive analysis, once each.
+
+    Backs both the manual `/analyze-defensive/<agent>` endpoint and the
+    periodic auto-sweep, so the two behave identically.
+
+    **Why the dedup check is not optional.** This used to publish every row it
+    fetched, every time it ran, with no record of what it had already sent.
+    The sweep re-reads the same "most recent" rows every 300s, so each one was
+    re-queued indefinitely: ai_soar_queue reached 4130 messages, all repeats
+    of a handful of alerts, and ai_analysis_results grew by ~1000 rows an hour
+    describing the same few events over and over. The response cache made this
+    worse rather than better - each repeat was answered in 0.1s from cache, so
+    the loop ran at full speed and cost nothing that would have shown up as
+    slowness.
+
+    `record_occurrence` is the same counter ingest uses, keyed by the same
+    fingerprint, so an alert already analysed on the way in is not analysed
+    again here.
+
+    `force=True` is for the manual endpoint: when a human explicitly asks for
+    a re-analysis they should get one, and that is a bounded, deliberate
+    action rather than a loop.
     """
     rows = await asyncio.to_thread(fetch_events_alert_data, agent, limit)
     if not rows:
-        return {"queued": 0, "reason": "no events_alert rows"}
+        return {"queued": 0, "skipped": 0, "reason": "no events_alert rows"}
 
     try:
         key_b64 = getattr(app.ctx, "fernet_key", None)
@@ -3421,19 +3440,65 @@ async def _push_recent_alerts_to_defensive(agent: str, limit: int = 25) -> dict:
     except Exception:
         fernet_obj = None
 
-    pushed = 0
+    payloads = []
     for row in rows:
         try:
             payload = decrypt_row_fields(row, ENCRYPTED_FIELDS_MAP.get("events_alert", []), fernet_obj) if fernet_obj else dict(row)
         except Exception:
             payload = dict(row)
+        payloads.append(payload)
+
+    if force:
+        to_send = [(p, None) for p in payloads]
+        skipped = 0
+    else:
+        to_send, skipped = await asyncio.to_thread(_filter_unseen_alerts, agent, payloads)
+
+    pushed = 0
+    for payload, fingerprint in to_send:
+        if fingerprint:
+            payload = dict(payload, _ai_fingerprint=fingerprint)
         try:
             ok = await mq_utils.publish_to_queue(mq_utils.AI_SOAR, agent, "events_alert", payload)
             if ok:
                 pushed += 1
         except Exception as e:
             print(f"[!] defensive push failed agent={agent}: {e}", flush=True)
-    return {"queued": pushed, "total_rows": len(rows)}
+    return {"queued": pushed, "skipped": skipped, "total_rows": len(rows)}
+
+
+def _filter_unseen_alerts(agent: str, payloads: list) -> tuple[list, int]:
+    """Return (unseen payloads with their fingerprints, count already seen).
+
+    Fails open: if the dedup table cannot be reached the alerts are queued
+    rather than dropped. Losing an analysis is worse than repeating one - but
+    note that "fails open" is what the old behaviour did unconditionally, and
+    it is why the queue ran away. Errors here are printed, not swallowed.
+    """
+    from core.triage import DEDUP_DDL, claim_for_analysis, compute_ai_fingerprint
+
+    try:
+        with sync_mysql_conn(f"{agent}_db") as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(DEDUP_DDL)
+                out, seen = [], 0
+                for payload in payloads:
+                    fp = compute_ai_fingerprint("events_alert", payload)
+                    # claim_, not record_: the sweep re-reads the same rows on
+                    # every pass and must not count each pass as a sighting.
+                    if claim_for_analysis(cursor, "events_alert", fp):
+                        out.append((payload, fp))
+                    else:
+                        seen += 1
+                conn.commit()
+                return out, seen
+            finally:
+                cursor.close()
+    except Exception as e:
+        print(f"[!] defensive dedup check failed agent={agent}, "
+              f"queueing all {len(payloads)} alert(s): {e}", flush=True)
+        return [(p, None) for p in payloads], 0
 
 
 @require_permission("analyze_logs")
@@ -3442,14 +3507,20 @@ async def trigger_defensive_scan(request, agent):
     """Manually push the latest events_alert rows for an agent through the
     defensive AI worker. Returns immediately; results land in
     ai_analysis_results once the worker finishes (visible in AI Analysis UI).
+
+    `force` defaults true here and false for the sweep: a person pressing the
+    button has asked for a re-analysis and should get one. It is bounded by
+    `limit` and by the person, which is what makes it safe - unlike the timer,
+    which has neither.
     """
     data = request.json or {}
     try:
         limit = max(1, min(int(data.get("limit", 25)), 200))
     except Exception:
         limit = 25
+    force = data.get("force", True) is not False
     try:
-        result = await _push_recent_alerts_to_defensive(agent, limit)
+        result = await _push_recent_alerts_to_defensive(agent, limit, force=force)
         return sanic_json({"success": True, "agent": agent, **result})
     except Exception as e:
         return sanic_json({"success": False, "error": str(e)}, status=500)
@@ -3856,10 +3927,18 @@ DEFENSIVE_SWEEP_BATCH = int(os.getenv("AI_DEFENSIVE_SWEEP_BATCH", "10"))
 
 
 async def _defensive_auto_sweep():
-    """Background loop: every DEFENSIVE_SWEEP_INTERVAL seconds pull a small
-    batch of the latest alerts per agent into the defensive AI queue so the
-    LLM keeps producing visible commentary even when nothing fresh is
-    streaming through ingest.
+    """Background loop: pick up alerts that reached the database without going
+    through the ingest AI path, and queue each one for defensive analysis once.
+
+    This is a backstop, not a generator of activity. Its previous docstring
+    said it existed "so the LLM keeps producing visible commentary even when
+    nothing fresh is streaming through ingest", and it delivered exactly that
+    - the same handful of alerts re-analysed every five minutes so the AI
+    page would not look idle. An idle AI page when nothing is happening is the
+    correct display.
+
+    With the dedup check in `_push_recent_alerts_to_defensive`, a sweep over
+    alerts that have all been seen queues nothing and prints nothing.
     """
     await asyncio.sleep(30)
     while True:
@@ -3878,7 +3957,8 @@ async def _defensive_auto_sweep():
                 try:
                     res = await _push_recent_alerts_to_defensive(ag, DEFENSIVE_SWEEP_BATCH)
                     if res.get("queued"):
-                        print(f"[AI-Sweep] defensive pushed {res['queued']} alerts for {ag}", flush=True)
+                        print(f"[AI-Sweep] defensive pushed {res['queued']} new alert(s) "
+                              f"for {ag} ({res.get('skipped', 0)} already analysed)", flush=True)
                 except Exception as e:
                     print(f"[!] defensive sweep agent={ag}: {e}", flush=True)
         except Exception as e:
@@ -3888,6 +3968,13 @@ async def _defensive_auto_sweep():
 
 @app.before_server_start
 async def start_defensive_sweep(app):
+    # Only in worker 0-0, like every other background loop here. Without this
+    # the sweep runs once per Sanic worker, and each copy queues the same
+    # alerts - multiplying the publish rate by the worker count for work that
+    # is meant to happen once.
+    worker_name = os.environ.get("SANIC_WORKER_NAME", "")
+    if not ("0-0" in worker_name or not worker_name):
+        return
     if os.getenv("AI_DEFENSIVE_SWEEP_ENABLED", "1") == "1":
         app.add_task(_defensive_auto_sweep())
         print(f"[*] Defensive AI auto-sweep enabled (every {DEFENSIVE_SWEEP_INTERVAL}s, batch={DEFENSIVE_SWEEP_BATCH})", flush=True)

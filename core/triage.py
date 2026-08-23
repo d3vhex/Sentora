@@ -31,11 +31,58 @@ Three deliberate limits on that risk:
 
 from __future__ import annotations
 
+import datetime as _dt
+import hashlib
 import json
 import os
 
 # Ordered lowest to highest. Position in this list is the comparison.
 SEVERITY_LADDER = ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
+
+
+def _json_default(o):
+    if isinstance(o, _dt.datetime):
+        return o.isoformat()
+    return str(o)
+
+
+# Fields excluded from the hash, in two groups.
+#
+# Volatile: differ between two sightings of the same event, so including them
+# would make every repeat look new.
+#
+# Server-added: columns that exist on the stored row but not on the payload
+# the agent sent. This distinction is easy to miss and breaks deduplication
+# silently. Ingest fingerprints the incoming payload; the defensive sweep
+# fingerprints the row it read back out of MySQL, which has picked up `id`,
+# `dup_fp`, `created_at`, `sent` and the `ai_analyzed*` flags along the way.
+# Hash those and the two paths can never agree - the sweep would consider
+# every alert unseen, and the dedup check would run, pass, and prevent
+# nothing.
+FINGERPRINT_IGNORE = {
+    # volatile
+    "timestamp", "@timestamp", "TimeGenerated", "time",
+    "PID", "ProcessID", "process_id",
+    # server-added
+    "id", "sent", "created_at", "dup_fp", "ai_analyzed", "ai_analyzed_at",
+}
+
+
+def compute_ai_fingerprint(table: str, item: dict) -> str:
+    """Identify an event for deduplication, ignoring the fields that always vary.
+
+    This lives here, and not next to either caller, because **both paths that
+    feed the AI queue have to agree on it.** Ingest computes a fingerprint
+    before publishing; the defensive sweep computes one before re-publishing.
+    If those two were separate implementations, the sweep's idea of "already
+    seen" would not match ingest's, and every alert ingest had already
+    analysed would look new to the sweep - which is the exact failure that
+    put 4130 duplicate messages on ai_soar_queue.
+    """
+    data = {k: v for k, v in item.items() if k not in FINGERPRINT_IGNORE}
+    blob = json.dumps(data, sort_keys=True, separators=(",", ":"),
+                      default=_json_default).encode("utf-8")
+    return hashlib.sha256(table.encode() + b"|AI|" + blob).hexdigest()
 
 # Events strictly below this are not sent for analysis. "INFO" disables the
 # gate entirely, which is the setting to use while you have no measurement of
@@ -156,6 +203,34 @@ CREATE TABLE IF NOT EXISTS ai_dedup (
     INDEX idx_dedup_seen (last_seen)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
+
+
+def claim_for_analysis(cursor, table: str, fingerprint: str) -> bool:
+    """Reserve this fingerprint for analysis. True if we are the first to.
+
+    The difference from `record_occurrence` is what it does NOT do: it does
+    not increment `occurrences`.
+
+    `record_occurrence` is for ingest, where each call is a real, separate
+    sighting of the event and counting it is the point. The defensive sweep is
+    not a sighting - it re-reads the same "most recent N" rows every five
+    minutes. Using `record_occurrence` there would add one to every recent
+    alert on every pass, and `occurrences` would drift from "how often did
+    this event happen" to "how many times has the sweep looped", silently
+    inflating the `inferences_avoided` figure the AI stats endpoint reports.
+
+    Still a single statement rather than SELECT-then-INSERT, so two callers
+    cannot both decide they are first. `last_seen` is touched so the row does
+    not look stale, which is also what makes MySQL return rowcount 2 rather
+    than 0 for an existing row - only rowcount 1 means we inserted it.
+    """
+    cursor.execute(
+        """INSERT INTO ai_dedup (fingerprint, table_name, occurrences)
+           VALUES (%s, %s, 1)
+           ON DUPLICATE KEY UPDATE last_seen = NOW()""",
+        (fingerprint, table),
+    )
+    return cursor.rowcount == 1
 
 
 def record_occurrence(cursor, table: str, fingerprint: str) -> tuple[bool, int]:

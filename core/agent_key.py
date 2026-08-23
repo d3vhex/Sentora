@@ -80,6 +80,8 @@ def decrypt_stats(rows, fernet, prefix: str = "enc::") -> tuple[list[str], dict]
     different actions, and reporting the second as the first sends you looking
     at the wrong thing.
     """
+    import json
+
     from cryptography.fernet import InvalidToken
 
     out: list[str] = []
@@ -91,10 +93,22 @@ def decrypt_stats(rows, fernet, prefix: str = "enc::") -> tuple[list[str], dict]
             out.append(str(raw or ""))
             continue
         try:
-            out.append(fernet.decrypt(raw[len(prefix):].encode()).decode())
-            stats["decrypted"] += 1
+            plain = fernet.decrypt(raw[len(prefix):].encode()).decode()
         except InvalidToken:
             stats["undecryptable"] += 1
+            continue
+
+        # enc_db._enc_value json-encodes the value before encrypting, so the
+        # ciphertext holds `json.dumps(v)`. Both the agent's own _dec_value
+        # and the server's decrypt_row_fields strip that layer; a consumer
+        # that does not gets a JSON string containing JSON, and every reader
+        # downstream sees escaped quotes instead of an event.
+        try:
+            decoded = json.loads(plain)
+            out.append(decoded if isinstance(decoded, str) else plain)
+        except ValueError:
+            out.append(plain)
+        stats["decrypted"] += 1
     return out, stats
 
 

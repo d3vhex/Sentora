@@ -56,11 +56,23 @@ def decrypt_row(row: dict, fields: list, fernet) -> dict:
     out = dict(row)
     for f in fields:
         v = out.get(f)
-        if isinstance(v, str) and v.startswith(ENC_PREFIX):
-            try:
-                out[f] = fernet.decrypt(v[len(ENC_PREFIX):].encode()).decode()
-            except InvalidToken:
-                out[f] = "<undecryptable>"
+        if not (isinstance(v, str) and v.startswith(ENC_PREFIX)):
+            continue
+        try:
+            plain = fernet.decrypt(v[len(ENC_PREFIX):].encode()).decode()
+        except InvalidToken:
+            out[f] = "<undecryptable>"
+            continue
+        # enc_db._enc_value json-encodes before encrypting, so one layer has
+        # to come back off - the agent's _dec_value and the server's
+        # decrypt_row_fields both do this. Without it the corpus carries a
+        # JSON string containing JSON, and the model is handed escaped quotes
+        # instead of an event.
+        try:
+            decoded = json.loads(plain)
+            out[f] = decoded if isinstance(decoded, str) else plain
+        except ValueError:
+            out[f] = plain
     return out
 
 
@@ -113,13 +125,16 @@ def main() -> int:
     else:
         params = ()
 
-    env_host = os.getenv("DB_HOST", "127.0.0.1")
     # `db` is only resolvable from inside the compose network. Treating it as
     # a hostname here produces "Unknown MySQL server host 'db'", which does
-    # not hint at the actual problem.
-    in_container = pathlib.Path("/.dockerenv").exists()
-    host = args.host or (env_host if (in_container or env_host != "db") else "127.0.0.1")
-    port = args.port or (int(os.getenv("DB_PORT", "3306")) if in_container else 3307)
+    # not hint at the actual problem. core/netloc.py holds the mapping; the
+    # same trap caught run_eval.py with OLLAMA_BASE_URL.
+    from core.netloc import resolve_host
+    env_host = os.getenv("DB_HOST", "127.0.0.1")
+    env_port = int(os.getenv("DB_PORT", "3306"))
+    host, port = resolve_host(env_host, env_port)
+    host = args.host or host
+    port = args.port or port
 
     try:
         conn = mysql.connector.connect(

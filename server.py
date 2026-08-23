@@ -171,12 +171,9 @@ def compute_fingerprint(table: str, item: dict) -> str:
     blob = json.dumps(clean, sort_keys=True, separators=(",", ":"), default=_json_default).encode("utf-8")
     return hashlib.sha256(table.encode() + b"|" + blob).hexdigest()
 
-def compute_ai_fingerprint(table: str, item: dict) -> str:
-    """Fingerprint that ignores high-entropy fields like timestamps to group similar logs for AI."""
-    ignore = {"id", "sent", "timestamp", "@timestamp", "TimeGenerated", "time", "created_at", "PID", "ProcessID", "process_id"}
-    data = {k: v for k, v in item.items() if k not in ignore}
-    blob = json.dumps(data, sort_keys=True, separators=(",", ":"), default=_json_default).encode("utf-8")
-    return hashlib.sha256(table.encode() + b"|AI|" + blob).hexdigest()
+# Defined in core/triage.py so the defensive sweep in app.py computes exactly
+# the same value - see the note there.
+from core.triage import compute_ai_fingerprint  # noqa: E402,F401
 
 def update_agent_info(agent: str, public_ip: str, os_info: str = None, hostname: str = None, mac_address: str = None):
     db_name = create_agent_db_if_not_exists(agent)
