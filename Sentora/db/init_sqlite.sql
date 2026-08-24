@@ -106,6 +106,11 @@ CREATE TABLE IF NOT EXISTS siem_events (
     dup_fp     CHAR(64),
     sent       INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  -- MITRE ATT&CK technique IDs from the Sigma rules that matched, comma
+  -- separated. A column rather than a field inside the JSON body, because
+  -- coverage is a question asked across every event - "which techniques have
+  -- we ever seen" - and that cannot be answered by parsing a text column.
+  techniques TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_siem_src ON siem_events (source);

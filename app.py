@@ -6677,6 +6677,98 @@ async def get_triage_stats(request):
         return sanic_json({"status": "error", "message": str(e)}, status=500)
 
 
+@app.get("/api/attack/coverage")
+@require_permission("read_telemetry")
+async def get_attack_coverage(request):
+    """Which ATT&CK techniques this deployment has actually seen.
+
+    The honest answer to "what am I not detecting". Two numbers that are
+    easily confused and are not the same thing:
+
+    - `covered`: techniques some installed Sigma rule can detect. This is
+      capability, and it is what a coverage heatmap usually shows.
+    - `observed`: techniques that have actually fired on this estate, with
+      counts. This is history.
+
+    A technique can be covered and never observed, which is the normal and
+    healthy case. The dangerous cell is the one that is neither: nothing
+    installed would have caught it, so its absence from the console says
+    nothing at all.
+
+    Techniques come from the Sigma rules' own `tags`, so there is no mapping
+    table here to fall out of date.
+    """
+    agent = request.args.get("agent")
+
+    def _observed():
+        seen = {}
+        with sync_mysql_conn() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute("SHOW DATABASES")
+                dbs = [r[0] for r in cursor.fetchall() if r[0].endswith("_db")]
+                if agent:
+                    wanted = _agent_name_forms(agent)[1] + "_db"
+                    dbs = [d for d in dbs if d == wanted]
+                for db in dbs:
+                    try:
+                        cursor.execute(
+                            f"SELECT techniques, COUNT(*) FROM {_quote_identifier(db)}"
+                            f".siem_events WHERE techniques IS NOT NULL "
+                            f"AND techniques <> '' GROUP BY techniques"
+                        )
+                    except Exception:
+                        # An agent enrolled before the column existed. Not an
+                        # error, and not a reason to fail the whole request.
+                        continue
+                    for value, count in cursor.fetchall():
+                        for tech in str(value).split(","):
+                            tech = tech.strip().upper()
+                            if tech:
+                                seen[tech] = seen.get(tech, 0) + int(count)
+            finally:
+                cursor.close()
+        return seen
+
+    try:
+        observed = await asyncio.to_thread(_observed)
+    except Exception as e:
+        print(f"[!] attack coverage query failed: {e}", flush=True)
+        observed = {}
+
+    covered = sorted(_sigma_technique_index())
+    return sanic_json({
+        "status": "success",
+        "covered": covered,
+        "observed": [{"technique": k, "events": v}
+                     for k, v in sorted(observed.items(), key=lambda kv: -kv[1])],
+        "covered_count": len(covered),
+        "observed_count": len(observed),
+        # Covered but never seen. Normal, and worth showing separately from
+        # the third category below.
+        "quiet": sorted(set(covered) - set(observed)),
+        # Seen with no rule that covers it - a technique the AI or the regex
+        # list surfaced and Sigma has nothing for.
+        "uncovered_but_seen": sorted(set(observed) - set(covered)),
+    })
+
+
+def _sigma_technique_index() -> set:
+    """Techniques the installed Sigma rules can detect.
+
+    Read from the same directory the agent loads, so the console cannot claim
+    coverage the endpoints do not have.
+    """
+    try:
+        from core.sigma_loader import load_dir
+        path = os.getenv("SIGMA_RULES_PATH",
+                         os.path.join("Sentora", "conf", "sigma"))
+        return load_dir(path).techniques
+    except Exception as e:
+        print(f"[!] could not read Sigma rules for coverage: {e}", flush=True)
+        return set()
+
+
 @app.get("/api/dashboard/summary")
 @require_permission("read_telemetry")
 async def get_dashboard_summary(request):

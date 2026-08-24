@@ -1,26 +1,6 @@
 import React, { useState } from 'react';
 import { NavLink, Link } from 'react-router-dom';
-import { 
-  LayoutDashboard, 
-  ShieldAlert, 
-  Settings, 
-  Users, 
-  Monitor, 
-  Database,
-  Activity,
-  ChevronRight,
-  BrainCircuit,
-  LogOut,
-  PlaySquare,
-  Zap,
-  ClipboardList,
-  Key,
-  Radar,
-  X,
-  Save,
-  Download,
-  Search
-} from 'lucide-react';
+import { Activity, BrainCircuit, ChevronRight, ClipboardList, Database, Download, Grid3x3, Key, LayoutDashboard, LogOut, Monitor, PlaySquare, Radar, Save, Search, Settings, ShieldAlert, Users, X, Zap } from 'lucide-react';
 import { authService } from '../services/api';
 
 interface SidebarProps {
@@ -158,6 +138,7 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen }) => {
           {authService.hasPermission('read_telemetry') && <SidebarLink to="/fim" icon={<ShieldAlert size={18} />} label="File Integrity" />}
           {authService.hasPermission('read_telemetry') && <SidebarLink to="/log-search" icon={<Search size={18} />} label="Log Explorer (OS)" />}
           {authService.hasPermission('read_telemetry') && <SidebarLink to="/threat-intel" icon={<Radar size={18} />} label="Threat Intelligence" />}
+          {authService.hasPermission('read_telemetry') && <SidebarLink to="/attack-coverage" icon={<Grid3x3 size={18} />} label="ATT&CK Coverage" />}
           {authService.hasPermission('manage_agent') && <SidebarLink to="/deployment" icon={<Download size={18} />} label="Deploy Agent" />}
           {authService.hasPermission('analyze_logs') && <SidebarLink to="/ai-analysis" icon={<BrainCircuit size={18} />} label="AI Analysis" />}
         </div>

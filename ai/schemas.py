@@ -100,10 +100,26 @@ class TriageVerdict(_Base):
     # It had described something. It had not described the event. `observed`
     # is constrained to values copied out of the log, so the field it fills
     # first cannot be a technique it has recognised in the prompt.
+    #
+    # That fixed the wrong-content problem and left a calibration one. Given
+    # an event it had summarised correctly as "vssadmin.exe delete shadows
+    # /all /quiet", the model still answered SUSPICIOUS / MEDIUM / 0.5, and a
+    # cleared audit log came back SUSPICIOUS / INFO. It was not failing to
+    # understand; it was declining to use the top of a three-point scale,
+    # which is what a 3B model does when asked to choose a label.
+    #
+    # `matched_criterion` turns that judgement into a lookup: name the
+    # criterion the observed text matches, or "none". Naming one determines
+    # the verdict, so the model is not being asked how bad something is - it
+    # is being asked whether a string is in a list.
     observed: str = Field(default="", description=(
-        "Values copied from the log and nothing else: the event ID, and the "
-        "process, account or object it names. No technique names, no tool "
-        "names, no words that do not appear in the log."))
+        "The ACTION the log records, copied from it: the full command line if "
+        "there is one, otherwise the object acted on. Not the event ID alone, "
+        "and not the parent process. No technique names - only text that "
+        "appears in the log."))
+    matched_criterion: str = Field(default="none", description=(
+        "Which listed CRITICAL criterion the text in `observed` matches, "
+        "quoted from that list, or 'none'. This decides the verdict."))
     summary: str = Field(default="", description=(
         "One sentence about this specific event, grounded in `observed`. "
         "<=180 characters."))

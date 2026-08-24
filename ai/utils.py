@@ -96,9 +96,14 @@ def _normalize_ollama_url(endpoint: str) -> str:
 # v3: `observed` added, and the criteria rewritten as literal evidence rather
 #     than technique descriptions - v2 copied its own criterion text into the
 #     summary and escalated an EID 4672 SYSTEM logon as credential dumping.
+# v4: criteria numbered and `matched_criterion` added. v3 understood the
+#     events - it summarised one correctly as "vssadmin.exe delete shadows
+#     /all /quiet" - and still never returned CRITICAL, because choosing a
+#     label off a three-point scale is a judgement and a 3B model settles in
+#     the middle. Naming which criterion matched is a lookup instead.
 # Each of these changes what the model answers, so cached verdicts from an
 # earlier version answer a different question and must not be reused.
-PROMPT_VERSION = os.getenv("AI_PROMPT_VERSION", "v3")
+PROMPT_VERSION = os.getenv("AI_PROMPT_VERSION", "v4")
 
 # Observed: llama3.2:3b on CPU takes ~47s for a single 2 KB event. The manual
 # worker batches ten events into one prompt, so its prompts are an order of

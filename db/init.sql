@@ -127,8 +127,14 @@ CREATE TABLE IF NOT EXISTS siem_events (
   ai_analyzed    TINYINT(1) NOT NULL DEFAULT 0,
   ai_analyzed_at TIMESTAMP NULL,
   dup_fp         CHAR(64) NULL,
+  -- MITRE ATT&CK technique IDs from the Sigma rules that matched, comma
+  -- separated. A column rather than a field inside the JSON body, because
+  -- coverage is a question asked across every event - "which techniques have
+  -- we ever seen" - and that cannot be answered by parsing a text column.
+  techniques     VARCHAR(255) NULL,
   created_at     TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
   KEY idx_siem_src (source(64)),
+  KEY idx_siem_tech (techniques),
   KEY idx_siem_sev (severity),
   KEY idx_siem_dup (dup_fp)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -137,6 +143,8 @@ CREATE TABLE IF NOT EXISTS siem_events (
 -- create_tables_if_not_exist when it already exists.
 ALTER TABLE siem_events ADD COLUMN severity VARCHAR(16) NULL;
 ALTER TABLE siem_events ADD KEY idx_siem_sev (severity);
+ALTER TABLE siem_events ADD COLUMN techniques VARCHAR(255) NULL;
+ALTER TABLE siem_events ADD KEY idx_siem_tech (techniques);
 
 -- ================== ai_log_checker_results (opsiyonel AI) ==================
 CREATE TABLE IF NOT EXISTS ai_log_checker_results (
