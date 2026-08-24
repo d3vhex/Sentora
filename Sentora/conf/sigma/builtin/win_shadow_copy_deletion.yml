@@ -1,0 +1,47 @@
+title: Volume Shadow Copies Deleted
+id: 4b9e2a71-5c38-4f6d-8e1b-7a2c4d90f3e6
+status: stable
+description: >
+    Deleting shadow copies removes the victim's ability to roll back, and it
+    is one of the last things ransomware does before it starts encrypting. By
+    the time this fires the operator has minutes rather than hours, so it is
+    deliberately broad across the several tools that can do it.
+references:
+    - https://attack.mitre.org/techniques/T1490/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    vssadmin_delete:
+        CommandLine|contains|all:
+            - 'vssadmin'
+            - 'delete'
+            - 'shadows'
+    vssadmin_resize:
+        CommandLine|contains|all:
+            - 'vssadmin'
+            - 'resize'
+            - 'shadowstorage'
+    wmic:
+        CommandLine|contains|all:
+            - 'wmic'
+            - 'shadowcopy'
+            - 'delete'
+    wbadmin:
+        CommandLine|contains|all:
+            - 'wbadmin'
+            - 'delete'
+            - 'catalog'
+    bcdedit:
+        CommandLine|contains|all:
+            - 'bcdedit'
+            - 'recoveryenabled'
+    condition: 1 of them
+falsepositives:
+    - A backup product pruning its own shadow storage on a schedule
+level: critical
+tags:
+    - attack.impact
+    - attack.t1490

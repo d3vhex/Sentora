@@ -226,3 +226,30 @@ def test_tactics_are_ordered_by_kill_chain_not_alphabetically():
     i_initial = page.index("'initial-access'")
     i_impact = page.index("'impact'")
     assert i_initial < i_impact
+
+
+def test_every_shipped_technique_has_a_tactic_on_the_page():
+    """The grid groups by tactic, and an unmapped technique falls into
+    "other" - present, but detached from where in a kill chain it sits, which
+    is the entire question the grid exists to answer.
+
+    Fails when a rule is added carrying a technique nobody mapped, which is
+    when it is cheap to fix rather than months later.
+    """
+    import re
+
+    from core.sigma_loader import load_dir
+
+    page = (FRONTEND / "pages" / "AttackCoverage.tsx").read_text(encoding="utf-8")
+    mapped = set(re.findall(r"\b(T\d{4}):", page))
+    shipped = {t.split(".")[0]
+               for t in load_dir(ROOT / "Sentora" / "conf" / "sigma").techniques}
+    assert not (shipped - mapped), \
+        f"shipped techniques with no tactic: {sorted(shipped - mapped)}"
+
+
+def test_coverage_is_not_zero_out_of_the_box():
+    """The page's "No Sigma rules installed" banner is correct advice and was
+    also, until rules shipped, what every install saw."""
+    from core.sigma_loader import load_dir
+    assert load_dir(ROOT / "Sentora" / "conf" / "sigma").techniques

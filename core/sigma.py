@@ -51,7 +51,20 @@ class UnsupportedRule(SigmaError):
 # because it changes how a list is combined rather than how a value matches.
 _VALUE_MODIFIERS = {
     "contains", "startswith", "endswith", "re", "base64", "base64offset",
-    "windash", "cidr",
+    "windash", "cidr", "utf16le", "utf16be", "utf16", "wide",
+}
+
+# Sigma's text-encoding modifiers, applied before base64 rather than after.
+#
+# These are not decoration. PowerShell's -EncodedCommand takes UTF-16LE, so a
+# needle encoded as UTF-8 and then base64'd cannot appear in the payload at
+# all - it would match nothing, quietly, forever. `wide` is Sigma's older
+# spelling of utf16le and means the same thing.
+_ENCODINGS = {
+    "utf16le": "utf-16-le",
+    "wide": "utf-16-le",
+    "utf16be": "utf-16-be",
+    "utf16": "utf-16",          # with the byte-order mark
 }
 
 
@@ -94,16 +107,42 @@ def _build_value_test(raw: Any, modifiers: list[str]) -> Callable[[str], bool]:
         return lambda text: bool(pattern.search(text))
 
     needles = [_as_text(raw)]
+
+    codec = next((_ENCODINGS[m] for m in modifiers if m in _ENCODINGS), None)
+    if codec and not ({"base64", "base64offset"} & set(modifiers)):
+        # Alone, an encoding modifier would compare UTF-16 bytes against text
+        # that is already str, and never be equal. Sigma defines it only as a
+        # step before base64, so anything else is a bug in the rule and is
+        # named rather than compiled into something that silently never fires.
+        raise UnsupportedRule(
+            "encoding modifier must be followed by base64 or base64offset")
+
+    def _encode(text: str) -> bytes:
+        return text.encode(codec) if codec else text.encode()
+
     if "base64" in modifiers:
-        needles = [base64.b64encode(n.encode()).decode() for n in needles]
+        needles = [base64.b64encode(_encode(n)).decode() for n in needles]
     elif "base64offset" in modifiers:
         # The same string encoded at each of the three byte alignments, which
-        # is how it appears when embedded in a larger blob.
+        # is how it appears once embedded in a larger blob.
+        #
+        # Both ends have to be trimmed, not just the leading one. base64 packs
+        # three bytes into four characters, so the first and last groups are
+        # shared with whatever surrounds the needle - a needle carrying its own
+        # final group matches only when it happens to sit at the very end of
+        # the payload. That is why an earlier version found "Net.WebClient" in
+        # nothing at all.
+        #
+        # How much to trim from the end depends on where the needle *ends*,
+        # which is the padding plus its own length - not on the padding alone.
+        starts, ends = (0, 2, 3), (None, -3, -2)
         expanded = []
         for n in needles:
+            encoded_bytes = _encode(n)
             for pad in range(3):
-                encoded = base64.b64encode(b"\x00" * pad + n.encode()).decode()
-                expanded.append(encoded[(pad * 4 + 2) // 3:].rstrip("="))
+                blob = base64.b64encode(b" " * pad + encoded_bytes).decode()
+                expanded.append(
+                    blob[starts[pad]:ends[(len(encoded_bytes) + pad) % 3]])
         needles = expanded
     if "windash" in modifiers:
         needles = [v for n in needles for v in _windash_variants(n)]
@@ -126,6 +165,15 @@ def _build_value_test(raw: Any, modifiers: list[str]) -> Callable[[str], bool]:
     return equals_or_glob
 
 
+def _as_list(value) -> list[str]:
+    """Sigma allows a single string where a list is expected."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    return [str(v).strip() for v in value if str(v).strip()]
+
+
 @dataclass
 class SigmaRule:
     """A parsed rule and the predicate its detection compiles to."""
@@ -138,6 +186,12 @@ class SigmaRule:
     tactics: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     description: str = ""
+    # What benign thing looks like this. The rule author is the only person
+    # who reliably knows, and the analyst deciding whether to dismiss the
+    # alert at 3am is the person who needs it - so it is carried through to
+    # the event rather than left in the YAML.
+    falsepositives: list[str] = field(default_factory=list)
+    references: list[str] = field(default_factory=list)
     source_path: str = ""
     _predicate: Callable[[dict], bool] | None = None
 
@@ -335,6 +389,8 @@ def parse(text: str, source_path: str = "") -> SigmaRule:
         tactics=tactics,
         tags=[str(t) for t in (doc.get("tags") or [])],
         description=str(doc.get("description") or "").strip(),
+        falsepositives=_as_list(doc.get("falsepositives")),
+        references=_as_list(doc.get("references")),
         source_path=source_path,
         _predicate=predicate,
     )

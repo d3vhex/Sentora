@@ -1,0 +1,38 @@
+title: Defender Exclusion Added Or Real-Time Protection Disabled
+id: 9e3f7b21-4a56-4c8d-b1f0-2d5a8c60e947
+status: stable
+description: >
+    An exclusion tells Defender to stop looking at a path. Adding one is how a
+    working directory is made safe before tools are staged in it, so the
+    interesting part is not the exclusion itself but whatever appears in that
+    path shortly afterwards.
+references:
+    - https://attack.mitre.org/techniques/T1562/001/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    mppreference:
+        CommandLine|contains:
+            - 'add-mppreference'
+            - 'set-mppreference'
+    exclusion:
+        CommandLine|contains:
+            - 'exclusionpath'
+            - 'exclusionextension'
+            - 'exclusionprocess'
+    disable_realtime:
+        CommandLine|contains: 'disablerealtimemonitoring'
+    stop_service:
+        CommandLine|contains|all:
+            - 'windefend'
+            - 'stop'
+    condition: (mppreference and (exclusion or disable_realtime)) or stop_service
+falsepositives:
+    - A documented exclusion for a database or build directory
+level: high
+tags:
+    - attack.defense_evasion
+    - attack.t1562.001

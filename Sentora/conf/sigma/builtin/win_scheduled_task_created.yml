@@ -1,0 +1,54 @@
+title: Scheduled Task Created To Run An Interpreter
+id: 3f6e1c84-8b27-4d59-a7e2-5c0f9b3a6d71
+status: stable
+description: >
+    Scheduled tasks are created constantly by ordinary software, so the task
+    alone says nothing. What is worth an alert is a task whose action is a
+    shell, a downloader, or a binary staged somewhere no installer would put
+    one - that is persistence, rather than a product scheduling its own
+    updater.
+references:
+    - https://attack.mitre.org/techniques/T1053/005/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: windows
+    service: security
+detection:
+    task_created:
+        EventID: 4698
+    task_interpreter:
+        TaskCommand|contains:
+            - 'powershell'
+            - 'cmd.exe'
+            - 'mshta'
+            - 'rundll32'
+            - 'wscript'
+            - 'cscript'
+            - 'certutil'
+            - 'bitsadmin'
+    schtasks_create:
+        CommandLine|contains|all:
+            - 'schtasks'
+            - '/create'
+    schtasks_interpreter:
+        CommandLine|contains:
+            - 'powershell'
+            - 'cmd /c'
+            - 'cmd.exe /c'
+            - 'mshta'
+    task_staged_binary:
+        TaskCommand|contains:
+            - '\users\public\'
+            - '\appdata\'
+            - '\temp\'
+            - '\programdata\'
+    condition: (task_created and (task_interpreter or task_staged_binary))
+        or (schtasks_create and schtasks_interpreter)
+falsepositives:
+    - Management tooling that schedules PowerShell maintenance scripts
+level: high
+tags:
+    - attack.persistence
+    - attack.execution
+    - attack.t1053.005

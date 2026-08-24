@@ -1,0 +1,43 @@
+title: Remote Script Piped Straight Into A Shell
+id: 4a8f2d63-7b15-4c90-a2e8-6d1b4f7c3095
+status: experimental
+description: >
+    curl piped into sh executes whatever the server returns, at the privilege
+    of the caller, leaving no copy on disk to examine afterwards. A great deal
+    of legitimate software is installed this way, which is precisely why it is
+    an effective delivery method - and why this is high rather than critical.
+references:
+    - https://attack.mitre.org/techniques/T1059/004/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: linux
+detection:
+    msg_downloader:
+        Message|contains:
+            - 'curl'
+            - 'wget'
+    msg_piped:
+        Message|contains:
+            - '| sh'
+            - '|sh'
+            - '| bash'
+            - '|bash'
+            - '| python'
+    cmd_downloader:
+        CommandLine|contains:
+            - 'curl'
+            - 'wget'
+    cmd_piped:
+        CommandLine|contains:
+            - '| sh'
+            - '|sh'
+            - '| bash'
+            - '|bash'
+    condition: (msg_downloader and msg_piped) or (cmd_downloader and cmd_piped)
+falsepositives:
+    - An install documented by its vendor as a curl-to-shell one-liner
+level: high
+tags:
+    - attack.execution
+    - attack.t1059.004
