@@ -97,6 +97,7 @@ def main() -> int:
         print("\n[!] Nothing labelled to evaluate.")
         return 2
 
+    from ai.gating import describe as describe_gate, surfaces
     from ai.prompts import PROMPTS
     from ai.schemas import TriageVerdict
     from ai.utils import AITransientError, analyze_structured
@@ -126,16 +127,23 @@ def main() -> int:
                 endpoint=endpoint or None,
             )
             actual = verdict.verdict if verdict else NO_VERDICT
+            shown = surfaces(verdict)
+            sev = verdict.severity if verdict else None
+            conf = verdict.confidence if verdict else None
             if error:
                 actual = NO_VERDICT
+                shown = False
         except AITransientError as e:
             print(f"  !! {row['id']}: model unreachable ({e})")
             actual = NO_VERDICT
+            shown = False
+            sev = conf = None
         elapsed = time.monotonic() - started
 
         results.append(Case(
             id=row["id"], expected=row["expected"], actual=actual,
-            latency_s=elapsed, note=row.get("note", ""),
+            latency_s=elapsed, note=row.get("note", ""), surfaced=shown,
+            severity=sev, confidence=conf,
         ))
         mark = "ok " if row["expected"] == actual else "MISS"
         print(f"  [{i:>3}/{len(cases)}] {mark} {row['id']}  "
@@ -148,12 +156,40 @@ def main() -> int:
           f"{'  <-- the model failed to answer these' if report.no_verdict else ''}")
     if report.median_latency is not None:
         print(f"  Median latency ........ {report.median_latency:.1f}s")
+    constant = report.constant_verdict
+    if constant:
+        # Before the metrics, because when this is true they are all
+        # descriptions of the same fact and easy to read past.
+        print()
+        print(f"  !! THE MODEL ANSWERED {constant} TO EVERY CASE.")
+        print( "     Its output is a constant function: it carries no")
+        print( "     information and cannot be a detection capability,")
+        print( "     whatever the figures below say.")
+
     print()
     er, ep = report.escalation_recall, report.escalation_precision
     print(f"  Escalation recall ..... {f'{er:.1%}' if er is not None else 'n/a'}"
           f"   (of events that should be escalated, how many were)")
     print(f"  Escalation precision .. {f'{ep:.1%}' if ep is not None else 'n/a'}"
           f"   (of escalations, how many deserved it)")
+
+    # The number that describes the product rather than the model. These came
+    # apart once already: a prompt rewrite took escalation recall from 0% to
+    # 40% while every detection landed just under the confidence the worker
+    # requires, so an analyst saw exactly as much as before.
+    sr = report.surfaced_recall
+    print(f"  Reaches an analyst .... {f'{sr:.1%}' if sr is not None else 'n/a'}"
+          f"   (of those, how many production would show)")
+    if sr is not None and er is not None and sr < er:
+        print(f"     {er:.0%} of attacks were flagged; {sr:.0%} would be seen.")
+        print(f"     Gate: {describe_gate()}")
+
+    anchored = report.confidence_is_anchored
+    if anchored is not None:
+        print()
+        print(f"  !! Every verdict came back at confidence {anchored:.2f}.")
+        print( "     The model is not computing a confidence, it is emitting a")
+        print( "     constant. Do not tune the gate against it.")
     print()
     print("  Per class:")
     for label, sc in sorted(report.by_class.items()):

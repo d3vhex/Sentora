@@ -35,17 +35,32 @@ DefensiveOutcome = Literal["ACT", "MONITOR", "IGNORE", "INSUFFICIENT_DATA"]
 
 
 class _Base(BaseModel):
-    """Shared coercion.
+    """Shared coercion. Deliberately declares no fields.
 
     Small local models are loose with types: confidence arrives as "0.85", as
     85, or missing. Rejecting the whole verdict over that would throw away a
     usable answer, so coerce here and let genuinely malformed output fail.
+
+    **Field order is load-bearing.** Under schema-constrained generation the
+    model emits fields in schema order, and Pydantic puts base-class fields
+    first. With `severity` and `confidence` declared here, every verdict began
+    "INFO, 0.0" - the model committed to a judgement before it had written a
+    word about what the event was, then wrote a summary consistent with the
+    judgement it had already made.
+
+    That is not a hypothesis. Asked the same LSASS dump directly, llama3.2:3b
+    answered "Yes, this is evidence of credential dumping". Asked through this
+    schema it answered NOT_CRITICAL, severity INFO, confidence 0.0, summary
+    "Routine logon event" - and did so for all 542 events in production.
+
+    So the subclasses declare their own fields, in the order they should be
+    thought in: what happened, what it indicates, then how bad it is and how
+    sure we are.
     """
 
-    severity: Severity = "INFO"
-    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-
-    @field_validator("confidence", mode="before")
+    # check_fields=False: the fields live on the subclasses now, so the
+    # validator cannot see them from here. See the ordering note above.
+    @field_validator("confidence", mode="before", check_fields=False)
     @classmethod
     def _coerce_confidence(cls, v):
         if v is None or v == "":
@@ -59,7 +74,7 @@ class _Base(BaseModel):
             f = f / 100.0
         return max(0.0, min(1.0, f))
 
-    @field_validator("severity", mode="before")
+    @field_validator("severity", mode="before", check_fields=False)
     @classmethod
     def _coerce_severity(cls, v):
         s = str(v or "INFO").strip().upper()
@@ -67,11 +82,20 @@ class _Base(BaseModel):
 
 
 class TriageVerdict(_Base):
-    """Automation worker: is this event worth an analyst's attention?"""
+    """Automation worker: is this event worth an analyst's attention?
 
-    verdict: TriageOutcome = "NOT_CRITICAL"
+    Declared in reasoning order - see the note on _Base. `summary` first, so
+    the model has to say what the event is before it is allowed to say how
+    serious it is.
+    """
+
+    summary: str = Field(default="", description=(
+        "What this event actually shows: the process, event ID, account and "
+        "command line. Describe it before judging it. One sentence, <=180 chars."))
     indicator: str = Field(default="none", description="MITRE ID plus short label, or 'none'")
-    summary: str = Field(default="", description="One sentence, at most 180 characters")
+    verdict: TriageOutcome = "NOT_CRITICAL"
+    severity: Severity = "INFO"
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     recommended_action: str = Field(default="MONITOR")
 
     @field_validator("verdict", mode="before")
@@ -82,13 +106,20 @@ class TriageVerdict(_Base):
 
 
 class DeepAnalysis(_Base):
-    """Manual worker: operator asked for this, so always produce something."""
+    """Manual worker: operator asked for this, so always produce something.
 
-    verdict: TriageOutcome = "NOT_CRITICAL"
+    Same ordering rule as TriageVerdict: narrative first, judgement after.
+    """
+
+    summary: str = Field(default="", description=(
+        "2-4 sentence technical narrative of what the telemetry shows, "
+        "written before any judgement is made about it."))
     kill_chain_stage: str = "none"
     techniques: list[str] = Field(default_factory=list)
     iocs: list[str] = Field(default_factory=list)
-    summary: str = ""
+    verdict: TriageOutcome = "NOT_CRITICAL"
+    severity: Severity = "INFO"
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     next_steps: list[str] = Field(default_factory=list)
 
     @field_validator("verdict", mode="before")
@@ -111,13 +142,22 @@ class DeepAnalysis(_Base):
 
 
 class DefensiveDecision(_Base):
-    """Defensive worker: should the platform do something, and what?"""
+    """Defensive worker: should the platform do something, and what?
 
+    Same ordering rule. This one dispatches SOAR actions, so a judgement made
+    before the event has been described is the most expensive version of the
+    problem.
+    """
+
+    event_name: str = Field(default="", description="The event, named: channel, ID and what it is")
+    reason: str = Field(default="", description=(
+        "Full sentence an analyst can paste into a ticket, describing what "
+        "happened - written before the verdict below."))
     verdict: DefensiveOutcome = "MONITOR"
-    event_name: str = ""
+    severity: Severity = "INFO"
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     action: str = "MONITOR"
     target: str = "none"
-    reason: str = Field(default="", description="Full sentence an analyst can paste into a ticket")
 
     @field_validator("verdict", mode="before")
     @classmethod

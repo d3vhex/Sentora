@@ -16,6 +16,7 @@ from ai.utils import (
     queue_soar_action,
     save_ai_results,
 )
+from ai.gating import surfaces
 from ai.schemas import (
     TriageVerdict, DeepAnalysis, DefensiveDecision, coherence_problem, render_summary,
 )
@@ -125,17 +126,10 @@ async def handle_automation(agent, table, data, api_key, endpoint, model=None):
 
     intel_match = await asyncio.to_thread(get_threat_intel_summary, log_text)
 
-    is_critical = (
-        verdict.verdict == 'CRITICAL'
-        and verdict.severity in ('CRITICAL', 'HIGH')
-        and verdict.confidence >= CRITICAL_CONFIDENCE_THRESHOLD
-    )
-    is_suspicious = (
-        verdict.verdict == 'SUSPICIOUS'
-        and verdict.confidence >= SUSPICIOUS_CONFIDENCE_THRESHOLD
-    )
-
-    if is_critical or is_suspicious or intel_match:
+    # ai/gating.surfaces, not a copy of the rule: the eval harness scores the
+    # same gate, and while they were separate the harness reported 40%
+    # escalation recall on runs where production surfaced nothing at all.
+    if surfaces(verdict) or intel_match:
         summary_line = render_summary(verdict, "AUTO")
         if intel_match:
             summary_line = f"{summary_line}\n[!!] GLOBAL THREAT INTEL MATCH: {intel_match}"

@@ -282,3 +282,85 @@ class TestCoherence:
             called = {getattr(n.func, "id", "") for n in ast.walk(fn)
                       if isinstance(n, ast.Call)}
             assert "coherence_problem" in called, f"{name} does not check coherence"
+
+
+# --------------------------------------------------------------------------
+# Field order decides what the model thinks first
+# --------------------------------------------------------------------------
+
+class TestReasoningOrder:
+    """Under constrained generation the model emits fields in schema order.
+
+    `severity` and `confidence` used to be declared on `_Base`, and Pydantic
+    puts base-class fields first - so every verdict began "INFO, 0.0". The
+    model committed to a judgement before writing a word about what the event
+    was, then wrote a summary that agreed with the judgement it had already
+    made.
+
+    The effect was total. Asked directly, llama3.2:3b said of an LSASS dump
+    "Yes, this is evidence of credential dumping". Asked through this schema
+    it answered NOT_CRITICAL / INFO / 0.0, summary "Routine logon event" - and
+    gave the same answer to all 15 attack cases and all 542 events in
+    production.
+
+    Description first is therefore not a style preference. It is the ordering
+    the model reasons in.
+    """
+
+    def _order(self, model):
+        from ai.schemas import constrained_schema
+        return list(constrained_schema(model)["properties"].keys())
+
+    def test_triage_describes_before_it_judges(self):
+        from ai.schemas import TriageVerdict
+        order = self._order(TriageVerdict)
+        assert order.index("summary") < order.index("verdict")
+        assert order.index("summary") < order.index("severity")
+        assert order.index("summary") < order.index("confidence")
+
+    def test_the_indicator_comes_before_the_verdict(self):
+        """Naming the technique is part of working out how bad it is."""
+        from ai.schemas import TriageVerdict
+        order = self._order(TriageVerdict)
+        assert order.index("indicator") < order.index("verdict")
+
+    def test_deep_analysis_narrates_before_it_judges(self):
+        from ai.schemas import DeepAnalysis
+        order = self._order(DeepAnalysis)
+        assert order.index("summary") < order.index("verdict")
+        assert order.index("summary") < order.index("severity")
+
+    def test_defensive_describes_before_it_dispatches(self):
+        """This one triggers SOAR actions, so it is the expensive case."""
+        from ai.schemas import DefensiveDecision
+        order = self._order(DefensiveDecision)
+        assert order.index("reason") < order.index("verdict")
+        assert order.index("reason") < order.index("action")
+        assert order.index("event_name") < order.index("verdict")
+
+    def test_the_base_declares_no_fields(self):
+        """The mechanism. Anything declared on _Base is emitted first, by
+        every schema, before whatever that schema wanted asked first."""
+        from ai.schemas import _Base
+        assert not _Base.model_fields, (
+            f"_Base declares {list(_Base.model_fields)}, which will be "
+            f"generated before every subclass's own fields"
+        )
+
+    def test_coercion_survived_the_move(self):
+        """The validators now live apart from the fields they validate."""
+        from ai.schemas import DefensiveDecision, TriageVerdict
+        v = TriageVerdict(severity=" hIgH ", confidence="85", verdict="critical")
+        assert (v.severity, v.confidence, v.verdict) == ("HIGH", 0.85, "CRITICAL")
+        d = DefensiveDecision(severity=None, confidence=None, verdict="nonsense")
+        assert (d.severity, d.confidence, d.verdict) == ("INFO", 0.0, "MONITOR")
+
+    def test_every_field_is_still_required_of_the_model(self):
+        """Reordering must not have reintroduced the optional-field bug: a
+        defaulted field is omitted from `required`, and the model then skips
+        it, which is how verdicts arrived as INFO/0.00 in the first place."""
+        from ai.schemas import DeepAnalysis, DefensiveDecision, TriageVerdict, constrained_schema
+        for model in (TriageVerdict, DeepAnalysis, DefensiveDecision):
+            schema = constrained_schema(model)
+            assert set(schema["required"]) == set(schema["properties"]), model.__name__
+            assert schema["additionalProperties"] is False

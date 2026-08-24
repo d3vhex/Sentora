@@ -1,12 +1,10 @@
 import os
 import re
-import json
 import time
 import requests
 import mysql.connector
 import hashlib
 from contextlib import contextmanager
-from datetime import datetime
 
 DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
 DB_USER = os.getenv("DB_USER", "root")
@@ -94,7 +92,10 @@ def _normalize_ollama_url(endpoint: str) -> str:
 # Bump when a prompt template changes. It is part of the cache key, so a
 # reworded prompt cannot keep serving verdicts produced by the old one — the
 # previous cache had no such notion and a stale answer lived forever.
-PROMPT_VERSION = os.getenv("AI_PROMPT_VERSION", "v1")
+# v2: the triage prompt was rewritten and the schema field order changed.
+# Both alter what the model answers, so every cached verdict from v1 is a
+# verdict to a different question and must not be reused.
+PROMPT_VERSION = os.getenv("AI_PROMPT_VERSION", "v2")
 
 # Observed: llama3.2:3b on CPU takes ~47s for a single 2 KB event. The manual
 # worker batches ten events into one prompt, so its prompts are an order of
