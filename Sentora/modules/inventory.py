@@ -168,7 +168,7 @@ def get_gpu_info():
                 if isinstance(data, list):
                     return " / ".join([d.get("Caption", "") for d in data])
                 return data.get("Caption", "Unknown GPU")
-        except: pass
+        except Exception: pass
     return "Unknown GPU"
 
 def get_mobo_info():
@@ -181,7 +181,7 @@ def get_mobo_info():
                 data = json.loads(res.stdout)
                 if isinstance(data, list): data = data[0]
                 return f"{data.get('Manufacturer', '')} {data.get('Product', '')}".strip()
-        except: pass
+        except Exception: pass
     return "Unknown Motherboard"
 
 def scan_inventory():
@@ -217,7 +217,7 @@ def scan_inventory():
                 "product_id": part.mountpoint, "serial_number": "N/A", "status": "active",
                 "timestamp": timestamp, "sent": False
             })
-        except: continue
+        except Exception: continue
 
     software_list = get_installed_software()
     for sw in software_list:

@@ -136,7 +136,7 @@ cd Sentora\
 # produces Sentora\main.exe
 ```
 
-Both scripts run `pip install -r requirements.txt`, then invoke
+Both scripts run `pip install -r requirements.lock`, then invoke
 PyInstaller with `--onefile`, embedding `conf/` and `modules/` via
 `--add-data`. After rebuilding, restart the server container so the new
 binary is served on the next download request.
@@ -175,7 +175,7 @@ Skip the installer for local dev:
 
 ```bash
 # 1. Install deps
-pip install -r requirements.txt
+pip install -r requirements.lock
 
 # 2. Hand the agent an enrolment config (or pass flags directly)
 python main.py --config /path/to/config.json

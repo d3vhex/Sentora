@@ -23,12 +23,17 @@ CREATE TABLE users (
     created_by VARCHAR(100),
     updated_by VARCHAR(100),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP
+    updated_at TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP,
+    -- The seeded admin below carries a password hash that is published in
+    -- this repository. Until it is changed, that session may do nothing
+    -- except change it. See app.py:init_password_policy for the migration
+    -- that adds this to deployments created before the column existed.
+    must_change_password TINYINT(1) NOT NULL DEFAULT 0
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 
-INSERT INTO users (username, password, role, created_by)
-VALUES ('admin', '$2b$12$YrcCyrQMGN16pntv7BfpWuayUJ2Kg7Dpr4XsYOSa4JXLDEMDzkNW.', 'admin', 'system');
+INSERT INTO users (username, password, role, created_by, must_change_password)
+VALUES ('admin', '$2b$12$YrcCyrQMGN16pntv7BfpWuayUJ2Kg7Dpr4XsYOSa4JXLDEMDzkNW.', 'admin', 'system', 1);
 
 
 

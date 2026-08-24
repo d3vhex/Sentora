@@ -664,7 +664,7 @@ def follow_windows_eventlog(rules_list: List[Dict], exclude_patterns, log_type,
                 time.sleep(5)
             if hand:
                 try: win32evtlog.CloseEventLog(hand)
-                except: pass
+                except Exception: pass
 
 def stats_reporter(metrics: MetricsCollector, interval: int = 60):
     """Periodic counters, on one line, and only when they moved.

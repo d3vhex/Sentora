@@ -113,8 +113,8 @@ for the one-time agent build step). The full stack wants ~16 GB RAM,
 see [System requirements](#system-requirements) below.
 
 ```bash
-git clone https://github.com/0giv/Sentora-Community-Edition.git
-cd Sentora-Community-Edition
+git clone https://github.com/d3vhex/Sentora.git
+cd Sentora
 
 # .env holds your local secrets. Never commit it.
 cp .env.example .env
@@ -287,6 +287,62 @@ middleware through a registry, so it applies regardless of which side of
 If that line reports `0 permission-gated`, RBAC is not being enforced — treat
 it as an outage.
 
+Every route must be one of three things: permission-gated, listed in
+`_PUBLIC_HANDLERS`, or named in `SESSION_ONLY_HANDLERS` in
+`tests/test_auth_wiring.py` with a comment saying why session alone is
+enough. A test asserts it, so a new route cannot quietly arrive ungoverned —
+which is how `run_playbook`, `delete_soar_action` and `test_ldap_connection`
+had ended up reachable by any account that could log in.
+
+### Login throttling
+
+Five failed attempts for one account, or twenty from one address, inside
+fifteen minutes, and further attempts are refused with `429` until the window
+passes. Counted from `login_logs`, which was already recording every failure
+and which nothing read — bcrypt was the only brake on online guessing.
+
+| Setting | Default | Meaning |
+| :--- | :--- | :--- |
+| `LOGIN_MAX_FAILURES_USER` | `5` | Per-account failures allowed in the window |
+| `LOGIN_MAX_FAILURES_IP` | `20` | Per-address failures; higher, because an office shares one NAT address |
+| `LOGIN_LOCKOUT_WINDOW_MIN` | `15` | How far back failures are counted |
+
+The check runs before the password comparison, so it also removes the timing
+difference between a known and an unknown username. It fails open if
+`login_logs` is unreachable: a login page that cannot be reached because the
+audit table is down is its own outage.
+
+### Client addresses behind a proxy
+
+`X-Forwarded-For` is honoured only from a peer listed in `TRUSTED_PROXIES`
+(comma-separated addresses or CIDRs, empty by default). With nothing in front
+of the app the header is attacker-supplied, so believing it unconditionally —
+which is what this replaced — let a caller write any address into the audit
+trail and reset their own rate limit in the same request.
+
+```
+TRUSTED_PROXIES=10.0.0.0/8,192.168.1.5
+```
+
+Leave it empty when the app is reached directly.
+
+### The agent's own API
+
+The agent listens on `0.0.0.0:9099` and runs as SYSTEM or root. Every route
+requires `X-Agent-Key`; `/self_destruct` requires this agent's own enrolment
+key specifically, so a leaked fleet-wide secret cannot uninstall every
+endpoint at once. `/health` answers liveness without a key and discloses
+nothing further without one.
+
+There is no permissive fallback. An earlier build accepted any non-empty key
+whenever `AGENT_MASTER_SECRET` was unset on the host — which nothing ever set,
+so it was the default everywhere. An EDR that fails open is worse than no EDR,
+because the console reports the endpoint as protected.
+
+`AGENT_BIND` moves the listener. It is still `0.0.0.0` by default because the
+server reaches agents over HTTP on this port; binding to loopback needs a
+replacement transport, not a config change.
+
 ### CORS
 
 `CORS_ORIGINS` defaults to empty. In the normal deployment this app serves the
@@ -301,21 +357,40 @@ and set `SESSION_COOKIE_SAMESITE=None` with `SESSION_COOKIE_SECURE=1`.
 Rotate these before exposing the platform to anything beyond `localhost`:
 
 - `DB_PASSWORD`
-- The `admin / admin123` UI login
 - `AGENT_SHARED_SECRET` (agent auth fallback). Auto-generated on first
   boot if unset.
 
-### Self-signed certs
+The `admin / admin123` login no longer needs remembering: the seeded account
+is created with `must_change_password`, and while that is set the session can
+reach nothing but `/change-password`. Enforced in middleware rather than in
+the UI, because a flag the front end is trusted to honour is a suggestion and
+the API answers curl too.
 
-`certs/` ships with self-signed dev certs so the stack works on
-`localhost` out of the box. They are public and grant zero trust. For
-anything that isn't your laptop, regenerate:
+### TLS certificates
+
+Nothing ships a private key. A working `certs/server.key` and
+`certs/rootCA.key` used to be committed, which gave every deployment the same
+TLS identity and published it: anyone who had ever cloned the repository held
+the key, so the certificate proved nothing about who was on the other end.
+
+With `TLS_ENABLED=1` and no certificate present, the app generates one on
+first boot. Each install gets its own key and the key never leaves the machine
+that made it. `certs/*.key` and `certs/*.crt` are git-ignored.
+
+The CA is self-signed, so browsers warn unless you trust it explicitly. That
+warning is honest — prefer it to a shared secret that produces no warning at
+all. For anything public, point `TLS_CERT` / `TLS_KEY` at a real certificate;
+when they are set and missing, the app says so rather than substituting a
+self-signed one.
+
+To regenerate by hand:
 
 ```bash
-cd certs && python generate_certs.py
+python certs/generate_certs.py --force
 ```
 
-Or supply your own organisational CA.
+**The old keys are still in git history.** Treat the pair that shipped before
+this change as burned; new installs no longer use it.
 
 ### Local Fernet keys
 
@@ -432,8 +507,9 @@ Operational docs:
 mysql -u root -p < db/init_userdb.sql
 mysql -u root -p < db/init.sql
 
-# 2. Backend
-pip install -r requirements.txt
+# 2. Backend. requirements.lock pins every version the image is built
+#    from; requirements.txt is the loose list it was resolved from.
+pip install -r requirements.lock
 python app.py
 
 # 3. Ingest (separate terminal)

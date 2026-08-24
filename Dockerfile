@@ -24,8 +24,11 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python backend dependencies
-COPY ./requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+# The lock, not the loose list. requirements.txt says what we depend on;
+# requirements.lock says which versions this image is built from, so the
+# image a commit produces today is the image it produces next month.
+COPY ./requirements.txt ./requirements.lock /app/
+RUN pip install --no-cache-dir -r /app/requirements.lock
 
 # Copy backend source. See .dockerignore — .env and data/ are excluded so
 # secrets are not baked into the image layers.

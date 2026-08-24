@@ -92,13 +92,23 @@ async def load(cur, raw_token: str | None) -> dict | None:
     """
     if not raw_token:
         return None
+    # `must_change_password` is joined in rather than fetched separately: the
+    # middleware needs it on every request to gate the session, and a second
+    # round-trip per request to answer "is this account still on its seeded
+    # password" would be paid by everyone forever.
+    #
+    # LEFT JOIN, so a session whose user row has been deleted still resolves
+    # and is handled by the existing checks rather than vanishing here.
     await cur.execute(
-        """SELECT token_hash, user_id, username, role, auth_type, last_seen_at
-             FROM sessions
-            WHERE token_hash = %s
-              AND revoked_at IS NULL
-              AND expires_at > NOW()
-              AND last_seen_at > (NOW() - INTERVAL %s MINUTE)""",
+        """SELECT s.token_hash, s.user_id, s.username, s.role, s.auth_type,
+                  s.last_seen_at,
+                  COALESCE(u.must_change_password, 0) AS must_change_password
+             FROM sessions s
+             LEFT JOIN users u ON u.id = s.user_id
+            WHERE s.token_hash = %s
+              AND s.revoked_at IS NULL
+              AND s.expires_at > NOW()
+              AND s.last_seen_at > (NOW() - INTERVAL %s MINUTE)""",
         (hash_token(raw_token), SESSION_IDLE_MINUTES),
     )
     return await cur.fetchone()

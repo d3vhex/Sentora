@@ -122,3 +122,113 @@ def test_permission_registry_is_keyed_before_the_wrapper_is_built(tree):
         "require_permission no longer populates the registry — the middleware "
         "would silently stop enforcing every stacked-decorator route"
     )
+
+
+# --------------------------------------------------------------------------
+# Every route is accounted for
+# --------------------------------------------------------------------------
+#
+# The checks above catch a route whose permission is misspelled, or one that
+# lost its decorator to the ordering bug. None of them noticed a route that
+# never had a decorator at all: 143 routes carried 103 declarations, and the
+# forty in between were nobody's job to explain.
+#
+# Most were fine. `run_playbook`, `delete_soar_action`, `patch_automation_status`
+# and `test_ldap_connection` were not - any account that could log in could
+# execute a playbook, close a response action, or point the server's LDAP
+# client at a host of its choosing.
+#
+# This is the assertion that makes the gap impossible to reopen quietly. A new
+# route is permission-gated, publicly declared, or named here with a reason.
+
+# Reachable with a session and no further authorisation. Each is either about
+# the caller themselves, or a static catalogue the UI needs before it knows
+# what the user may do.
+SESSION_ONLY_HANDLERS = {
+    # Acts on the calling session only, and binds to it rather than to a
+    # username in the body.
+    "change_password",
+    # Answers "what may I do" - gating it on a permission would be circular.
+    "fetch_my_permissions",
+    # Static SOAR builder catalogues. No tenant data, no state.
+    "get_node_palette",
+    "get_playbook_examples",
+    # Enrolment: these check manage_agent inside the handler, before doing
+    # anything, because they also serve token-authenticated callers.
+    "enroll_agent",
+    "list_enrollments",
+    "revoke_enrollment",
+}
+
+# Named individually so a bulk edit to the list above cannot quietly reopen
+# the ones that mattered.
+MUST_STAY_GATED = [
+    "clear_playbook_runs", "delete_soar_action", "get_soar_actions_api",
+    "patch_automation_status", "resolve_soar_action", "run_automation_alias",
+    "run_playbook", "test_ldap_connection",
+]
+
+
+def _route_functions(tree: ast.Module) -> dict:
+    out = {}
+    for fn in _functions(tree):
+        names = _decorator_names(fn)
+        if any(n.split(".")[-1] in ROUTE_DECORATORS and n.startswith("app.")
+               for n in names):
+            out[fn.name] = (names, fn)
+    return out
+
+
+def test_the_route_scan_finds_them_all(tree):
+    """Guard against a green run caused by matching nothing."""
+    found = _route_functions(tree)
+    assert len(found) > 100, f"only {len(found)} routes found; the scan is broken"
+
+
+def test_every_route_is_public_permissioned_or_explicitly_session_only(tree):
+    public = _literal_set(tree, "_PUBLIC_HANDLERS")
+    ungoverned = []
+    for name, (names, fn) in sorted(_route_functions(tree).items()):
+        if "require_permission" in names:
+            continue
+        if name in public or name in SESSION_ONLY_HANDLERS:
+            continue
+        if "user_has_permission" in ast.unparse(fn):
+            continue          # checked inline, before doing the work
+        ungoverned.append(name)
+
+    assert not ungoverned, (
+        "these routes are reachable by any authenticated account with no "
+        "authorisation check:\n  "
+        + "\n  ".join(ungoverned)
+        + "\n\nAdd @require_permission(...), or add the handler to "
+          "SESSION_ONLY_HANDLERS with a comment saying why that is safe."
+    )
+
+
+def test_the_session_only_list_does_not_name_gated_routes(tree):
+    """Otherwise the list grows stale and stops meaning anything."""
+    routes = _route_functions(tree)
+    contradictions = sorted(
+        name for name in SESSION_ONLY_HANDLERS
+        if name in routes and "require_permission" in routes[name][0]
+    )
+    assert not contradictions, (
+        f"listed as session-only but actually gated: {contradictions}"
+    )
+
+
+def test_the_session_only_list_has_no_dead_entries(tree):
+    missing = sorted(SESSION_ONLY_HANDLERS - set(_route_functions(tree)))
+    assert not missing, (
+        f"SESSION_ONLY_HANDLERS names handlers that are not routes: {missing}"
+    )
+
+
+@pytest.mark.parametrize("name", MUST_STAY_GATED)
+def test_the_routes_that_prompted_this_stay_gated(name, tree):
+    routes = _route_functions(tree)
+    assert name in routes, f"{name} is no longer a route; update this test"
+    names, fn = routes[name]
+    assert ("require_permission" in names
+            or "user_has_permission" in ast.unparse(fn)), name

@@ -206,6 +206,63 @@ CASES = [
            "[PowerShell] EID=4104, Cat=2 | ScriptBlock | "
            "[Convert]::FromBase64String($env:APP_CONFIG) | "
            "ParentImage=C:\\Program Files\\Microsoft VS Code\\Code.exe")),
+
+    # ---- observed false positives -----------------------------------------
+    # These are not invented. They are events this deployment actually
+    # produced, which the model actually escalated as credential dumping with
+    # confidence 1.00 and a recommendation to isolate the host.
+    #
+    # They are here because the invented hard negatives above did not catch
+    # it. Those were written by asking "what would look like an attack?", and
+    # the answer came from the same head that wrote the prompt - so they
+    # probed the failures I had already thought of. The real false positives
+    # were the most ordinary events on the machine, which is exactly why they
+    # did not occur to me.
+    #
+    # A corpus of negatives you imagined measures your imagination. Keep
+    # taking these from the telemetry.
+    ("observed-4672-system-privileges", "NOT_CRITICAL",
+     "OBSERVED false positive. EID 4672 for S-1-5-18 is 'special privileges "
+     "assigned to new logon' for SYSTEM. It fires on essentially every SYSTEM "
+     "logon, thousands of times a day, on every Windows host in existence. "
+     "The model called this T1055 credential dumping at confidence 1.00 and "
+     "recommended ISOLATE_HOST.",
+     event(SEC, "HIGH", "ACTIVE_DIRECTORY",
+           "[Microsoft-Windows-Security-Auditing] EID=4672, Cat=12548 | "
+           "S-1-5-18 | SYSTEM | NT AUTHORITY | 0x3e7 | "
+           "SeAssignPrimaryTokenPrivilege SeTcbPrivilege SeSecurityPrivilege "
+           "SeTakeOwnershipPrivilege SeLoadDriverPrivilege SeBackupPrivilege "
+           "SeRestorePrivilege SeDebugPrivilege SeAuditPrivilege")),
+
+    ("observed-4798-git-bash", "NOT_CRITICAL",
+     "OBSERVED false positive. EID 4798 is 'a user's local group membership "
+     "was enumerated', here by Git Bash starting up, for the user's own "
+     "account. The model called it Credential Access and recommended "
+     "ISOLATE_HOST.",
+     event(SEC, "CRITICAL", "DESERIALIZATION",
+           "[Microsoft-Windows-Security-Auditing] EID=4798, Cat=13824 | pc | "
+           "DESKTOP-EVS8H9J | S-1-5-21-531660122-344579815-2653107626-1001 | "
+           "S-1-5-21-531660122-344579815-2653107626-1001 | pc | "
+           "DESKTOP-EVS8H9J | 0xf7bc2 | 0x3fe4 | "
+           "C:\\Program Files\\Git\\usr\\bin\\bash.exe")),
+
+    ("observed-7040-service-start-type", "NOT_CRITICAL",
+     "OBSERVED false positive. A service start type changed - which Windows "
+     "Update, driver installs and Docker Desktop all do routinely.",
+     event(SYS, "MEDIUM", "SYSTEM_SECURITY",
+           "[System] EID=7040, Cat=0 | The start type of the Background "
+           "Intelligent Transfer Service service was changed from demand "
+           "start to auto start.")),
+
+    ("observed-4624-system-logon", "NOT_CRITICAL",
+     "OBSERVED false positive shape. A network logon by the machine account "
+     "to itself. LogonType 5 is the Service Control Manager starting a "
+     "service; there is no more routine event on Windows.",
+     event(SEC, "MEDIUM", "WINDOWS_SECURITY",
+           "[Microsoft-Windows-Security-Auditing] EID=4624, Cat=12544 | "
+           "S-1-5-18 | SYSTEM | NT AUTHORITY | LogonType=5 | "
+           "AuthenticationPackage=Negotiate | "
+           "ProcessName=C:\\Windows\\System32\\services.exe")),
 ]
 
 

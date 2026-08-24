@@ -165,7 +165,7 @@ def get_hardware_inventory():
                         "serial_number": item.get("InstanceId", "N/A"),
                         "status": "active"
                     })
-        except: pass
+        except Exception: pass
     else:
         try:
             res = subprocess.run(["lsusb"], capture_output=True, text=True, encoding='utf-8', errors='replace')
@@ -174,7 +174,7 @@ def get_hardware_inventory():
                     "type": "usb",
                     "name": line.strip()
                 })
-        except: pass
+        except Exception: pass
 
 def monitor_registry():
     if not IS_WINDOWS: return
@@ -192,7 +192,7 @@ def monitor_registry():
                         "value_data": str(v),
                         "status": "monitored"
                     })
-    except: pass
+    except Exception: pass
 
 def main():
     check_fim()

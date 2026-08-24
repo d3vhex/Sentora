@@ -64,5 +64,7 @@ Out of scope:
   configuration (for example exposing `:8000` to the public internet
   without TLS, leaving `admin / admin123`, disabling `@require_permission`
   guards, etc.). Document them in an issue instead.
-- The ship-with self-signed development certificates in `certs/`. They
-  exist for `localhost` demos and are documented as not-secret.
+- Self-signed certificates generated on first boot. They are per-install and
+  private to the machine that made them, but the CA is self-signed and trusts
+  nothing; browsers warn, correctly. Supply a real certificate via `TLS_CERT`
+  and `TLS_KEY` for any deployment reachable beyond your own network.
