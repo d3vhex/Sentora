@@ -114,3 +114,81 @@ def test_an_admin_reset_sets_the_flag_again():
     fn = next(n for n in ast.walk(TREE)
               if isinstance(n, ast.AsyncFunctionDef) and n.name == "admin_reset_password")
     assert "must_change_password = 1" in ast.unparse(fn)
+
+
+# --------------------------------------------------------------------------
+# The console has to be able to say why it is empty
+# --------------------------------------------------------------------------
+#
+# Enforcing the flag in middleware without the UI knowing about it produced a
+# console that rendered every page, fetched nothing, and explained nothing:
+# 132 responses of 401/403 and blank tables. The operator's report was "no
+# data, like there's no DB access" - the database was fine.
+#
+# A policy the interface cannot satisfy is a lockout, not a control.
+
+FRONTEND = ROOT / "frontend" / "src"
+
+
+def test_login_returns_the_flag():
+    """Set before the first request fails, not after."""
+    assert '"must_change_password": bool(must_change)' in APP
+    assert "COALESCE(must_change_password, 0)" in APP
+
+
+def test_the_client_reacts_to_the_refusal():
+    api = (FRONTEND / "services" / "api.ts").read_text(encoding="utf-8")
+    assert "must_change_password" in api, "the interceptor ignores the 403 code"
+    assert "mustChangePassword" in api, "nothing records it for the UI to read"
+
+
+def test_the_client_stores_it_at_login_too():
+    api = (FRONTEND / "services" / "api.ts").read_text(encoding="utf-8")
+    i = api.index("authService")
+    assert "must_change_password" in api[i:], (
+        "the flag is only picked up after a request has already failed"
+    )
+
+
+def test_the_operator_is_told():
+    """A banner, not a console message."""
+    sidebar = (FRONTEND / "components" / "Sidebar.tsx").read_text(encoding="utf-8")
+    assert "mustChange" in sidebar
+    assert "Set a password to continue" in sidebar
+
+
+def test_the_banner_opens_the_dialog_that_fixes_it():
+    """Telling someone to change their password without a way to do it is the
+    same problem one step removed."""
+    sidebar = (FRONTEND / "components" / "Sidebar.tsx").read_text(encoding="utf-8")
+    i = sidebar.index("Set a password to continue")
+    assert "setShowPasswordModal(true)" in sidebar[max(0, i - 900):i]
+
+
+def test_the_flag_clears_when_the_password_changes():
+    sidebar = (FRONTEND / "components" / "Sidebar.tsx").read_text(encoding="utf-8")
+    assert "localStorage.removeItem('mustChangePassword')" in sidebar
+
+
+def test_the_migration_only_flags_the_published_credential():
+    """The first version matched on username and created_by, so it flagged
+    the seeded admin whether or not the password had ever been changed. On a
+    running deployment that is not a policy, it is a lockout for somebody who
+    set a password months ago.
+    """
+    assert "SEEDED_ADMIN_HASH" in SCHEMA_INIT
+    i = SCHEMA_INIT.index("UPDATE users SET must_change_password = 1")
+    stmt = SCHEMA_INIT[i:i + 400]
+    assert "password = %s" in stmt, (
+        "the migration flags accounts regardless of their current password"
+    )
+
+
+def test_the_hash_matches_the_one_actually_seeded():
+    """If they drift, the migration silently flags nobody."""
+    import re
+    m = re.search(r'SEEDED_ADMIN_HASH = "([^"]+)"', SCHEMA_INIT)
+    assert m
+    assert m.group(1) in SCHEMA, (
+        "SEEDED_ADMIN_HASH is not the hash db/init_userdb.sql inserts"
+    )

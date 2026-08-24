@@ -36,6 +36,18 @@ api.interceptors.response.use(
       localStorage.clear();
       window.location.href = '/login';
     }
+    // The server refuses every route except the password change while an
+    // account still carries the credential published in db/init_userdb.sql.
+    // Without this the console renders empty and says nothing: every request
+    // 403s, the pages show no data, and the cause is invisible.
+    //
+    // The change-password dialog lives in the sidebar, which is part of the
+    // shell and loads without an API call, so there is somewhere to go. The
+    // flag is what was missing, not the flow.
+    if (status === 403 && err?.response?.data?.code === 'must_change_password') {
+      localStorage.setItem('mustChangePassword', '1');
+      window.dispatchEvent(new CustomEvent('sentora:must-change-password'));
+    }
     return Promise.reject(err);
   }
 );
@@ -45,6 +57,13 @@ export const authService = {
     if (res.data.status === 'success') {
       localStorage.setItem('userId', res.data.user.id.toString());
       localStorage.setItem('user', JSON.stringify(res.data.user));
+      // Set at login as well as on a 403, so the banner is up before the
+      // first request fails rather than after.
+      if (res.data.user.must_change_password) {
+        localStorage.setItem('mustChangePassword', '1');
+      } else {
+        localStorage.removeItem('mustChangePassword');
+      }
       return res.data;
     }
     throw new Error(res.data.message || 'Login failed');

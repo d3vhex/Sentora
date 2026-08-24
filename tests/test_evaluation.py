@@ -315,3 +315,30 @@ def test_runs_without_confidence_are_not_flagged():
     """Older saved runs have no confidence recorded."""
     cases = [Case(id=f"c{i}", expected="CRITICAL", actual="SUSPICIOUS") for i in range(5)]
     assert summarise(cases).confidence_is_anchored is None
+
+
+def test_the_report_states_what_it_can_resolve():
+    """Two runs of the same corpus, same prompt, temperature 0, returned 50%
+    and 60% escalation recall. CPU inference reduces across threads in a
+    non-deterministic order, so a near-tie flips.
+
+    With ten positives, one flip is ten points - which is the whole size of
+    the difference between two prompt versions I reported as an improvement.
+    The report has to carry its own error bar, because a number without one
+    invites exactly that reading.
+    """
+    cases = ([c(f"a{i}", "CRITICAL", "CRITICAL") for i in range(10)]
+             + [c(f"b{i}", "NOT_CRITICAL", "NOT_CRITICAL") for i in range(9)])
+    assert summarise(cases).resolution == pytest.approx(0.1)
+
+
+def test_resolution_tightens_as_the_corpus_grows():
+    few = summarise([c(f"a{i}", "CRITICAL", "CRITICAL") for i in range(4)])
+    many = summarise([c(f"a{i}", "CRITICAL", "CRITICAL") for i in range(100)])
+    assert few.resolution > many.resolution
+
+
+def test_resolution_is_none_without_positives():
+    """A corpus that cannot measure recall cannot state a resolution for it."""
+    cases = [c(f"b{i}", "NOT_CRITICAL", "NOT_CRITICAL") for i in range(10)]
+    assert summarise(cases).resolution is None
