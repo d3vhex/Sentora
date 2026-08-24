@@ -10,10 +10,22 @@ Nothing pointed at the pool. The 500 body carried the timeout, the log carried
 `RuntimeWarning: coroutine '_PooledConn.close' was never awaited`, and the
 endpoint had been returning 200 in 23ms an hour earlier.
 
-The pool now fails fast and says what happened, and the endpoints the agents
-poll hold their connection in an `async with`. The rest of the handlers are
-listed below as known debt: this test pins the two that are fixed and the
-size of what is not, so the number cannot quietly grow.
+Three separate things were wrong, and only the first was the outage:
+
+- Twelve queries were blocked on a metadata lock taken by an unconditional
+  ALTER, each legitimately holding a connection. See test_automation_status.
+- `acquire()` waited on the semaphore forever, so an empty pool became a
+  server-wide hang reported as a generic timeout.
+- 72 handlers release their connection only on the happy path.
+
+The third is now covered for anything served over HTTP: `_track_for_request`
+registers the connection on the request and an `on_response` middleware
+returns it, whatever the handler did. See test_db_pool_release.
+
+This test still counts them, for two reasons. Background tasks have no request
+and are not covered by the middleware. And a handler that holds a connection
+across a slow call still occupies a slot for as long as it runs, middleware or
+not - the count is a measure of how much of the pool is governed by hand.
 """
 from __future__ import annotations
 

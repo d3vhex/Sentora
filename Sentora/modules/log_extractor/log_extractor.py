@@ -289,18 +289,49 @@ def load_rules_from_yaml(path: str):
         return []
 
     compiled_rules = []
-    
+
     categories = data.get('categories', {})
-    
+    scope = (os.getenv("RULES_SCOPE", "endpoint") or "endpoint").strip().lower()
+    skipped_categories, skipped_patterns = [], 0
+
     for cat_name, cat_data in categories.items():
         severity = cat_data.get('severity', 'INFO')
         raw_patterns = cat_data.get('patterns', '')
-        
+
+        # `applies_to` scopes a category to the kind of data it can match.
+        #
+        # 821 of the 1575 patterns in this file are web-application attacks -
+        # SQL injection, XSS, XXE, template injection, prototype pollution -
+        # and this agent collects Windows Event Log, process and network
+        # telemetry, Docker events and FIM. There is no HTTP request body
+        # anywhere in that. Those patterns could only ever produce false
+        # positives here, and they did: a single COMMAND INJECTION regex
+        # matching the agent's own ` | ` field separator flagged 89 of 100
+        # events CRITICAL.
+        #
+        # Scoped, not deleted. The moment this platform ingests web logs the
+        # rules are there, correct and unmodified. Deleting them would be
+        # throwing away real detections to fix a routing problem.
+        #
+        # Unmarked categories always load. A category nobody has classified is
+        # not evidence that it is irrelevant, and defaulting to "skip" would
+        # silently disable detections as the file grows.
+        applies_to = cat_data.get('applies_to')
+        if applies_to and scope != "all":
+            allowed = {str(s).strip().lower() for s in applies_to}
+            if scope not in allowed:
+                skipped_categories.append(cat_name)
+                skipped_patterns += len([
+                    l for l in raw_patterns.splitlines()
+                    if l.strip() and not l.strip().startswith('#')
+                ])
+                continue
+
         for line in raw_patterns.splitlines():
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
-                
+
             try:
                 regex = re.compile(line, re.IGNORECASE | re.DOTALL)
                 compiled_rules.append({
@@ -311,7 +342,16 @@ def load_rules_from_yaml(path: str):
             except re.error as e:
                 logging.warning(f"Rule failed to compile: [{cat_name}] '{line}' -> {e}")
 
-    logging.info(f"Loaded {len(compiled_rules)} security rules from rules.yaml.")
+    logging.info("Loaded %d security rules from rules.yaml (scope=%s).",
+                 len(compiled_rules), scope)
+    if skipped_categories:
+        # Named, not silent. "Why did my SQL injection rule not fire" must be
+        # answerable from the log rather than by reading this function.
+        logging.info(
+            "Skipped %d pattern(s) in %d category(ies) that do not apply to "
+            "scope '%s': %s. Set RULES_SCOPE=all to load everything.",
+            skipped_patterns, len(skipped_categories), scope,
+            ", ".join(sorted(skipped_categories)))
     return compiled_rules
 
 def compile_exclude_patterns(patterns):
