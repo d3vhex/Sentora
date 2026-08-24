@@ -1,0 +1,43 @@
+title: Service Installed With A Suspicious Image Path
+id: 7a2b9d16-3e58-4f71-8c04-6b9e2a5d13f8
+status: stable
+description: >
+    A service survives reboots and runs as SYSTEM, which is why installing one
+    is a standard way to hold access. Services are also installed legitimately
+    all the time, so this does not fire on 7045 alone - it fires when the image
+    path is somewhere software does not normally live, or is an interpreter
+    rather than a program.
+references:
+    - https://attack.mitre.org/techniques/T1543/003/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: windows
+    service: system
+detection:
+    service_installed:
+        EventID: 7045
+    odd_location:
+        ImagePath|contains:
+            - '\temp\'
+            - '\users\public\'
+            - '\appdata\'
+            - '\programdata\'
+            - '\$recycle.bin\'
+    interpreter:
+        ImagePath|contains:
+            - 'powershell'
+            - 'cmd.exe /c'
+            - 'cmd /c'
+            - 'rundll32'
+            - 'mshta'
+            - 'wscript'
+            - 'cscript'
+    condition: service_installed and (odd_location or interpreter)
+falsepositives:
+    - An installer that stages its service binary under ProgramData
+level: high
+tags:
+    - attack.persistence
+    - attack.privilege_escalation
+    - attack.t1543.003

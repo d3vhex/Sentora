@@ -1,0 +1,28 @@
+title: Windows Audit Log Cleared
+id: 1d8c5e93-7f24-4a6b-9c30-8e1b4f7a2d65
+status: stable
+description: >
+    EventID 1102 is Windows recording that its own security log was cleared.
+    It is the one event clearing the log cannot remove, because clearing the
+    log is what writes it.
+
+    The reason this is critical is not the clearing but what it implies about
+    everything logged before it: that evidence is gone, and the quiet period
+    preceding it can no longer be read as quiet.
+references:
+    - https://attack.mitre.org/techniques/T1070/001/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 1102
+    condition: selection
+falsepositives:
+    - A host being reimaged, clearing logs as part of provisioning
+level: critical
+tags:
+    - attack.defense_evasion
+    - attack.t1070.001

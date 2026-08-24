@@ -1,0 +1,35 @@
+title: SSH authorized_keys Written
+id: 2e7c1b58-9a34-4d06-b8f7-3c5e1a9d642b
+status: experimental
+description: >
+    An added authorized_keys entry is access that survives a password change,
+    the session ending and usually a reboot. It is also a normal part of
+    provisioning, so the signal worth reading is where it happened - a key
+    appearing in an account nobody deploys to.
+references:
+    - https://attack.mitre.org/techniques/T1098/004/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: linux
+detection:
+    msg_keyfile:
+        Message|contains: 'authorized_keys'
+    msg_writing:
+        Message|contains:
+            - 'echo'
+            - 'tee'
+            - '>>'
+            - 'curl'
+            - 'wget'
+            - 'ssh-rsa'
+            - 'ssh-ed25519'
+    cmd_keyfile:
+        CommandLine|contains: 'authorized_keys'
+    condition: (msg_keyfile and msg_writing) or cmd_keyfile
+falsepositives:
+    - Cloud-init or a configuration manager installing a deploy key
+level: high
+tags:
+    - attack.persistence
+    - attack.t1098.004

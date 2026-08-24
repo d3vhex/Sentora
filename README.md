@@ -23,6 +23,21 @@ phone-home. If you want a smarter model and have the RAM, swap it in `.env`.
 - **Collects telemetry** from Windows and Linux agents over a single TCP
   channel. SIEM events, alerts, FIM, packages, network connections,
   open ports, Docker activity, screen frames.
+- **Detects with Sigma rules, on the endpoint.** 15 rules covering 16 MITRE
+  ATT&CK techniques ship in `conf/sigma/builtin/`; drop community rulesets in
+  beside them. Sigma matches *named fields* rather than text, so
+  `Image|endswith: '\vssadmin.exe'` cannot be defeated by the word "vssadmin"
+  appearing in an unrelated message — and
+  `CommandLine|utf16le|base64offset|contains` reads inside a base64
+  `-EncodedCommand` payload, where the plaintext command line shows only the
+  wrapper. Measured on the eval corpus: 9 of 10 attacks caught by Sigma alone,
+  0 of 9 hard negatives falsely flagged. This layer is deterministic and keeps
+  working when the model is unavailable.
+- **Maps detections to MITRE ATT&CK, from the rules themselves.** Rules carry
+  `tags: attack.t1490`, so there is no hand-kept mapping table to go stale. The
+  coverage page separates three states a single "coverage %" would hide:
+  covered and seen, covered and quiet, and *not covered at all* — the last
+  being the only one where the console's silence means nothing.
 - **Triages every event with a local LLM.** Three workers run in parallel:
   one watches every incoming event in real time, one runs operator-driven
   deep scans, and one decides whether to take a defensive action

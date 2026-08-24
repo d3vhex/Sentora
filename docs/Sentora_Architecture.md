@@ -461,7 +461,8 @@ optional, and either can run without the other.
 ### 4.1 Sensor Capabilities
 
 - SIEM Engine. Hooks Windows Event Log / Linux syslog / journald.
-  `rules.yaml` controls regex categorization and severity tagging.
+  Every collection path runs Sigma first and falls back to the
+  `rules.yaml` regex list for events no Sigma rule addresses. See 4.1.1.
 - FIM (watchdog). In-memory hash comparison for sensitive paths.
 - Docker Monitor. Container inventory snapshots (60 s) plus live event
   stream (`docker_containers` and `siem_events` filtered by
@@ -471,6 +472,59 @@ optional, and either can run without the other.
 - Screen Streaming. `mss` plus `Pillow` JPEG WebSocket (see 2.4). The
   agent no longer runs the OSV vuln scan locally; that was moved
   server-side.
+
+### 4.1.1 Sigma Detection (`core/sigma.py`, `core/sigma_loader.py`)
+
+Sigma rules are compiled in process to a predicate over an event dict. Not
+via pysigma: that compiles Sigma to *query languages* — Splunk SPL,
+Elasticsearch DSL — and has no backend answering "does this dict match",
+which is the only question an agent has. It also brings a large dependency
+tree to something running on every endpoint.
+
+**An unsupported construct raises rather than compiling to false.** A rule
+that silently never fires is worse than one that fails to load: the second is
+visible on the next start, the first is discovered after an intrusion.
+Rejected rules are named with their reason and contribute no ATT&CK coverage.
+
+Supported modifiers: `contains`, `startswith`, `endswith`, `all`, `re`,
+`cidr`, `windash`, `base64`, `base64offset`, and the encoding modifiers
+`utf16le` / `utf16be` / `utf16` / `wide`. Conditions support `and` / `or` /
+`not`, parentheses, `1 of x*` and `all of them`.
+
+The encoding modifiers matter more than they look. PowerShell's
+`-EncodedCommand` takes UTF-16LE, so a needle encoded as UTF-8 and base64'd
+cannot appear in that payload at all — without them the detection compiles,
+reports as covered, and matches nothing. `base64offset` emits the needle at
+each of the three byte alignments, trimmed at *both* ends, because base64
+packs three bytes into four characters and the first and last groups are
+shared with whatever surrounds the needle.
+
+**Field mapping.** Sigma addresses `CommandLine`, `Image`, `TargetObject`.
+Windows supplies `StringInserts`, a positional array whose meaning depends on
+the event ID, so `WINDOWS_FIELDS` names them for the IDs this agent collects
+(4688, 4624, 4625, 4648, 4672, 4698, 4699, 4720, 4657, 4104, 7045, 1102).
+`SYSMON_FIELDS` is a separate table selected by channel: Sysmon's IDs are
+small numbers — 1, 11, 13 — that mean something entirely different on the
+System and Application channels, and reading a System event through Sysmon's
+layout would put arbitrary text into `Image` and invent evidence for whichever
+rule then matched.
+
+An unmapped event ID is not dropped; its inserts stay reachable and the
+assembled text is available as `Message`. `unmapped_event_ids()` reports which
+IDs are arriving without a mapping rather than leaving the gap silent.
+
+**Per-platform capability.** The three collection paths are not equal, and the
+difference is a property of the logs rather than of the rules:
+
+| Path | Fields available | Field-matching rules |
+| --- | --- | --- |
+| Windows Event Log | full, via `WINDOWS_FIELDS` | yes |
+| systemd journal | process, command line, unit | yes |
+| plain log files | `Message`, `SourceIp`, `User` | no — text has no `CommandLine` |
+
+**ATT&CK coverage** is read from the loaded rules' own `tags`, so there is no
+mapping table to keep current, and a rule that failed to load cannot claim
+coverage it is not providing.
 
 ### 4.2 Tables Synced From Agent to Server
 
