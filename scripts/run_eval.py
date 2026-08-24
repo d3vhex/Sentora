@@ -97,6 +97,7 @@ def main() -> int:
         print("\n[!] Nothing labelled to evaluate.")
         return 2
 
+    from ai import criteria
     from ai.gating import describe as describe_gate, surfaces
     from ai.prompts import PROMPTS
     from ai.schemas import TriageVerdict
@@ -126,6 +127,10 @@ def main() -> int:
                 agent=None,
                 endpoint=endpoint or None,
             )
+            # The same adjustment production makes, so the score describes
+            # what the platform does rather than what the model said.
+            if verdict is not None:
+                criteria.apply(verdict, log_text)
             actual = verdict.verdict if verdict else NO_VERDICT
             shown = surfaces(verdict)
             sev = verdict.severity if verdict else None

@@ -364,3 +364,69 @@ class TestReasoningOrder:
             schema = constrained_schema(model)
             assert set(schema["required"]) == set(schema["properties"]), model.__name__
             assert schema["additionalProperties"] is False
+
+
+class TestCriterionLookup:
+    """The verdict is derived from a lookup, not chosen off a scale.
+
+    v3 understood the events and still never returned CRITICAL. Given a log it
+    summarised correctly as "New process vssadmin.exe delete shadows /all
+    /quiet" it answered SUSPICIOUS / MEDIUM / 0.5; a cleared audit log came
+    back SUSPICIOUS / INFO. Across a 19-case corpus, `CRITICAL recall 0.00,
+    support 8`.
+
+    That is not a comprehension failure. Asked to pick one of three ordered
+    labels, a 3B model settles in the middle - and a prompt that repeats "most
+    events are ordinary" pushes it further there.
+
+    `matched_criterion` replaces the judgement with a question that has a
+    determinate answer: does the observed text match one of six named
+    criteria? Naming one fixes the verdict, so the model is not weighing
+    severity at all.
+    """
+
+    def _order(self):
+        from ai.schemas import TriageVerdict, constrained_schema
+        return list(constrained_schema(TriageVerdict)["properties"].keys())
+
+    def test_the_criterion_is_named_before_the_verdict(self):
+        order = self._order()
+        assert order.index("matched_criterion") < order.index("verdict")
+
+    def test_the_observation_comes_before_the_criterion(self):
+        """It matches against what it copied, not against the prompt."""
+        order = self._order()
+        assert order.index("observed") < order.index("matched_criterion")
+
+    def test_the_field_defaults_to_no_match(self):
+        """Defaulting to a criterion would make every unparsed reply critical."""
+        from ai.schemas import TriageVerdict
+        assert TriageVerdict().matched_criterion == "none"
+
+    def test_the_prompt_numbers_its_criteria(self):
+        """An unnumbered list is quoted back as prose; a numbered one is
+        referenced. v2 pasted the criterion text into the summary."""
+        from ai.prompts import PROMPTS
+        p = PROMPTS["automation"]
+        for tag in ("C1", "C2", "C3", "C4", "C5", "C6"):
+            assert tag in p, tag
+
+    def test_the_prompt_states_the_derivation(self):
+        from ai.prompts import PROMPTS
+        p = PROMPTS["automation"]
+        assert "matched_criterion" in p
+        assert "verdict CRITICAL" in p
+
+    def test_the_prompt_blocks_the_softening_that_v3_did(self):
+        """v3's failure was downgrading a match because the account looked
+        legitimate - which is what an intruder's account looks like."""
+        from ai.prompts import PROMPTS
+        assert "Do not soften" in PROMPTS["automation"]
+
+    def test_the_known_benign_event_ids_are_still_listed(self):
+        """The four observed false positives were fixed in v3 and must not
+        come back with the criteria loosened."""
+        from ai.prompts import PROMPTS
+        p = PROMPTS["automation"]
+        for eid in ("4672", "4624", "4798", "7040"):
+            assert eid in p, eid

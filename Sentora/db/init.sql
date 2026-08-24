@@ -148,7 +148,12 @@ CREATE TABLE IF NOT EXISTS siem_events (
     message    TEXT,
     dup_fp     CHAR(64),
     sent       BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    -- MITRE ATT&CK technique IDs from the Sigma rules that matched, comma
+    -- separated. A column rather than a field inside the JSON body, because
+    -- coverage is a question asked across every event - "which techniques
+    -- have we ever seen" - and that cannot be answered by parsing text.
+    techniques TEXT
 );
 ALTER TABLE siem_events
     ADD COLUMN IF NOT EXISTS source      TEXT,
@@ -157,8 +162,10 @@ ALTER TABLE siem_events
     ADD COLUMN IF NOT EXISTS message     TEXT,
     ADD COLUMN IF NOT EXISTS dup_fp      CHAR(64),
     ADD COLUMN IF NOT EXISTS sent        BOOLEAN DEFAULT FALSE,
-    ADD COLUMN IF NOT EXISTS created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-CREATE INDEX IF NOT EXISTS idx_siem_src ON siem_events (source);
+    ADD COLUMN IF NOT EXISTS created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS techniques  TEXT;
+CREATE INDEX IF NOT EXISTS idx_siem_src  ON siem_events (source);
+CREATE INDEX IF NOT EXISTS idx_siem_tech ON siem_events (techniques);
 CREATE INDEX IF NOT EXISTS idx_siem_dup ON siem_events (dup_fp);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_siem_dup_not_null
   ON siem_events (dup_fp) WHERE dup_fp IS NOT NULL;

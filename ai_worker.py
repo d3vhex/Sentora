@@ -16,6 +16,7 @@ from ai.utils import (
     queue_soar_action,
     save_ai_results,
 )
+from ai import criteria
 from ai.gating import surfaces
 from ai.schemas import (
     TriageVerdict, DeepAnalysis, DefensiveDecision, coherence_problem, render_summary,
@@ -110,6 +111,14 @@ async def handle_automation(agent, table, data, api_key, endpoint, model=None):
     )
 
     if error is None and verdict is not None:
+        # The model proposes a criterion; the log decides. See ai/criteria.py -
+        # it claimed "C1 credential access - comsvcs.dll" on an EID 4672
+        # privilege list, and separately missed a service installed from
+        # ADMIN$ that the markers found.
+        criterion_note = criteria.apply(verdict, log_text)
+        if criterion_note:
+            logger.info(f"[criteria] {agent}/{table}: {criterion_note}")
+
         # Schema-valid and still self-contradictory. See coherence_problem.
         error = coherence_problem(verdict)
         if error:

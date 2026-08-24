@@ -184,6 +184,13 @@ export const agentService = {
   // unanswerable while the table was seeded with three hardcoded rows.
   getThreatIntel: (params?: { q?: string; type?: string; source?: string; limit?: number }) =>
     api.get('/threat-intel', { params }).then(res => res.data),
+
+  // Two numbers, deliberately separate: what the installed Sigma rules can
+  // detect, and what has actually fired here. See the page for why a single
+  // coverage percentage hides the only cell that matters.
+  getAttackCoverage: (agent?: string) =>
+    api.get('/api/attack/coverage', { params: agent ? { agent } : {} })
+      .then(res => res.data),
   refreshThreatIntel: () => api.post('/threat-intel/refresh').then(res => res.data),
   getServerResources: () => api.get('/server/resources').then(res => res.data),
   getGlobalStats: () => api.get('/api/global/stats').then(res => res.data),
