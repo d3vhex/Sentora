@@ -1,4 +1,4 @@
-from sanic import Sanic
+from sanic import Request, Sanic
 import bcrypt
 import aiomysql
 import secrets
@@ -1457,6 +1457,30 @@ async def revoke_user_sessions(user_id: int, reason: str = "") -> int:
         return 0
 
 
+@app.on_response
+async def _release_request_db_connections(request, response):
+    """Return every pooled connection this request acquired.
+
+    Runs on error responses too, which is the whole point: the leak was on the
+    exception path, where handlers returned a 500 without reaching their
+    close. Sanic runs response middleware for those the same way.
+
+    `_PooledConn.close()` is idempotent, so handlers that already released
+    theirs cost nothing here. Failures are swallowed per connection: a
+    connection we cannot return must not turn a successful response into an
+    error, and the pool's idle-reaper will discard it.
+    """
+    held = getattr(request.ctx, "_db_conns", None)
+    if not held:
+        return
+    request.ctx._db_conns = []
+    for pooled in held:
+        try:
+            await pooled.close()
+        except Exception as e:
+            print(f"[!] releasing a pooled connection failed: {e}", flush=True)
+
+
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
@@ -2072,6 +2096,42 @@ class _PooledConn:
             pass
 
 
+
+def _track_for_request(pooled):
+    """Attach a pooled connection to the request that acquired it.
+
+    74 handlers acquire a connection and release it only on the happy path, so
+    any exception in between leaked one permanently. The pool holds ten. Once
+    ten had leaked, every endpoint in the server stopped answering.
+
+    Fixing that by rewriting 74 handlers to use `async with` is a large diff
+    across code paths with no tests, and it only holds until someone writes
+    the seventy-fifth. Tying the connection to the request instead makes the
+    leak structurally impossible for anything served over HTTP, whatever style
+    the handler is written in: whoever acquires it, the response middleware
+    releases it.
+
+    `close()` is idempotent, so a handler that does release its own connection
+    correctly is unaffected.
+
+    Background tasks have no current request and are not covered - they still
+    have to release their own. That is a much smaller surface, and
+    `agent_conn` / `userdb_conn` exist for it.
+    """
+    try:
+        request = Request.get_current()
+    except Exception:
+        return pooled            # no request context: a background task
+    if request is None:
+        return pooled
+    held = getattr(request.ctx, "_db_conns", None)
+    if held is None:
+        held = []
+        request.ctx._db_conns = held
+    held.append(pooled)
+    return pooled
+
+
 class _AsyncMySQLPool:
     def __init__(self, factory, maxsize=_POOL_MAXSIZE, max_idle_sec=_POOL_IDLE_SEC):
         self._factory = factory
@@ -2117,9 +2177,9 @@ class _AsyncMySQLPool:
                         except Exception:
                             pass
                         continue
-                    return _PooledConn(conn, self)
+                    return _track_for_request(_PooledConn(conn, self))
             conn = await self._factory()
-            return _PooledConn(conn, self)
+            return _track_for_request(_PooledConn(conn, self))
         except BaseException:
             self._sem.release()
             raise

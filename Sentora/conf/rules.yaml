@@ -5,6 +5,7 @@ flags:
 categories:
   SQL INJECTION:
     severity: CRITICAL
+    applies_to: [web]
     weight: 5
     patterns: |
       # Classic SQLi
@@ -154,6 +155,7 @@ categories:
 
   XSS:
     severity: HIGH
+    applies_to: [web]
     weight: 3
     patterns: |
       # Classic XSS
@@ -301,6 +303,7 @@ categories:
 
   COMMAND INJECTION:
     severity: CRITICAL
+    applies_to: [web, endpoint]
     weight: 5
     patterns: |
       # Classic command injection
@@ -424,6 +427,7 @@ categories:
 
   LOCAL FILE INCLUSION:
     severity: MEDIUM
+    applies_to: [web]
     weight: 2
     patterns: |
       # Classic LFI
@@ -566,6 +570,7 @@ categories:
 
   META REFRESH:
     severity: INFO
+    applies_to: [web]
     weight: 1
     patterns: |
       <META HTTP-EQUIV="refresh" CONTENT="0;url=data:text/html;base64,[A-Za-z0-9+/=]+">
@@ -602,6 +607,7 @@ categories:
 
   KEYWORD ACCESS:
     severity: MEDIUM
+    applies_to: [web, endpoint]
     weight: 2
     patterns: |
       \b(?:sudo|ssh|root)\b
@@ -707,6 +713,7 @@ categories:
 
   SESSION HIJACKING:
     severity: HIGH
+    applies_to: [web]
     weight: 4
     patterns: |
       Cookie:\s*PHPSESSID=[a-zA-Z0-9]+
@@ -759,6 +766,7 @@ categories:
 
   SSRF:
     severity: HIGH
+    applies_to: [web]
     weight: 4
     patterns: |
       http://127\.0\.0\.1
@@ -845,6 +853,7 @@ categories:
 
   RCE:
     severity: CRITICAL
+    applies_to: [web, endpoint]
     weight: 5
     patterns: |
       \b(?:exec|system|shell_exec|passthru|proc_open|popen|pcntl_exec)\s*\(
@@ -954,6 +963,7 @@ categories:
 
   DESERIALIZATION:
     severity: CRITICAL
+    applies_to: [web]
     weight: 4
     patterns: |
       java\.io\.ObjectInputStream\.readObject
@@ -1054,6 +1064,7 @@ categories:
 
   PATH TRAVERSAL:
     severity: HIGH
+    applies_to: [web]
     weight: 3
     patterns: |
       \.\./
@@ -1187,6 +1198,7 @@ categories:
 
   INFORMATION DISCLOSURE:
     severity: MEDIUM
+    applies_to: [web, endpoint]
     weight: 2
     patterns: |
       \b(?:api_key|secret_key|private_key|client_secret|access_token|refresh_token)\b
@@ -1330,6 +1342,7 @@ categories:
 
   XXE:
     severity: HIGH
+    applies_to: [web]
     weight: 4
     patterns: |
       # Classic XXE
@@ -1385,6 +1398,7 @@ categories:
 
   LDAP INJECTION:
     severity: HIGH
+    applies_to: [web]
     weight: 3
     patterns: |
       # LDAP injection
@@ -1424,6 +1438,7 @@ categories:
 
   XPATH INJECTION:
     severity: HIGH
+    applies_to: [web]
     weight: 3
     patterns: |
       # XPath injection
@@ -1457,6 +1472,7 @@ categories:
 
   CRLF INJECTION:
     severity: MEDIUM
+    applies_to: [web]
     weight: 2
     patterns: |
       # CRLF injection
@@ -1488,6 +1504,7 @@ categories:
 
   TEMPLATE INJECTION:
     severity: CRITICAL
+    applies_to: [web]
     weight: 5
     patterns: |
       # Jinja2/Flask
@@ -1547,6 +1564,7 @@ categories:
 
   OPEN REDIRECT:
     severity: MEDIUM
+    applies_to: [web]
     weight: 2
     patterns: |
       # Open redirect
@@ -1582,6 +1600,7 @@ categories:
 
   FILE UPLOAD:
     severity: HIGH
+    applies_to: [web]
     weight: 4
     patterns: |
       # Dangerous file extensions
@@ -1626,6 +1645,7 @@ categories:
 
   RACE CONDITION:
     severity: MEDIUM
+    applies_to: [web]
     weight: 2
     patterns: |
       # Time-of-check time-of-use (TOCTOU)
@@ -1645,6 +1665,7 @@ categories:
 
   PROTOTYPE POLLUTION:
     severity: HIGH
+    applies_to: [web]
     weight: 3
     patterns: |
       # JavaScript prototype pollution
@@ -1829,6 +1850,7 @@ categories:
 
   WEB_ATTACK_LEGACY:
     severity: HIGH
+    applies_to: [web]
     weight: 3
     patterns: |
       illegal request

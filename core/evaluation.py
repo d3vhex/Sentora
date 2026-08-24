@@ -43,6 +43,16 @@ class Case:
     actual: str
     latency_s: float | None = None
     note: str = ""
+    # Whether production would have shown this to an analyst, per ai/gating.
+    # A verdict alone is not a detection: the worker also requires a severity
+    # and a confidence, and a run can score well on verdicts while surfacing
+    # nothing at all. Defaults to None for runs saved before this existed.
+    surfaced: bool | None = None
+    # Kept so threshold questions can be answered without re-running the
+    # model, and so the report can say when confidence is not being computed
+    # at all - see EvalReport.confidence_is_anchored.
+    severity: str | None = None
+    confidence: float | None = None
 
     @property
     def correct(self) -> bool:
@@ -102,6 +112,66 @@ class EvalReport:
         """Present for completeness, but see the module docstring: on this
         distribution a do-nothing model scores well here."""
         return sum(1 for c in self.cases if c.correct) / self.total if self.total else None
+
+    @property
+    def confidence_is_anchored(self) -> float | None:
+        """The single confidence the model returned, if it returned only one.
+
+        llama3.2:3b answered exactly 0.60 to every attack it flagged. That is
+        not a calibrated probability, it is a number the model has settled on,
+        and a gate built from it will behave arbitrarily: move the threshold a
+        hundredth either side and every detection flips at once.
+
+        Worth knowing before anyone tunes AI_SUS_CONF against it.
+        """
+        seen = {c.confidence for c in self.cases
+                if c.confidence is not None and c.actual != NO_VERDICT}
+        if len(seen) == 1 and len([c for c in self.cases
+                                   if c.actual != NO_VERDICT]) > 2:
+            return seen.pop()
+        return None
+
+    @property
+    def surfaced_recall(self) -> float | None:
+        """Of the events that should be escalated, how many an analyst would see.
+
+        The number that describes the product. `escalation_recall` describes
+        the model, and the two came apart badly: a rewritten prompt took
+        escalation recall from 0% to 40% while every one of those detections
+        came back SUSPICIOUS at confidence 0.60, just under the 0.75 the
+        worker requires - so the analyst saw exactly as much as before, which
+        was nothing.
+
+        None when the run predates this field, rather than 0, because
+        "not measured" and "measured zero" are different claims.
+        """
+        should = [c for c in self.cases if c.expected in ESCALATING]
+        if not should or any(c.surfaced is None for c in should):
+            return None
+        return sum(1 for c in should if c.surfaced) / len(should)
+
+    @property
+    def constant_verdict(self) -> str | None:
+        """The verdict this model gave to everything, if it gave one verdict.
+
+        A model that answers the same thing regardless of input carries no
+        information: its output is a constant function and cannot be a
+        detection capability, however good its accuracy looks.
+
+        This is not hypothetical. llama3.2:3b answered NOT_CRITICAL to all 15
+        cases of the attack corpus - including an LSASS memory dump, which it
+        summarised as "Routine logon event" - and to all 542 events it had
+        processed in production. Accuracy read 33%, the five benign cases were
+        all "correct", and the UI showed a steady stream of Reviewed cards.
+        Nothing in the numbers said the layer was inert.
+
+        Reported before recall, because when this is set every other figure is
+        a description of the same fact.
+        """
+        answered = {c.actual for c in self.cases if c.actual != NO_VERDICT}
+        if len(answered) == 1 and self.total > 1:
+            return answered.pop()
+        return None
 
     @property
     def escalation_recall(self) -> float | None:

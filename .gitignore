@@ -56,7 +56,13 @@ docs/sentora_marketing_strategy.md
 # Sentora Specific
 
 # Evaluation data is per-deployment: real telemetry, hand-labelled.
-# The harness is versioned, the corpus and run results are not.
+# The harness is versioned, the observed corpus and run results are not.
+#
+# evals/corpus_attacks.jsonl is deliberately NOT ignored. It is constructed
+# rather than observed - a fixed set of attack cases in this deployment's log
+# format - so it is the same for everyone and belongs under version control.
+# Without it the harness cannot measure recall at all: real telemetry from a
+# machine that is not under attack contains no positives.
 evals/corpus.jsonl
 evals/runs/*.json
 

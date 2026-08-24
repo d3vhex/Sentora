@@ -219,3 +219,99 @@ def test_prompts_import_without_the_worker_runtime():
     text = run_eval.read_text(encoding="utf-8")
     assert "from ai.prompts import PROMPTS" in text
     assert "from ai_worker import" not in text
+
+
+# --------------------------------------------------------------------------
+# A model that answers the same thing to everything
+# --------------------------------------------------------------------------
+
+def test_a_constant_model_is_named_as_such():
+    """The failure that a scoreboard hides.
+
+    llama3.2:3b answered NOT_CRITICAL to all 15 cases of the attack corpus -
+    including an LSASS memory dump it summarised as "Routine logon event" -
+    and to all 542 events it had processed in production. Accuracy read 33%,
+    every benign case was "correct", and the UI showed a steady stream of
+    Reviewed cards. Nothing in the numbers said the layer was inert.
+
+    A constant function carries no information. The report has to say so in
+    words, because a reader scanning recall 0.00 next to precision 1.00 will
+    conclude the model is cautious rather than absent.
+    """
+    cases = ([c(f"a{i}", "CRITICAL", "NOT_CRITICAL") for i in range(10)]
+             + [c(f"b{i}", "NOT_CRITICAL", "NOT_CRITICAL") for i in range(5)])
+    report = summarise(cases)
+    assert report.constant_verdict == "NOT_CRITICAL"
+    assert report.escalation_recall == 0.0
+
+
+def test_a_model_that_discriminates_is_not_flagged():
+    cases = [c("a", "CRITICAL", "CRITICAL"), c("b", "NOT_CRITICAL", "NOT_CRITICAL")]
+    assert summarise(cases).constant_verdict is None
+
+
+def test_one_case_is_not_evidence_of_constancy():
+    """A single case is always 'constant'; that says nothing."""
+    assert summarise([c("a", "CRITICAL", "CRITICAL")]).constant_verdict is None
+
+
+def test_unusable_verdicts_do_not_count_as_an_answer():
+    """A run where the model failed everywhere is a different problem, and
+    run_eval already refuses to save it."""
+    cases = [c(f"a{i}", "CRITICAL", NO_VERDICT) for i in range(5)]
+    assert summarise(cases).constant_verdict is None
+
+
+def test_constancy_is_reported_before_the_metrics():
+    """Otherwise it reads as one number among several."""
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parent.parent
+           / "scripts" / "run_eval.py").read_text(encoding="utf-8")
+    assert "constant_verdict" in src
+    assert src.index("ANSWERED") < src.index("Escalation recall")
+
+
+def test_surfaced_recall_can_be_lower_than_escalation_recall():
+    """The gap that hid a non-result: flagged is not seen."""
+    cases = [Case(id="a", expected="CRITICAL", actual="SUSPICIOUS", surfaced=False),
+             Case(id="b", expected="CRITICAL", actual="CRITICAL", surfaced=True)]
+    r = summarise(cases)
+    assert r.escalation_recall == 1.0
+    assert r.surfaced_recall == 0.5
+
+
+def test_surfaced_recall_is_none_for_older_runs():
+    """'Not measured' and 'measured zero' are different claims."""
+    cases = [Case(id="a", expected="CRITICAL", actual="CRITICAL")]
+    assert summarise(cases).surfaced_recall is None
+
+
+def test_a_constant_confidence_is_called_out():
+    """llama3.2:3b returned exactly 0.60 for every attack it flagged.
+
+    That is not a calibrated probability. A gate built from it flips every
+    detection at once when the threshold moves a hundredth, so the report has
+    to say this before anyone tunes AI_SUS_CONF against it.
+    """
+    cases = [Case(id=f"c{i}", expected="CRITICAL", actual="SUSPICIOUS",
+                  confidence=0.60) for i in range(5)]
+    assert summarise(cases).confidence_is_anchored == 0.60
+
+
+def test_varied_confidence_is_not_flagged():
+    cases = [Case(id="a", expected="CRITICAL", actual="CRITICAL", confidence=0.9),
+             Case(id="b", expected="CRITICAL", actual="SUSPICIOUS", confidence=0.6),
+             Case(id="c", expected="NOT_CRITICAL", actual="NOT_CRITICAL", confidence=0.3)]
+    assert summarise(cases).confidence_is_anchored is None
+
+
+def test_anchoring_needs_more_than_two_answers():
+    cases = [Case(id="a", expected="CRITICAL", actual="CRITICAL", confidence=0.6),
+             Case(id="b", expected="CRITICAL", actual="CRITICAL", confidence=0.6)]
+    assert summarise(cases).confidence_is_anchored is None
+
+
+def test_runs_without_confidence_are_not_flagged():
+    """Older saved runs have no confidence recorded."""
+    cases = [Case(id=f"c{i}", expected="CRITICAL", actual="SUSPICIOUS") for i in range(5)]
+    assert summarise(cases).confidence_is_anchored is None

@@ -48,15 +48,27 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 RULES = ROOT / "Sentora" / "conf" / "rules.yaml"
 
 
-def load_rules(path: pathlib.Path):
+def load_rules(path: pathlib.Path, scope: str = "endpoint"):
+    """Compile the rules the agent would compile, for the same scope.
+
+    Honouring `applies_to` matters: without it this reports on 1575 patterns
+    while the agent runs 740, and every hit rate below describes a ruleset
+    nobody is using.
+    """
     cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     flags = 0
     for name in cfg.get("flags") or []:
         flags |= getattr(re, str(name).upper(), 0)
 
-    rules, broken = [], []
+    scope = (scope or "endpoint").strip().lower()
+    rules, broken, skipped = [], [], []
     for category, spec in (cfg.get("categories") or {}).items():
         severity = (spec or {}).get("severity", "?")
+        applies_to = (spec or {}).get("applies_to")
+        if applies_to and scope != "all":
+            if scope not in {str(s).strip().lower() for s in applies_to}:
+                skipped.append(category)
+                continue
         for line in ((spec or {}).get("patterns") or "").splitlines():
             pat = line.strip()
             if not pat or pat.startswith("#"):
@@ -66,7 +78,7 @@ def load_rules(path: pathlib.Path):
             except re.error as e:
                 # An invalid regex is a category that silently never fires.
                 broken.append((category, pat, str(e)))
-    return rules, broken
+    return rules, broken, skipped
 
 
 def messages_from_corpus(path: pathlib.Path):
@@ -134,6 +146,76 @@ def extract_text(body):
     return str(body or "")
 
 
+
+def score_against_labels(rules, path: pathlib.Path) -> int:
+    """Score the ruleset against a labelled corpus.
+
+    Hit rates say how *often* rules fire. They do not say whether the rules
+    catch attacks, which is the question the ruleset exists to answer, and a
+    ruleset can have a low hit rate because it is precise or because it is
+    aimed at the wrong data.
+
+    Run against evals/corpus_attacks.jsonl this gives the baseline the AI
+    layer has to beat. The first run scored recall 30%, precision 60%: the
+    rules missed a cleared Security log, shadow-copy deletion, a SYSTEM
+    scheduled task and a PsExec service install, while firing on a signed
+    management-agent script and the backup account's scheduled SMB logon.
+    """
+    rows = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines()
+            if l.strip()]
+    labelled = [r for r in rows if (r.get("expected") or "").strip()]
+    if not labelled:
+        print(f"[!] {path} has no labelled cases to score against.")
+        return 1
+
+    tp = fn = fp = tn = 0
+    misses, false_alarms = [], []
+    for row in labelled:
+        text = extract_text(row.get("event", {}).get("message"))
+        # A rule "escalates" when it fires at CRITICAL or HIGH; those are the
+        # severities that reach an analyst.
+        escalated = any(sev in ("CRITICAL", "HIGH")
+                        for _c, sev, _p, rx in rules if rx.search(text))
+        positive = row["expected"] in ("CRITICAL", "SUSPICIOUS")
+        if positive and escalated:
+            tp += 1
+        elif positive:
+            fn += 1
+            misses.append(row["id"])
+        elif escalated:
+            fp += 1
+            false_alarms.append(row["id"])
+        else:
+            tn += 1
+
+    print()
+    print(f"  Scored against {len(labelled)} labelled case(s)")
+    print()
+    recall = tp / (tp + fn) if tp + fn else None
+    precision = tp / (tp + fp) if tp + fp else None
+    print(f"    recall    {f'{recall:.0%}' if recall is not None else 'n/a':>5}"
+          f"   ({tp}/{tp + fn} attacks escalated)")
+    print(f"    precision {f'{precision:.0%}' if precision is not None else 'n/a':>5}"
+          f"   ({tp}/{tp + fp} escalations deserved)")
+
+    if misses:
+        print()
+        print("  Missed - these are the expensive errors:")
+        for m in misses:
+            print(f"    {m}")
+    if false_alarms:
+        print()
+        print("  False alarms on benign activity:")
+        for f in false_alarms:
+            print(f"    {f}")
+    if any(r.get("constructed") for r in labelled):
+        print()
+        print("  Some cases are CONSTRUCTED, not observed. A miss is real")
+        print("  evidence; a hit is weak, because these are the loud version")
+        print("  of each technique. Read recall as an upper bound.")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--rules", default=str(RULES))
@@ -144,11 +226,20 @@ def main() -> int:
     ap.add_argument("--host"); ap.add_argument("--port", type=int)
     ap.add_argument("--pattern", help="show sample text matched by one specific pattern")
     ap.add_argument("--top", type=int, default=25)
+    ap.add_argument("--score", action="store_true",
+                    help="score against a labelled corpus (recall/precision) "
+                         "instead of reporting hit rates")
+    ap.add_argument("--scope", default=os.getenv("RULES_SCOPE", "endpoint"),
+                    help="rule scope to load, matching the agent's RULES_SCOPE "
+                         "(endpoint, web, or all)")
     args = ap.parse_args()
 
-    rules, broken = load_rules(pathlib.Path(args.rules))
+    rules, broken, skipped = load_rules(pathlib.Path(args.rules), args.scope)
     print(f"[*] {len(rules)} usable pattern(s) across "
-          f"{len({c for c, *_ in rules})} categories")
+          f"{len({c for c, *_ in rules})} categories  (scope={args.scope})")
+    if skipped:
+        print(f"    {len(skipped)} category(ies) not in scope and not loaded: "
+              f"{', '.join(sorted(skipped))}")
     if broken:
         # A pattern that will not compile is a category that can never fire,
         # and nothing else reports it.
@@ -166,6 +257,12 @@ def main() -> int:
     else:
         print("[!] Give either --agent or --corpus.")
         return 2
+
+    if args.score:
+        if not args.corpus:
+            print("[!] --score needs --corpus (it reads the labels).")
+            return 2
+        return score_against_labels(rules, pathlib.Path(args.corpus))
 
     if not texts:
         print("[!] No events to measure.")
