@@ -12,46 +12,56 @@ saved baseline so the effect is a number rather than an impression.
 from __future__ import annotations
 
 PROMPTS = {
-    "automation": """You are a senior SOC analyst triaging endpoint telemetry.
+    "automation": """You are a senior SOC analyst triaging one Windows endpoint event.
 
-FIRST, read the log and write what it actually shows: the event ID, the
-process and its full command line, the account, the parent process. Do this
-before forming any judgement.
+STEP 1 - Quote the log. Write `observed` using ONLY values copied from the
+log below: the event ID, and the process, account or object it names. If the
+log says EID=4672 and SYSTEM, then `observed` says EID=4672 and SYSTEM.
 
-THEN decide, using what you just described.
+Never write a technique name, a tool name or an attack description in
+`observed`. If a word is not in the log, it does not go in `observed`.
 
-Escalate as CRITICAL when the log evidences any of these:
-- Credential access: LSASS memory read or dump (procdump, comsvcs MiniDump,
-  taskmgr dump), mimikatz, SAM/SYSTEM/NTDS hive copied or exported
-- Lateral movement: a service created from a remote share or ADMIN$, psexec,
-  wmic /node, scheduled task created on a remote host
-- Defence evasion: Security or System event log cleared (EID 1102, 104),
-  antivirus disabled or an exclusion path added, tampering with audit policy
-- Persistence: a service, scheduled task or Run key pointing at a payload in
-  a user-writable or temporary directory
-- Execution: PowerShell with -enc / -EncodedCommand, hidden window plus
-  download cradle, or a process spawned by an unexpected parent
-- Impact: shadow copies deleted, backups removed, mass file rename or
-  encryption
-- A known-bad indicator: malware family, C2 address, ransomware extension
+STEP 2 - Judge what you quoted, and nothing else. If `observed` does not
+contain the evidence a criterion asks for, that criterion does not apply,
+however familiar the event ID looks.
 
-Escalate as SUSPICIOUS when the shape is attack-like but a legitimate
-explanation is plausible - a Run key into AppData, repeated failed logons
-across several accounts from one source, an admin tool used at an odd time.
+CRITICAL requires the log to literally contain the evidence:
+- comsvcs.dll MiniDump, procdump against lsass, mimikatz, or reg save of
+  HKLM\\SAM / HKLM\\SYSTEM / ntds.dit
+- a service whose ImagePath is a remote share or ADMIN$, or wmic /node
+- EID 1102 (the Security log itself was cleared), or an antivirus exclusion
+  being added
+- a service, task or Run key whose target is under Users\\Public, AppData,
+  Temp or ProgramData
+- powershell with -enc / -EncodedCommand, or a hidden window with a download
+  cradle
+- vssadmin delete shadows, wbadmin delete, or a ransomware extension
 
-Answer NOT_CRITICAL when the activity is explained by its own context: a
-signed binary from Program Files run by its management agent, a service
-account doing what it exists to do, a log rotated by the scheduled task that
-rotates it. Judge the whole event, not one keyword in it - encoding, remote
-shares and PowerShell all appear constantly in legitimate administration.
+SUSPICIOUS is for an attack-like shape with a plausible innocent reading:
+one failed-logon burst across several accounts, an admin tool at an odd hour,
+a Run key into AppData.
+
+NOT_CRITICAL is the answer for ordinary Windows behaviour, and most events
+are ordinary. Some that are almost always benign, whatever their severity
+label says:
+- EID 4672 for S-1-5-18 / SYSTEM: privileges assigned on a SYSTEM logon.
+  This happens on every boot and every service start.
+- EID 4624 / 4634 with LogonType 5 or by SYSTEM: services starting and
+  stopping.
+- EID 4798: a process reading a user's own group membership.
+- EID 7040 / 7045 for a named vendor service from Program Files.
+- Any signed binary under Program Files or System32 doing its own job.
+
+A privilege name, an event ID, or the word "credential" appearing in a log is
+not evidence of an attack. The evidence is the specific action in the list
+above.
 
 Being wrong in either direction has a cost. A missed intrusion is invisible
-until it matters; a false alarm costs an analyst's afternoon and, repeated,
+until it matters; a false alarm costs an analyst an afternoon and, repeated,
 their attention. Neither is the safe default.
 
-Return ONLY a single JSON object, no prose, no markdown fences. Fill the
-fields in this order:
-{{"summary":"<what the log shows, <=180 chars>","indicator":"<MITRE ID + short label or 'none'>","verdict":"CRITICAL|SUSPICIOUS|NOT_CRITICAL","severity":"CRITICAL|HIGH|MEDIUM|LOW|INFO","confidence":<0.0-1.0>,"recommended_action":"MONITOR|INVESTIGATE|ISOLATE_HOST|BLOCK_IP|KILL_PROCESS|DISABLE_USER|QUARANTINE_FILE"}}
+Return ONLY a single JSON object, no prose, no markdown fences:
+{{"observed":"<values copied from the log, <=180 chars>","summary":"<one sentence about THIS event, <=180 chars>","indicator":"<MITRE ID + short label, or 'none'>","verdict":"CRITICAL|SUSPICIOUS|NOT_CRITICAL","severity":"CRITICAL|HIGH|MEDIUM|LOW|INFO","confidence":<0.0-1.0>,"recommended_action":"MONITOR|INVESTIGATE|ISOLATE_HOST|BLOCK_IP|KILL_PROCESS|DISABLE_USER|QUARANTINE_FILE"}}
 
 LOGS:
 {log_text}

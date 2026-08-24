@@ -177,8 +177,13 @@ attribute the source IP.
    TLS_KEY=/app/certs/server.key
    ```
    Rotation requires `docker compose restart app`.
-3. **Self-signed, lab only.** `python certs/generate_certs.py`. The bundled
-   pair is public and grants zero trust.
+3. **Self-signed, lab only.** With `TLS_ENABLED=1` and no certificate
+   present, the app generates one on first boot; `python certs/generate_certs.py
+   --force` replaces it. Each deployment gets its own key, and the key never
+   leaves the machine that made it — nothing is bundled any more, because a
+   committed private key gave every install the same published TLS identity.
+   Browsers will warn: the CA is self-signed and trusts nothing. Use a real
+   certificate for anything reachable beyond your own network.
 
 ### 3.2 Session cookies require this
 

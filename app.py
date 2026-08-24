@@ -172,179 +172,16 @@ ENCRYPTED_FIELDS_MAP = {
 }
 
 
-async def init_hub_db():
-    """
-    Ensures that the sentora_hub database and its global tables exist.
-    """
-    try:
-        with sync_mysql_conn() as conn:
-            cur = conn.cursor()
-            try:
-                cur.execute("CREATE DATABASE IF NOT EXISTS sentora_hub")
-                cur.execute("USE sentora_hub")
+# The five boot migrations moved to core/schema_init.py: they are DDL, they
+# share one dependency, and app.py is not where a schema belongs.
+from core import schema_init  # noqa: E402
 
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS hardware_inventory (
-                        id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                        type         VARCHAR(64),
-                        name         VARCHAR(255),
-                        vendor_id    VARCHAR(128),
-                        product_id   VARCHAR(128),
-                        serial_number VARCHAR(128),
-                        status       VARCHAR(32),
-                        `timestamp`  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        sent         TINYINT(1) DEFAULT 0,
-                        dup_fp       CHAR(64) NULL
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-                """)
-
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS threat_intel (
-                        id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                        type        VARCHAR(32),
-                        value       VARCHAR(255) NOT NULL,
-                        source      VARCHAR(128),
-                        severity    VARCHAR(16),
-                        description TEXT,
-                        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        last_seen   TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-                        UNIQUE KEY uniq_intel (type, value),
-                        INDEX idx_intel_value (value),
-                        INDEX idx_intel_seen (last_seen)
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-                """)
-                # `last_seen` drives staleness pruning and the freshness
-                # readout. It was added by the feed refresher's own ALTER,
-                # which only ran once a feed had actually returned something —
-                # so on a deployment whose feeds were failing, the column did
-                # not exist and anything querying it broke.
-                for ddl in (
-                    "ALTER TABLE threat_intel ADD COLUMN last_seen TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP",
-                    "ALTER TABLE threat_intel ADD INDEX idx_intel_value (value)",
-                    "ALTER TABLE threat_intel ADD INDEX idx_intel_seen (last_seen)",
-                ):
-                    try:
-                        cur.execute(ddl)
-                    except Exception:
-                        pass  # already present
-
-                conn.commit()
-            finally:
-                cur.close()
-        print("[HubDB] Central database 'sentora_hub' initialized successfully.")
-    except Exception as e:
-        print(f"[HubDB] Error initializing central database: {e}")
-
-async def init_enrollment_tables():
-    """Ensure enrollment_tokens + agent_identities exist in userdb (idempotent migration)."""
-    try:
-        with sync_mysql_conn("userdb") as conn:
-            cur = conn.cursor()
-            try:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS enrollment_tokens (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        token CHAR(64) NOT NULL UNIQUE,
-                        created_by_user_id INT,
-                        created_by_username VARCHAR(100),
-                        hostname_hint VARCHAR(255),
-                        note VARCHAR(500),
-                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        expires_at DATETIME NOT NULL,
-                        used_at DATETIME NULL,
-                        used_by_agent VARCHAR(128) NULL,
-                        used_from_ip VARCHAR(45) NULL,
-                        INDEX idx_expires (expires_at),
-                        INDEX idx_used (used_at)
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                """)
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS agent_identities (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        agent_name VARCHAR(128) NOT NULL UNIQUE,
-                        agent_key CHAR(64) NOT NULL UNIQUE,
-                        os_type VARCHAR(32),
-                        hostname VARCHAR(255),
-                        enrolled_from_ip VARCHAR(45),
-                        enrolled_via_token CHAR(64),
-                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        last_seen DATETIME NULL,
-                        revoked_at DATETIME NULL,
-                        INDEX idx_agent_name (agent_name),
-                        INDEX idx_revoked (revoked_at)
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                """)
-                conn.commit()
-            finally:
-                cur.close()
-        print("[Enrollment] Tables ready in userdb.")
-    except Exception as e:
-        print(f"[Enrollment] Error initializing tables: {e}")
-
-async def init_email_templates_table():
-    """Ensure `email_templates` exists in userdb (idempotent migration).
-
-    `send_email` and `/<agent>/notifications/templates` both query this table,
-    but init_userdb.sql never created it — so every templated alert mail failed
-    at the SELECT and the notifications endpoint returned a 500. Columns match
-    what send_email reads: template_name, subject_template, body_template.
-    """
-    try:
-        with sync_mysql_conn("userdb") as conn:
-            cur = conn.cursor()
-            try:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS email_templates (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        template_name VARCHAR(255) NOT NULL UNIQUE,
-                        subject_template TEXT NOT NULL,
-                        body_template TEXT NOT NULL,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                """)
-                # `dispatch_critical_alerts` looks up a per-agent template name
-                # ("Critical Alerts - Agent: WIN-01"), so without this generic
-                # fallback an operator would have to create one row per
-                # enrolled endpoint before any alert mail went out — with a log
-                # line as the only symptom of not having done so.
-                cur.execute("""
-                    INSERT IGNORE INTO email_templates
-                        (template_name, subject_template, body_template)
-                    VALUES (%s, %s, %s)
-                """, (
-                    DEFAULT_ALERT_TEMPLATE,
-                    "[Sentora] Critical alerts on {{agent}}",
-                    "Agent: {{agent}}\n\n{{body}}\n\n-- Sentora",
-                ))
-                conn.commit()
-            finally:
-                cur.close()
-        print("[Email] Templates table ready in userdb.")
-    except Exception as e:
-        print(f"[Email] Error initializing templates table: {e}")
-
-
-async def init_session_table():
-    """Ensure the `sessions` table exists in userdb (idempotent migration)."""
-    try:
-        with sync_mysql_conn("userdb") as conn:
-            cur = conn.cursor()
-            try:
-                cur.execute(session_store.CREATE_TABLE_SQL)
-                conn.commit()
-            finally:
-                cur.close()
-        print("[Session] Table ready in userdb.")
-    except Exception as e:
-        print(f"[Session] Error initializing table: {e}")
 
 @app.listener("main_process_start")
 async def setup_hub(app):
-    await init_hub_db()
-    await init_enrollment_tables()
-    await init_session_table()
-    await init_email_templates_table()
+    schema_init.set_defaults(conn_factory=sync_mysql_conn,
+                             alert_template=DEFAULT_ALERT_TEMPLATE)
+    await schema_init.run_all()
 
 
 def is_soar_enabled() -> bool:
@@ -460,7 +297,7 @@ async def _history_block_count(agent: str, target_ip: str) -> int:
 
 async def _execute_automation_record(agent: str, rec: dict) -> dict:
     """
-    Automation kaydını çalıştırır - Agent'a SOAR isteği gönderir.
+    Execute an automation record: send the SOAR request to the agent.
     
     Args:
         agent: Agent adı
@@ -565,11 +402,41 @@ async def _execute_automation_record(agent: str, rec: dict) -> dict:
             "ok": False,
         }
 
-def ensure_permissions(path: pathlib.Path):
+def ensure_permissions(path: pathlib.Path) -> bool:
+    """Restrict a secret file to its owner, and say so if that did not happen.
+
+    This swallowed the failure. When chmod does not take effect the file keeps
+    whatever the umask gave it - commonly 0644 in a container - so the secret
+    is readable by every process there and nothing anywhere says so. A
+    permission control that fails silently is not a control.
+
+    Verified rather than assumed: chmod can return without error and still not
+    produce the mode asked for, on Windows and on some mounted filesystems.
+
+    Returns True when the file ends up owner-only. Never raises: the caller
+    has already written the secret, and refusing to continue would leave it
+    written and unusable.
+    """
     try:
         os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
-    except Exception:
-        pass
+    except OSError as e:
+        print(f"[!] Could not restrict permissions on {path}: {e}. "
+              f"The file may be readable by other users.", flush=True)
+        return False
+
+    # POSIX modes are advisory on Windows, where this is expected to be a
+    # no-op; there is no point reporting it on every start.
+    if os.name == "nt":
+        return True
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except OSError:
+        return False
+    if mode & (stat.S_IRWXG | stat.S_IRWXO):
+        print(f"[!] {path} is still mode {mode:o} after chmod — it is "
+              f"readable beyond its owner.", flush=True)
+        return False
+    return True
 
 
 def _as_bool(val):
@@ -807,6 +674,29 @@ ENROLLMENT_TOKEN_TTL_HOURS = int(os.getenv("ENROLLMENT_TOKEN_TTL_HOURS", "24"))
 
 def _gen_token() -> str:
     return secrets.token_hex(32)
+
+
+def _quote_identifier(name: str) -> str:
+    """Quote a table or database name for interpolation into SQL.
+
+    Identifiers cannot be parameterised - `DESCRIBE %s` is not valid SQL - so
+    they have to be interpolated, and `f"DESCRIBE `{table}`"` was doing it
+    without escaping. A name containing a backtick closes the quoting early:
+    ``tbl`; DROP DATABASE x; -- `` becomes two statements.
+
+    MySQL escapes a backtick inside an identifier by doubling it. The name is
+    also length-limited and rejected outright if it contains a NUL or a
+    newline, neither of which appears in a real identifier and both of which
+    make log entries misleading.
+
+    These paths all require `manage_db`, so this is depth rather than the only
+    control.
+    """
+    raw = str(name or "")
+    if not raw or len(raw) > 64 or any(bad in raw for bad in ("\x00", "\n", "\r")):
+        raise ValueError(f"not a usable SQL identifier: {raw[:40]!r}")
+    return "`" + raw.replace("`", "``") + "`"
+
 
 def _client_ip(request) -> str:
     """The client's address, per core/login_guard.client_ip.
@@ -1393,6 +1283,12 @@ _PUBLIC_HANDLERS = {
     "report_automation_result", "report_automation_result_by_id",
 }
 
+# The only handlers a session on a seeded password may reach. `logout` is
+# included so an operator who cannot set a password can still end the session
+# rather than being stuck in it.
+_PASSWORD_CHANGE_HANDLERS = {"change_password", "logout", "serve_root",
+                             "serve_index", "health_check"}
+
 # Static assets must load before anyone can log in. Matched on path because
 # Sanic's internal static handler name varies across versions.
 _PUBLIC_PATH_PREFIXES = ("/assets/", "/vite.svg", "/favicon.ico")
@@ -1598,6 +1494,23 @@ async def authenticate(request):
 
     if not user:
         return _unauthorized("Authentication required")
+
+    # A session still on the seeded password may do exactly one thing.
+    #
+    # db/init_userdb.sql ships `admin` with a bcrypt hash that is published in
+    # this repository, and nothing ever required it to be changed. A console
+    # that isolates endpoints and runs commands on them was reachable with a
+    # credential anyone could read.
+    #
+    # Enforced here rather than in the UI: a flag the front end is trusted to
+    # honour is not a control, it is a suggestion. `logout` stays open so
+    # somebody who cannot set a password is not stuck in the session.
+    if user.get("must_change_password") and handler_name not in _PASSWORD_CHANGE_HANDLERS:
+        return sanic_json({
+            "status": "error",
+            "code": "must_change_password",
+            "message": "Set a new password before using the console.",
+        }, status=403)
 
     # `X-User-ID` is no longer identity — it is an assertion checked against
     # the session. SameSite is the primary CSRF control; requiring the header
@@ -1953,7 +1866,7 @@ def fetch_one_log_from_db(agent, table, log_id):
         with sync_mysql_conn(db_name) as conn:
             cursor = conn.cursor(dictionary=True)
             try:
-                cursor.execute(f"SELECT * FROM `{table}` WHERE id = %s", (log_id,))
+                cursor.execute(f"SELECT * FROM {_quote_identifier(table)} WHERE id = %s", (log_id,))
                 return cursor.fetchone()
             finally:
                 cursor.close()
@@ -2003,6 +1916,7 @@ async def analyze_all_agents_logs():
         }
 
 @app.route("/api/global/stats", methods=["GET"])
+@require_permission("read_telemetry")
 async def get_global_inventory_stats(request):
     try:
         def fetch_counts():
@@ -2322,8 +2236,13 @@ def load_or_create_fernet_key() -> str:
     path = _FERNET_KEY_PATH
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-    except Exception:
-        pass
+    except OSError as e:
+        # Not fatal on its own - the directory may already exist and be
+        # writable - but if it is not, the key cannot be persisted and every
+        # agent bootstrapped afterwards encrypts with a key this server will
+        # not have after a restart. That surfaces as undecryptable telemetry
+        # long after the cause.
+        print(f"[!] Could not create {os.path.dirname(path)}: {e}", flush=True)
     if os.path.exists(path):
         try:
             with open(path, "rb") as f:
@@ -2336,10 +2255,10 @@ def load_or_create_fernet_key() -> str:
     try:
         with open(path, "wb") as f:
             f.write(key)
-        try:
-            os.chmod(path, 0o600)
-        except Exception:
-            pass
+        # This is the key every agent's telemetry is encrypted with. If the
+        # mode does not take, ensure_permissions says so rather than leaving
+        # a world-readable key and a cheerful success line.
+        ensure_permissions(pathlib.Path(path))
         print(f"[+] Generated new Fernet key at {path}", flush=True)
     except Exception as e:
         print(f"[!] Could not persist generated Fernet key: {e}", flush=True)
@@ -2614,6 +2533,7 @@ def _server_disk_percent() -> float:
 
 
 @app.route("/server/resources", methods=["GET"])
+@require_permission("read_telemetry")
 async def get_server_resources(request):
     try:
         cpu = psutil.cpu_percent(interval=None)
@@ -2896,7 +2816,13 @@ async def admin_reset_password(request, user_id):
         cnx = await connect_userdb()
         cursor = await cnx.cursor()
 
-        await cursor.execute("UPDATE users SET password = %s WHERE id = %s", (hashed, user_id))
+        # Set, not cleared. An administrator resetting someone else's password
+        # has necessarily chosen it for them, so that password is known to two
+        # people and must be replaced by the account holder on first use.
+        await cursor.execute(
+            "UPDATE users SET password = %s, must_change_password = 1 "
+            "WHERE id = %s",
+            (hashed, user_id))
         await cnx.commit()
         await cursor.close(); await cnx.close()
 
@@ -4064,6 +3990,7 @@ async def assign_permissions_to_role(request):
         }, status=500)
     
 @app.route("/ai-analysis-status/<agent>")
+@require_permission("read_telemetry")
 async def get_ai_analysis_status(request, agent):
     try:
         db_name = _agent_db_name(agent)
@@ -4312,6 +4239,7 @@ async def log_login_attempt(username, auth_type, status, reason, ip_address):
 
 
 @app.route("/<agent>/soar_actions/<action_id>/resolve", methods=["PATCH"])
+@require_permission("manage_soar")
 async def resolve_soar_action(request, agent, action_id):
     if not is_soar_enabled():
         return _soar_block_response()
@@ -4354,6 +4282,7 @@ async def resolve_soar_action(request, agent, action_id):
 
 
 @app.route("/<agent>/soar_actions/<action_id>/send", methods=["PATCH"])
+@require_permission("manage_soar")
 async def mark_soar_action_sent(request, agent, action_id):
     if not is_soar_enabled():
         return _soar_block_response()
@@ -4390,6 +4319,7 @@ async def mark_soar_action_sent(request, agent, action_id):
 
 
 @app.route("/<agent>/soar_actions/<action_id>", methods=["DELETE"])
+@require_permission("manage_soar")
 async def delete_soar_action(request, agent, action_id):
     if not is_soar_enabled():
         return _soar_block_response()
@@ -4537,6 +4467,7 @@ async def run_due_automations(request, agent):
 
 
 @app.get("/<agent>/soar_actions")
+@require_permission("manage_soar")
 async def get_soar_actions_api(request, agent):
     """
     Alias for /automations to support frontend SoarHub.
@@ -4696,7 +4627,7 @@ async def fixed_list_automations(request, agent):
                     return float(dt.timestamp())
                 except Exception:
                     try: return float(val)
-                    except: return 0.0
+                    except Exception: return 0.0
             return 0.0
 
         filtered = []
@@ -4713,10 +4644,13 @@ async def fixed_list_automations(request, agent):
             r["created_at"] = _ensure_ts(r.get("created_at"))
 
             if r.get("payload") and isinstance(r["payload"], str):
-                try: 
-                    import json as py_json
-                    r["payload"] = py_json.loads(r["payload"])
-                except: pass
+                try:
+                    r["payload"] = pyjson.loads(r["payload"])
+                except ValueError:
+                    # A bare `except:` here also caught KeyboardInterrupt and
+                    # SystemExit. Leave the payload as the string it is; the
+                    # UI renders it either way.
+                    pass
 
             filtered.append(r)
 
@@ -4881,6 +4815,7 @@ async def update_automation(request, agent, auto_id):
         return sanic_json({"error": str(e)}, status=500)
 
 @app.patch("/<agent>/automations/<auto_id:int>/status")
+@require_permission("manage_soar")
 async def patch_automation_status(request, agent, auto_id):
     data = request.json or {}
     new_status = (data.get("status") or "").strip()
@@ -4955,11 +4890,13 @@ async def delete_automation(request, agent, auto_id):
         return sanic_json({"error": str(e)}, status=500)
 
 @app.post("/<agent>/automations/<auto_id:int>/run")
+@require_permission("manage_soar")
 async def run_automation_alias(request, agent, auto_id):
     return await execute_automation(request, agent, auto_id)
 
 
 @app.post("/<agent>/automations/validate-target")
+@require_permission("manage_soar")
 async def validate_automation_target(request, agent):
     if not is_soar_enabled():
         return _soar_block_response()
@@ -5230,8 +5167,14 @@ async def login(request):
                             break
                     await cursor.close()
                     await cnx.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Swallowed silently before. When this lookup fails the
+                    # user is admitted with the default role instead of the
+                    # one their LDAP group maps to, which reads as a
+                    # permissions bug months later rather than as an outage
+                    # now.
+                    print(f"[!] LDAP role lookup failed for {username!r}: {e}",
+                          flush=True)
 
                 await log_login_attempt(username, "ldap", "success", "", ip)
                 user_perms = await get_role_permissions(app_role)
@@ -5320,6 +5263,7 @@ def _sync_ldap_bind(ldap_host, ldap_port, bind_dn, bind_password, use_ssl: bool)
         conn.unbind()
 
 @app.route("/ldap/test-connection", methods=["POST"])
+@require_permission("manage_system")
 async def test_ldap_connection(request):
     data = request.json or {}
     ldap_host = data.get("ldap_host")
@@ -5631,6 +5575,7 @@ async def upsert_ldap(request):
 
 
 @app.route("/ldap/groups", methods=["GET"])
+@require_permission("manage_system")
 async def get_ldap_groups(request):
     data = request.json or {}
      
@@ -5713,7 +5658,13 @@ async def change_password(request):
             return sanic_json({"status": "error", "message": "Current password is wrong"}, status=401)
 
         new_hashed = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-        await cursor.execute("UPDATE users SET password = %s WHERE username = %s", (new_hashed, username))
+        # Clearing the flag here is what lets the account back into the rest
+        # of the console. Done in the same statement as the hash so a session
+        # cannot end up with a new password and still be gated.
+        await cursor.execute(
+            "UPDATE users SET password = %s, must_change_password = 0 "
+            "WHERE username = %s",
+            (new_hashed, username))
         await cnx.commit()
         await cursor.close(); await cnx.close()
 
@@ -5959,6 +5910,7 @@ async def report_automation_result_by_id(request, task_id):
         return sanic_json({"status": "error", "message": str(e)}, status=500)
 
 @app.route("/db-status")
+@require_permission("manage_db")
 async def db_status(request):
     try:
         cnx = await connect_userdb()
@@ -6084,10 +6036,10 @@ async def clear_table_delayed(request, agent, table):
     delay = int(data.get("delay", 0))
 
     if table not in allowed_tables:
-        return sanic_json({"status": "error", "message": f"{table} no permission"}, status=403)
+        return sanic_json({"status": "error", "message": f"{table} is not a table this endpoint may clear"}, status=403)
 
     if delay <= 0:
-        return sanic_json({"status": "error", "message": "Give a valid entr"}, status=400)
+        return sanic_json({"status": "error", "message": "delay must be a positive number of seconds"}, status=400)
 
     async def delayed_clear():
         await asyncio.sleep(delay)
@@ -6933,6 +6885,7 @@ async def stream_login_logs(request):
         return sanic_json({"status": "error", "message": f"DB error: {e}"}, status=500)
 
 @app.route("/test-audit", methods=["GET"])
+@require_permission("manage_system")
 async def test_audit_log(request):
     await audit_log(request, "TEST_ACTION", "TEST_RESOURCE", "Testing audit log insertion")
     return sanic_json({"status": "success", "message": "Test audit log triggered"})
@@ -7023,7 +6976,7 @@ async def list_table_columns(request, db_name, table_name):
             with sync_mysql_conn(db_name) as conn:
                 cursor = conn.cursor()
                 try:
-                    cursor.execute(f"DESCRIBE `{table_name}`")
+                    cursor.execute(f"DESCRIBE {_quote_identifier(table_name)}")
                     return [
                         {"name": row[0], "type": row[1], "null": row[2], "key": row[3], "default": row[4], "extra": row[5]}
                         for row in cursor.fetchall()
@@ -7044,7 +6997,7 @@ async def get_table_data(request, db_name, table_name):
             with sync_mysql_conn(db_name) as conn:
                 cursor = conn.cursor(dictionary=True)
                 try:
-                    cursor.execute(f"SELECT * FROM `{table_name}` LIMIT %s", (limit,))
+                    cursor.execute(f"SELECT * FROM {_quote_identifier(table_name)} LIMIT %s", (limit,))
                     return cursor.fetchall()
                 finally:
                     cursor.close()
@@ -7218,8 +7171,8 @@ def _try_agent_request(method: str, url: str, keys: list, json_body=None, timeou
 
 async def _get_agent_http_base(agent: str) -> str:
     """
-    Agent'ın HTTP base URL'sini döner.
-    - IP'yi ilgili agent'ın kendi DB'sindeki agent_info tablosundan çeker.
+    Return the agent's HTTP base URL.
+    - resolve the IP from that agent's kendi DB'sindeki agent_info tablosundan çeker.
     - IP yoksa veya bozuksa 127.0.0.1'e düşer.
     - Port env'den AGENT_PORT ile override edilebilir (default 9099).
     """
@@ -7400,7 +7353,7 @@ async def call_agent_soar(
         return {"ok": False, "error": error, "status": "failed", "message": error}
 
 async def ensure_playbooks_table(agent: str):
-    """<agent>_db.playbooks tablosu yoksa oluştur."""
+    """Create <agent>_db.playbooks if it does not exist."""
     cnx = await connect_db_for_agent(agent)
     cur = await cnx.cursor()
     await cur.execute("""
@@ -7442,8 +7395,8 @@ def _parse_json_field(val):
 @app.route("/<agent>/playbooks", methods=["GET"])
 async def list_playbooks(request, agent):
     """
-    Frontend: listeyi doldurmak için. 
-    Artık nodes ve connections da dönüyor ki edit açıldığında kaybolmasın.
+    Frontend: to populate the list. 
+    Nodes and connections are now da dönüyor ki edit açıldığında kaybolmasın.
     """
     try:
         await ensure_playbooks_table(agent)
@@ -7647,195 +7600,13 @@ async def delete_playbook(request, agent, playbook_id):
 
 
 
-def _palette_actions_enabled():
-    return bool(is_soar_enabled())
+# The node palette moved to core/soar_palette.py: it is a static
+# catalogue describing the SOAR builder UI, not application logic.
+from core import soar_palette  # noqa: E402
 
-def _node_schema(type_name, label, category, inputs=None, outputs=None, config_schema=None, disabled=False, help_text=""):
-    return {
-        "type": type_name,
-        "label": label,
-        "category": category,
-        "disabled": bool(disabled),
-        "inputs": inputs or [{"name": "in", "accept": "*"}],
-        "outputs": outputs or [{"name": "out"}],
-        "config_schema": config_schema or {},
-        "help": help_text,
-    }
+soar_palette.set_defaults(soar_enabled=is_soar_enabled)
+_build_node_palette = soar_palette._build_node_palette
 
-def _build_node_palette():
-    actions_enabled = _palette_actions_enabled()
-
-    nodes = []
-
-    nodes.append(_node_schema(
-        "trigger",
-        "Trigger (Generic)",
-        "trigger",
-        inputs=[],
-        outputs=[{"name": "out"}],
-        config_schema={
-            "triggerType": {"type": "string", "placeholder": "manual"},
-            "schedule": {"type": "string", "placeholder": ""},
-            "webhook": {"type": "string", "placeholder": ""},
-            "conditions": {"type": "array", "default": []}
-        },
-        help_text="Generic trigger placeholder. Use triggerType to specify the real trigger."
-    ))
-    nodes.append(_node_schema(
-        "action",
-        "Action (Generic)",
-        "action",
-        config_schema={
-            "actionType": {"type": "string", "placeholder": "http_request"},
-            "target": {"type": "string", "placeholder": ""},
-            "comment": {"type": "string", "placeholder": ""},
-            "ttl": {"type": "number", "default": 0},
-            "params": {"type": "string", "placeholder": "{}"}
-        },
-        disabled=not actions_enabled,
-        help_text="Generic action placeholder. actionType determines the SOAR action or HTTP request."
-    ))
-
-    nodes.append(_node_schema(
-        "trigger.events_alert",
-        "When Events Alert Arrives",
-        "trigger",
-        inputs=[],
-        outputs=[{"name": "on_alert"}],
-        config_schema={
-            "source": {"type": "string", "required": False, "title": "Source contains"},
-            "min_severity": {"type": "string", "enum": ["LOW","MEDIUM","HIGH","CRITICAL"], "default": "MEDIUM"},
-        },
-        help_text="events_alert tablosuna yeni kayıt düşünce tetikler (UI simülasyonunda filtreler).",
-    ))
-
-    nodes.append(_node_schema(
-        "trigger.time",
-        "Cron/Time Trigger",
-        "trigger",
-        inputs=[],
-        outputs=[{"name": "tick"}],
-        config_schema={"cron": {"type": "string", "placeholder": "*/5 * * * *"}},
-        help_text="Zaman bazlı tetik (UI simülasyonu için).",
-    ))
-
-    nodes.append(_node_schema(
-        "condition.severity_at_least",
-        "Severity ≥",
-        "condition",
-        config_schema={"threshold": {"type": "string", "enum": ["LOW","MEDIUM","HIGH","CRITICAL"], "default": "HIGH"}},
-        help_text="context.severity ile eşik karşılaştırır.",
-    ))
-    nodes.append(_node_schema(
-        "condition.text_match",
-        "Text contains",
-        "condition",
-        config_schema={"field": {"type": "string", "default": "message"}, "needle": {"type": "string"}},
-        help_text="context[field] içinde needle arar.",
-    ))
-
-    nodes.append(_node_schema(
-        "action.soar.block_ip",
-        "SOAR: Block IP",
-        "action",
-        config_schema={"ip": {"type": "string", "placeholder": "{{event.ip}}"}},
-        disabled=not actions_enabled,
-        help_text="Agent SOAR /soar/execute -> block_ip.",
-    ))
-    nodes.append(_node_schema(
-        "action.soar.disable_user",
-        "SOAR: Disable User",
-        "action",
-        config_schema={"username": {"type": "string", "placeholder": "{{event.username}}"}},
-        disabled=not actions_enabled,
-        help_text="Agent SOAR /soar/execute -> disable_user.",
-    ))
-
-    nodes.append(_node_schema(
-        "action.soar.unblock_ip",
-        "SOAR: Unblock IP",
-        "action",
-        config_schema={"ip": {"type": "string", "placeholder": "{{event.ip}}"}},
-        disabled=not actions_enabled,
-        help_text="Agent SOAR /soar/execute -> unblock_ip."
-    ))
-    nodes.append(_node_schema(
-        "action.soar.enable_user",
-        "SOAR: Enable User",
-        "action",
-        config_schema={"username": {"type": "string", "placeholder": "{{event.username}}"}},
-        disabled=not actions_enabled,
-        help_text="Agent SOAR /soar/execute -> enable_user."
-    ))
-    nodes.append(_node_schema(
-        "action.soar.kill_process",
-        "SOAR: Kill Process",
-        "action",
-        config_schema={"pid": {"type": "string", "placeholder": "{{event.pid}}"}},
-        disabled=not actions_enabled,
-        help_text="Agent SOAR /soar/execute -> kill_process."
-    ))
-    nodes.append(_node_schema(
-        "action.soar.restart_service",
-        "SOAR: Restart Service",
-        "action",
-        config_schema={"service": {"type": "string", "placeholder": "{{event.service}}"}},
-        disabled=not actions_enabled,
-        help_text="Agent SOAR /soar/execute -> restart_service."
-    ))
-    nodes.append(_node_schema(
-        "action.soar.lock_machine",
-        "SOAR: Lock Machine",
-        "action",
-        config_schema={"machine": {"type": "string", "placeholder": "{{event.host}}"}},
-        disabled=not actions_enabled,
-        help_text="Agent SOAR /soar/execute -> lock_machine."
-    ))
-    nodes.append(_node_schema(
-        "action.soar.quarantine_file",
-        "SOAR: Quarantine File",
-        "action",
-        config_schema={"filepath": {"type": "string", "placeholder": "/path/to/file"}},
-        disabled=not actions_enabled,
-        help_text="Agent SOAR /soar/execute -> quarantine_file."
-    ))
-    nodes.append(_node_schema(
-        "action.soar.tail_log",
-        "SOAR: Tail Log",
-        "action",
-        config_schema={"logfile": {"type": "string", "placeholder": "/var/log/syslog"}},
-        disabled=not actions_enabled,
-        help_text="Agent SOAR /soar/execute -> tail_log."
-    ))
-    nodes.append(_node_schema(
-        "action.soar.run_cmd",
-        "SOAR: Run Command",
-        "action",
-        config_schema={"command": {"type": "string", "placeholder": "uptime"}},
-        disabled=not actions_enabled,
-        help_text="Agent SOAR /soar/execute -> run_cmd."
-    ))
-
-    nodes.append(_node_schema(
-        "notify.email",
-        "Send Email (template)",
-        "notify",
-        config_schema={
-            "template_name": {"type": "string", "placeholder": "Critical Alerts - Agent: {{agent}}"},
-            "context_json": {"type": "string", "placeholder": "{\"agent\":\"{{agent}}\",\"body\":\"...\"}"}
-        },
-        help_text="userdb.email_templates içinden şablonla mail atar.",
-    ))
-
-    nodes.append(_node_schema(
-        "util.delay",
-        "Delay",
-        "util",
-        config_schema={"ms": {"type": "number", "default": 1000}},
-        help_text="Akışı N ms bekletir (icrada üst sınır 5sn).",
-    ))
-
-    return {"nodes": nodes, "soar_enabled": actions_enabled}
 
 @app.get("/playbooks/palette")
 async def get_node_palette(request):
@@ -7864,6 +7635,7 @@ async def get_playbook_examples(request):
     return sanic_json({"examples": examples})
 
 @app.post("/<agent>/playbooks/<playbook_id:int>/webhook")
+@require_permission("manage_soar")
 async def playbook_webhook(request, agent, playbook_id):
     """
     This endpoint allows external systems to trigger a playbook via webhook.
@@ -7964,6 +7736,7 @@ def _eval_condition(ntype: str, config: dict, ctx: dict) -> bool:
 
 
 @app.get("/<agent>/playbooks/catalog")
+@require_permission("manage_soar")
 async def get_playbooks_catalog(request, agent):
     try:
         catalog = {
@@ -8004,9 +7777,10 @@ async def get_playbooks_catalog(request, agent):
         return sanic_json({"error": str(e)}, status=500) 
         
 @app.get("/<agent>/notifications/templates")
+@require_permission("set_email_config")
 async def get_email_templates(request, agent):
     """
-    Notification node'ları için email template listesi.
+    Email template list for notification nodes.
     """
     try:
         cnx = await connect_userdb()
@@ -8022,6 +7796,7 @@ async def get_email_templates(request, agent):
         return sanic_json({"error": str(e)}, status=500)
 
 @app.post("/<agent>/playbooks/validate")
+@require_permission("manage_soar")
 async def validate_playbook(request, agent):
     try:
         data = request.json or {}
@@ -8393,6 +8168,7 @@ async def download_playbook_run(request, agent, run_id):
 
 
 @app.post("/<agent>/playbooks/<playbook_id:int>/run")
+@require_permission("manage_soar")
 async def run_playbook(request, agent, playbook_id):
     if not is_soar_enabled():
         return _soar_block_response()
@@ -8546,6 +8322,7 @@ async def run_playbook(request, agent, playbook_id):
 
 
 @app.post("/<agent_name>/create_playbooks")
+@require_permission("manage_soar")
 async def create_playbook_compat(request, agent_name):
     data = request.json or {}
     name = (data.get("name") or "").strip()
@@ -8601,6 +8378,7 @@ async def create_playbook_compat(request, agent_name):
 
 
 @app.post("/<agent>/playbooks/runs/clear")
+@require_permission("manage_soar")
 async def clear_playbook_runs(request, agent):
     await _ensure_playbook_runs_table(agent)
     try:
@@ -8700,7 +8478,7 @@ async def drop_database(request, db_name):
                 cursor = conn.cursor()
                 try:
                     for name in candidates:
-                        sql = f"DROP DATABASE IF EXISTS `{name}`"
+                        sql = f"DROP DATABASE IF EXISTS {_quote_identifier(name)}"
                         print(f"[*] Dropping candidate DB: {sql}")
                         cursor.execute(sql)
                     conn.commit()
@@ -8789,7 +8567,7 @@ async def delete_agent(request, agent):
                         # Identifier, so it cannot be parameterised. The name
                         # came through _agent_name_forms, which strips
                         # everything outside [A-Za-z0-9_-].
-                        cursor.execute(f"DROP DATABASE `{name}`")
+                        cursor.execute(f"DROP DATABASE {_quote_identifier(name)}")
                         dropped.append(name)
                 cursor.execute(
                     "DELETE FROM userdb.agent_identities WHERE agent_name IN (%s, %s)",

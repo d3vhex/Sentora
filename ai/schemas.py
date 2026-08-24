@@ -89,9 +89,24 @@ class TriageVerdict(_Base):
     serious it is.
     """
 
+    # `observed` before `summary`, and both before the verdict.
+    #
+    # "Describe before judging" was not enough on its own. The model dutifully
+    # filled `summary` first and filled it with the prompt's own criterion
+    # text - "LSASS memory read, mimikatz, SAM/SYSTEM/NTDS hive copied or
+    # exported" - on an EID 4672 SYSTEM logon, then rated it CRITICAL at
+    # confidence 1.00 and recommended isolating the host.
+    #
+    # It had described something. It had not described the event. `observed`
+    # is constrained to values copied out of the log, so the field it fills
+    # first cannot be a technique it has recognised in the prompt.
+    observed: str = Field(default="", description=(
+        "Values copied from the log and nothing else: the event ID, and the "
+        "process, account or object it names. No technique names, no tool "
+        "names, no words that do not appear in the log."))
     summary: str = Field(default="", description=(
-        "What this event actually shows: the process, event ID, account and "
-        "command line. Describe it before judging it. One sentence, <=180 chars."))
+        "One sentence about this specific event, grounded in `observed`. "
+        "<=180 characters."))
     indicator: str = Field(default="none", description="MITRE ID plus short label, or 'none'")
     verdict: TriageOutcome = "NOT_CRITICAL"
     severity: Severity = "INFO"

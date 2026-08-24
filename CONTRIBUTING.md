@@ -80,7 +80,12 @@ For tighter feedback loops you can run pieces outside Docker:
 
 ```bash
 # Backend with hot reload
-pip install -r requirements.txt
+pip install -r requirements.lock
+
+# requirements.lock pins every direct and transitive version, so a build of
+# this commit installs the same code next month as it does today. Adding a
+# dependency means editing requirements.txt and regenerating the lock — the
+# command is in the lock's own header, and CI fails if the two disagree.
 python app.py --debug
 
 # Frontend with Vite HMR
