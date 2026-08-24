@@ -27,6 +27,9 @@ kept coming back.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import functools
 import re
 
 # criterion -> (name, [alternatives]); each alternative is a list of substrings
@@ -62,26 +65,52 @@ CRITERIA: dict[str, tuple[str, list[list[str]]]] = {
         ["set-mppreference", "disablerealtimemonitoring"],
     ]),
     "C4": ("persistence to a writable path", [
-        # `appdata` was here on its own and it is too common to carry the
-        # weight: Slack, Teams and Dropbox all install a Run key pointing into
-        # AppData, so every one of them read as CRITICAL persistence.
+        # A path is a location, not a mechanism, and this criterion used to
+        # match on location alone. `appdata` went first - Slack, Teams and
+        # Dropbox all install a Run key pointing there, so every one of them
+        # read as CRITICAL persistence.
         #
-        # Removing it costs nothing measurable - all eight attack cases still
-        # match a criterion - and it stops forcing an autostart entry that
-        # legitimate software creates every day.
+        # The remaining three were the same mistake one step quieter. Windows
+        # Error Reporting writes its own crash dumps to
+        # `C:\ProgramData\Microsoft\Windows\WER\Temp\`, and that matched
+        # `programdata` and `\temp\` on a real, entirely uneventful desktop.
+        # Three of the ten observed events in the corpus were being forced to
+        # CRITICAL by a machine reporting that something had crashed.
+        #
+        # So each alternative now names a mechanism as well as a location.
+        # Persistence is something that will run again; a file sitting in a
+        # writable directory is not, however suspicious the directory.
         #
         # A Run key into AppData is still worth a look. That is what
         # SUSPICIOUS is for, and it is a judgement, so it stays with the model.
-        ["users\\public"],
-        ["\\temp\\"],
-        ["programdata"],
+        ["currentversion\\run", "users\\public"],
+        ["currentversion\\run", "\\temp\\"],
+        ["currentversion\\run", "\\appdata\\"],
+        ["currentversion\\run", "programdata"],
+        ["schtasks", "/create", "users\\public"],
+        ["schtasks", "/create", "\\temp\\"],
+        ["scheduled task was created", "users\\public"],
+        ["scheduled task was created", "\\temp\\"],
+        ["service was installed", "users\\public"],
+        ["service was installed", "\\temp\\"],
     ]),
     "C5": ("obfuscated execution", [
-        ["-enc"],
-        ["-encodedcommand"],
-        ["-e ", "powershell"],
-        ["downloadstring"],
+        # `-enc` on its own was here, and it is not an indicator. The corpus
+        # makes the point twice: a developer decoding a config string, and
+        # this estate's own management tooling running an encoded command on
+        # an ordinary afternoon. Both were forced to CRITICAL.
+        #
+        # What separates them is what the payload does, not that there is one,
+        # so the encoded flag now has to be accompanied by something. See
+        # `decoded_payload` below - the base64 is decoded and searched, which
+        # is the only place a cradle is actually visible.
+        ["-encodedcommand", "downloadstring"],
+        ["-encodedcommand", "net.webclient"],
+        ["-enc ", "invoke-expression"],
+        ["downloadstring", "http"],
         ["iex(", "new-object"],
+        ["iex (", "new-object"],
+        ["frombase64string", "invoke-expression"],
     ]),
     "C6": ("destruction of recovery", [
         ["vssadmin", "delete", "shadows"],
@@ -131,6 +160,58 @@ def claimed_criterion(value: str) -> str | None:
     return f"C{m.group(1)}" if m else None
 
 
+# 24 characters is 18 bytes decoded, which is about the shortest thing worth
+# finding - `curl http://x | sh` is 18. A longer minimum missed exactly those,
+# and length turned out not to be what keeps noise out anyway: the printable
+# check below rejects hex dumps and GUIDs regardless of how long they are.
+_B64_RUN = re.compile(r"[A-Za-z0-9+/]{24,}={0,2}")
+
+
+@functools.lru_cache(maxsize=256)
+def decoded_payload(text: str) -> str:
+    """Whatever the base64 in this log decodes to, appended to the haystack.
+
+    The reason this exists: `-EncodedCommand` is where a payload goes to stop
+    being searchable. Matching on the flag alone treats encoding itself as the
+    indicator, which it is not - this estate's own tooling runs encoded
+    commands, and a developer decoding a config string looks identical from
+    outside. Both were being forced to CRITICAL.
+
+    Decoding moves the question from "was this encoded" to "what does it do",
+    which is the question worth asking and the only one the two cases answer
+    differently.
+
+    Cached because `resolve()` asks all six criteria about the same log, so
+    without it the same payload is decoded six times per event on the hot
+    path.
+
+    PowerShell encodes as UTF-16LE and everything else as UTF-8, so both are
+    tried. Failures are silent on purpose: a run of base64-looking characters
+    is usually a GUID, a hash or a hex dump, and none of those are worth a
+    log line.
+    """
+    out = []
+    for run in _B64_RUN.findall(text or "")[:20]:      # bounded: logs get long
+        padded = run + "=" * (-len(run) % 4)
+        try:
+            blob = base64.b64decode(padded, validate=False)
+        except binascii.Error:      # a ValueError subclass; b64decode raises it
+            continue
+        for codec in ("utf-16-le", "utf-8"):
+            try:
+                decoded = blob.decode(codec)
+            except (UnicodeDecodeError, LookupError):
+                continue
+            # A wrong guess yields mojibake, not text. Requiring mostly
+            # printable ASCII keeps that out of the haystack, where it could
+            # otherwise coincide with a marker.
+            printable = sum(32 <= ord(c) < 127 for c in decoded)
+            if decoded and printable / len(decoded) > 0.9:
+                out.append(decoded)
+                break
+    return " ".join(out)
+
+
 def supported_by(tag: str, *texts: str) -> bool:
     """Does the log actually contain the evidence this criterion requires?
 
@@ -141,8 +222,9 @@ def supported_by(tag: str, *texts: str) -> bool:
     spec = CRITERIA.get((tag or "").upper())
     if not spec:
         return False
-    haystack = _normalise(" ".join(t for t in texts if t))
-    if not haystack:
+    joined = " ".join(t for t in texts if t)
+    haystack = _normalise(joined + " " + decoded_payload(joined))
+    if not haystack.strip():
         return False
     # Markers go through the same transformation as the text. Folding only one
     # side breaks the comparison in a way that looks like a missing marker:

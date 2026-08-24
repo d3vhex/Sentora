@@ -29,6 +29,8 @@ try:
     from core.sigma import severity_of as sigma_severity
     from core.sigma_loader import match_all as sigma_match
     from core.sigma_loader import windows_event_fields as sigma_fields
+    from core.sigma_loader import journal_event_fields as sigma_journal_fields
+    from core.sigma_loader import text_event_fields as sigma_text_fields
     HAS_SIGMA = True
 except ImportError:
     HAS_SIGMA = False
@@ -42,15 +44,25 @@ except ImportError:
     def sigma_fields(*_a, **_kw):       # pragma: no cover
         return {}
 
+    def sigma_journal_fields(*_a, **_kw):   # pragma: no cover
+        return {}
+
+    def sigma_text_fields(*_a, **_kw):      # pragma: no cover
+        return {}
+
 
 IS_WINDOWS = platform.system() == "Windows"
 
 here = os.path.dirname(os.path.abspath(__file__))
 default_cfg = os.path.normpath(os.path.join(here, "../../conf/log_paths.yaml"))
 RULES_YAML_PATH = os.path.normpath(os.path.join(here, "../../conf/rules.yaml"))
-# Community Sigma rules live here. Empty by default: the operator chooses
-# which rulesets to install, because a detection nobody reviewed is not an
-# improvement on one nobody reviewed.
+# Sigma rules. `builtin/` ships with the agent; community rulesets go beside
+# it, and everything under here is loaded recursively at start.
+#
+# This directory was empty by design once, on the argument that a detection
+# nobody reviewed is no improvement. The argument holds and the outcome did
+# not: it meant zero ATT&CK coverage on every install, and "no detections" is
+# not a defensible default for a detection agent.
 SIGMA_RULES_PATH = os.getenv(
     "SIGMA_RULES_PATH",
     os.path.normpath(os.path.join(here, "../../conf/sigma")))
@@ -406,6 +418,64 @@ def get_log_paths_from_yaml_or_fallback(cfg_log_paths, distro: str):
             return cfg_log_paths['default']
     return FALLBACK_LOG_PATHS.get(distro, FALLBACK_LOG_PATHS['default'])
 
+class Classification:
+    """What a log line was decided to be, and by what.
+
+    Which layer decided is worth knowing downstream - a Sigma hit matched a
+    named field and carries an ATT&CK technique, a regex hit matched text
+    somewhere in the line, and they are not equally strong evidence. But it is
+    already recorded: `rule_title` is the Sigma rule's name and the regex list
+    has nothing to put there. A second field saying the same thing is state
+    that can disagree with itself, so `by` reads it rather than storing it.
+    """
+
+    __slots__ = ("severity", "category", "rule_title", "techniques")
+
+    def __init__(self, severity, category, rule_title=None, techniques=()):
+        self.severity = severity
+        self.category = category
+        self.rule_title = rule_title
+        self.techniques = list(techniques)
+
+    @property
+    def by(self) -> str:
+        return "sigma" if self.rule_title else "regex"
+
+
+def classify(text, fields, sigma_rules, rules_list):
+    """Sigma first, the regex list as fallback. None if neither fires.
+
+    One implementation for all three collection paths. It used to exist only
+    on the Windows path, which meant a Linux endpoint got no Sigma at all and
+    no ATT&CK technique on anything - the coverage page would have reported a
+    Windows-only estate as the whole estate.
+
+    `fields` is what the path could supply. The journal supplies real ones; a
+    plain syslog line supplies little more than `Message`, so field-matching
+    rules will not fire there. That is a genuine limit of text logs rather
+    than a decision made here, and `core.sigma_loader.text_event_fields` says
+    so where it builds them.
+    """
+    if sigma_rules and fields:
+        hits = sigma_match(sigma_rules, fields)
+        if hits:
+            # Every rule that fired, not the first: techniques accumulate and
+            # the most severe wins the label.
+            best = max(hits, key=lambda r: _SEVERITY_ORDER.get(sigma_severity(r), 0))
+            return Classification(
+                severity=sigma_severity(best),
+                category=best.title,
+                rule_title=best.title,
+                techniques=sorted({tech for r in hits for tech in r.techniques}),
+            )
+
+    for rule in rules_list:
+        if rule['regex'].search(text):
+            return Classification(severity=rule['severity'],
+                                  category=rule['category'])
+    return None
+
+
 def make_dup_fp_for_event(message: str) -> str:
     msg = (message or "").strip()
     return hashlib.sha256(msg.encode("utf-8")).hexdigest()
@@ -413,7 +483,7 @@ def make_dup_fp_for_event(message: str) -> str:
 def enhanced_follow_file(path: str, rules_list: List[Dict],
                         exclude_patterns: List[re.Pattern], enricher: EventEnricher,
                         metrics: MetricsCollector, rate_limiter: RateLimiter,
-                        duplicate_filter: DuplicateFilter):
+                        duplicate_filter: DuplicateFilter, sigma_rules=None):
     last_position = 0
     consecutive_errors = 0
     max_errors = 5
@@ -443,13 +513,9 @@ def enhanced_follow_file(path: str, rules_list: List[Dict],
                         metrics.increment('rate_limited_events')
                         continue
 
-                    matched_rule = None
-                    for rule in rules_list:
-                        if rule['regex'].search(line):
-                            matched_rule = rule
-                            break
-                    
-                    if not matched_rule:
+                    hit = classify(line, sigma_text_fields(line, path),
+                                   sigma_rules, rules_list)
+                    if hit is None:
                         continue
 
                     if any(p.search(line) for p in exclude_patterns):
@@ -457,8 +523,10 @@ def enhanced_follow_file(path: str, rules_list: List[Dict],
                         continue
 
                     event = enricher.enrich_event(line, path)
-                    event.event_type = matched_rule['category']
-                    event.severity = matched_rule['severity']
+                    event.event_type = hit.category
+                    event.severity = hit.severity
+                    event.techniques = hit.techniques
+                    event.rule_title = hit.rule_title
 
                     if duplicate_filter.is_duplicate(event.event_hash):
                         metrics.increment('duplicate_events')
@@ -484,7 +552,7 @@ def enhanced_follow_file(path: str, rules_list: List[Dict],
 
 def enhanced_follow_journal(rules_list: List[Dict], exclude_patterns, enricher: EventEnricher,
                             metrics: MetricsCollector, rate_limiter: RateLimiter,
-                            duplicate_filter: DuplicateFilter):
+                            duplicate_filter: DuplicateFilter, sigma_rules=None):
     try:
         j = Journal(flags=0)
         j.log_level(LOG_INFO)
@@ -507,13 +575,9 @@ def enhanced_follow_journal(rules_list: List[Dict], exclude_patterns, enricher: 
                         metrics.increment('rate_limited_events')
                         continue
 
-                    matched_rule = None
-                    for rule in rules_list:
-                        if rule['regex'].search(msg):
-                            matched_rule = rule
-                            break
-                    
-                    if not matched_rule:
+                    hit = classify(msg, sigma_journal_fields(entry),
+                                   sigma_rules, rules_list)
+                    if hit is None:
                         continue
 
                     if any(p.search(msg) for p in exclude_patterns):
@@ -521,8 +585,10 @@ def enhanced_follow_journal(rules_list: List[Dict], exclude_patterns, enricher: 
 
                     event = enricher.enrich_event(msg, 'journal')
                     event.timestamp = datetime.fromtimestamp(entry.get('__REALTIME_TIMESTAMP', time.time())).strftime('%Y-%m-%d %H:%M:%S')
-                    event.event_type = matched_rule['category']
-                    event.severity = matched_rule['severity']
+                    event.event_type = hit.category
+                    event.severity = hit.severity
+                    event.techniques = hit.techniques
+                    event.rule_title = hit.rule_title
 
                     if not duplicate_filter.is_duplicate(event.event_hash):
                         event_queue.put(event)
@@ -666,36 +732,12 @@ def follow_windows_eventlog(rules_list: List[Dict], exclude_patterns, log_type,
                     # appearing in a message, and it carries the ATT&CK
                     # technique with it. The regex list is the fallback for
                     # everything Sigma has no rule for.
-                    sigma_hits = []
-                    techniques = []
-                    rule_title = None
-                    severity = None
-                    category = None
-                    if sigma_rules:
-                        fields = sigma_fields(eid, inserts, message=full_msg,
-                                              channel=log_type, provider=source)
-                        sigma_hits = sigma_match(sigma_rules, fields)
-                        if sigma_hits:
-                            # Every rule that fired, not the first. Techniques
-                            # accumulate, and the most severe wins the label.
-                            best = max(sigma_hits, key=lambda r: _SEVERITY_ORDER.get(
-                                sigma_severity(r), 0))
-                            severity = sigma_severity(best)
-                            category = best.title
-                            rule_title = best.title
-                            techniques = sorted({t for r in sigma_hits
-                                                 for t in r.techniques})
-
-                    matched_rule = None
-                    if not sigma_hits:
-                        for rule in rules_list:
-                            if rule['regex'].search(full_msg):
-                                matched_rule = rule
-                                break
-                        if not matched_rule:
-                            continue
-                        severity = matched_rule['severity']
-                        category = matched_rule['category']
+                    fields = sigma_fields(eid, inserts, message=full_msg,
+                                          channel=log_type,
+                                          provider=source) if sigma_rules else None
+                    hit = classify(full_msg, fields, sigma_rules, rules_list)
+                    if hit is None:
+                        continue
 
                     if any(p.search(full_msg) for p in exclude_patterns):
                         continue
@@ -708,10 +750,10 @@ def follow_windows_eventlog(rules_list: List[Dict], exclude_patterns, log_type,
                     # the provider says what produced it.
                     origin = f"{log_type}/{source}" if source and source != "Unknown" else log_type
                     event = enricher.enrich_event(full_msg, origin)
-                    event.event_type = category
-                    event.severity = severity
-                    event.techniques = techniques
-                    event.rule_title = rule_title
+                    event.event_type = hit.category
+                    event.severity = hit.severity
+                    event.techniques = hit.techniques
+                    event.rule_title = hit.rule_title
 
                     if not duplicate_filter.is_duplicate(event.event_hash):
                         event_queue.put(event)
@@ -814,7 +856,7 @@ def main():
             threading.Thread(
                 target=enhanced_follow_file,
                 args=(path, rules_list, exclude_patterns, enricher, metrics,
-                        rate_limiter, duplicate_filter),
+                        rate_limiter, duplicate_filter, sigma_rules),
                 daemon=True
             ).start()
         else:
@@ -840,7 +882,7 @@ def main():
             threading.Thread(
                 target=enhanced_follow_journal,
                 args=(rules_list, exclude_patterns, enricher, metrics,
-                      rate_limiter, duplicate_filter),
+                      rate_limiter, duplicate_filter, sigma_rules),
                 daemon=True
             ).start()
 

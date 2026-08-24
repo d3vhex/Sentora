@@ -1,0 +1,53 @@
+title: Autorun Registry Key Pointing At A User-Writable Path
+id: 7e2d9c48-1b53-4a86-b0f7-5c3e8a14d629
+status: experimental
+description: >
+    A Run key entry executes at every logon. Ordinary software uses them
+    constantly, so the key alone is not the signal - the signal is a Run entry
+    whose target sits in AppData, Temp or a public directory, which is where
+    an installer would not put a binary and where an unprivileged process can
+    still write.
+
+    Requires Sysmon (EventID 13) or registry auditing (4657); neither is on by
+    default, so this rule is quiet on a stock Windows install rather than
+    wrong.
+references:
+    - https://attack.mitre.org/techniques/T1547/001/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: windows
+detection:
+    autorun_key:
+        TargetObject|contains:
+            - '\currentversion\run\'
+            - '\currentversion\runonce\'
+            - '\currentversion\runservices\'
+            - '\winlogon\shell'
+            - '\winlogon\userinit'
+    autorun_key_4657:
+        ObjectName|contains:
+            - '\currentversion\run'
+            - '\winlogon'
+    user_writable:
+        Details|contains:
+            - '\appdata\'
+            - '\temp\'
+            - '\users\public\'
+            - '\programdata\'
+            - '\downloads\'
+    user_writable_4657:
+        NewValue|contains:
+            - '\appdata\'
+            - '\temp\'
+            - '\users\public\'
+            - '\downloads\'
+    condition: (autorun_key and user_writable) or (autorun_key_4657 and user_writable_4657)
+falsepositives:
+    - Software that legitimately installs per-user into AppData, which a
+      surprising amount of modern software does
+level: high
+tags:
+    - attack.persistence
+    - attack.privilege_escalation
+    - attack.t1547.001

@@ -99,3 +99,64 @@ def test_the_report_shows_what_production_would_show():
            / "scripts" / "run_eval.py").read_text(encoding="utf-8")
     assert "surfaced_recall" in src
     assert "Reaches an analyst" in src
+
+
+# --------------------------------------------------------------------------
+# A verified criterion is not model output
+# --------------------------------------------------------------------------
+
+def vc(verdict="CRITICAL", severity="CRITICAL", confidence=0.5, criterion="none"):
+    return types.SimpleNamespace(verdict=verdict, severity=severity,
+                                 confidence=confidence, matched_criterion=criterion)
+
+
+def test_a_verified_criterion_surfaces_regardless_of_confidence():
+    """Measured on the attack corpus: six CRITICAL verdicts whose severity was
+    also CRITICAL were blocked at confidence 0.50 - an LSASS dump, a SAM hive
+    export, shadow copies being deleted. A seventh sat at 0.00.
+
+    Every benign case also came back at 0.50. The number carries no signal in
+    either direction, so gating a checked fact on it discards real detections
+    and admits nothing.
+    """
+    assert gating.surfaces(vc(confidence=0.5, criterion="C1 credential access"))
+    assert gating.surfaces(vc(confidence=0.0, severity="HIGH", criterion="C3"))
+
+
+def test_without_a_criterion_the_confidence_gate_still_applies():
+    """The bypass is for a fact about the log, not for CRITICAL in general."""
+    assert not gating.surfaces(vc(confidence=0.5, criterion="none"))
+    assert gating.surfaces(vc(confidence=0.9, criterion="none"))
+
+
+def test_severity_is_still_required():
+    """A criterion match raises severity to at least HIGH in criteria.apply,
+    so MEDIUM here means something overrode it and the verdict is incoherent."""
+    assert not gating.surfaces(vc(severity="MEDIUM", confidence=0.9, criterion="C1"))
+
+
+def test_suspicious_gets_no_bypass():
+    """`criteria.apply` clears the criterion when it is not supported, so a
+    SUSPICIOUS verdict never carries a verified one - but if one ever appeared
+    there it must not be enough on its own."""
+    assert not gating.surfaces(
+        vc(verdict="SUSPICIOUS", severity="MEDIUM", confidence=0.5, criterion="C1"))
+
+
+def test_lowering_the_threshold_was_measured_and_rejected():
+    """Between 0.60 and 0.90 the model's output is identical - it returns 0.50
+    or 0.90 and nothing between - so moving the gate there changes nothing.
+    Dropping to 0.50 gains one attack and admits six false alarms.
+
+    Pinned so the next person to reach for the threshold sees that it was
+    tried.
+    """
+    import inspect
+    source = inspect.getsource(gating)
+    assert "0.60 and 0.90 the output is identical" in source
+
+
+def test_the_description_matches_the_rule():
+    """It is printed in the eval report, so a stale description would
+    misdescribe every run."""
+    assert "verified criterion" in gating.describe()

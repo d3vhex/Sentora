@@ -1,0 +1,32 @@
+title: Registry Hive Exported
+id: 2f7d4c19-83ab-4e10-b6c2-9d41f0e5a7b3
+status: stable
+description: >
+    SAM, SYSTEM and SECURITY together are enough to recover local password
+    hashes offline. Exporting them is the first half of a credential theft
+    that finishes on the attacker's own machine, where nothing here can see
+    it - which is why this has to be caught at the export.
+references:
+    - https://attack.mitre.org/techniques/T1003/002/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    reg_save:
+        CommandLine|contains|all:
+            - 'reg'
+            - 'save'
+    hives:
+        CommandLine|contains:
+            - 'hklm\sam'
+            - 'hklm\system'
+            - 'hklm\security'
+    condition: reg_save and hives
+falsepositives:
+    - A documented backup procedure that exports hives before a change
+level: critical
+tags:
+    - attack.credential_access
+    - attack.t1003.002

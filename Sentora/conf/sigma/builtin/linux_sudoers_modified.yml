@@ -1,0 +1,43 @@
+title: Sudoers Modified Outside visudo
+id: 8b4d6f31-2c79-4e15-9a63-1f8e5b0c7d24
+status: experimental
+description: >
+    Writing to /etc/sudoers or dropping a file into sudoers.d grants root, and
+    doing it with a redirect or an editor rather than visudo skips the syntax
+    check - which is both how an intruder does it and how an administrator
+    locks themselves out of their own machine.
+
+    Matched against the journal, where the command line is a real field. On a
+    plain syslog file only the message text is available, so this rule is
+    weaker there rather than absent.
+references:
+    - https://attack.mitre.org/techniques/T1548/003/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: linux
+detection:
+    msg_sudoers:
+        Message|contains:
+            - '/etc/sudoers'
+            - 'sudoers.d/'
+    msg_writing:
+        Message|contains:
+            - 'tee '
+            - 'echo '
+            - '>>'
+            - 'nopasswd'
+    cmd_sudoers:
+        CommandLine|contains: 'sudoers'
+    cmd_writing:
+        CommandLine|contains:
+            - 'tee'
+            - 'nopasswd'
+            - '>>'
+    condition: (msg_sudoers and msg_writing) or (cmd_sudoers and cmd_writing)
+falsepositives:
+    - Configuration management writing a sudoers.d drop-in on every run
+level: high
+tags:
+    - attack.privilege_escalation
+    - attack.t1548.003

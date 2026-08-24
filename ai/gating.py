@@ -48,15 +48,47 @@ def surfaces(verdict) -> bool:
     except (TypeError, ValueError):
         confidence = 0.0
 
+    # A verified criterion is not model output. `ai/criteria.apply` only
+    # leaves a criterion named here when the log itself contains that
+    # criterion's markers, which is a fact about the event rather than the
+    # model's opinion of it - so the confidence gate does not apply.
+    #
+    # This is not a loosening for its own sake. Measured on the attack corpus:
+    # six CRITICAL verdicts whose severity was also CRITICAL were blocked at
+    # confidence 0.50, including an LSASS dump, a SAM hive export and shadow
+    # copies being deleted. A seventh sat at 0.00. Meanwhile every benign case
+    # also came back at 0.50 - the number carries no signal in either
+    # direction, so gating real detections on it discards them and admits
+    # nothing.
+    #
+    # Lowering the threshold instead was measured and does not work: between
+    # 0.60 and 0.90 the output is identical, because the model returns 0.50 or
+    # 0.90 and nothing in between. Dropping to 0.50 gains one attack and adds
+    # six false alarms.
     if outcome == "CRITICAL":
-        return severity in ESCALATING_SEVERITIES and confidence >= CRITICAL_CONFIDENCE
+        if severity not in ESCALATING_SEVERITIES:
+            return False
+        if criterion_verified(verdict):
+            return True
+        return confidence >= CRITICAL_CONFIDENCE
     if outcome == "SUSPICIOUS":
         return confidence >= SUSPICIOUS_CONFIDENCE
     return False
 
 
+def criterion_verified(verdict) -> bool:
+    """True when the log was checked and found to contain the evidence.
+
+    `matched_criterion` is whatever the model wrote until `criteria.apply`
+    runs; afterwards it names a criterion only if the markers were found, and
+    is "none" otherwise. So this is a question about the log, not the model.
+    """
+    from ai.criteria import claimed_criterion
+    return claimed_criterion(getattr(verdict, "matched_criterion", "")) is not None
+
+
 def describe() -> str:
     """The gate in words, for reports that need to say what they measured."""
-    return (f"CRITICAL needs severity CRITICAL/HIGH and confidence "
-            f">={CRITICAL_CONFIDENCE}; SUSPICIOUS needs confidence "
-            f">={SUSPICIOUS_CONFIDENCE}")
+    return (f"CRITICAL needs severity CRITICAL/HIGH, and either a verified "
+            f"criterion or confidence >={CRITICAL_CONFIDENCE}; SUSPICIOUS "
+            f"needs confidence >={SUSPICIOUS_CONFIDENCE}")

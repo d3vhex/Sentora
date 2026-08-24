@@ -1,0 +1,43 @@
+title: Local Account Created Or Added To Administrators
+id: 5c9a3e72-1d46-4b83-8f0e-7a2d5c14b968
+status: stable
+description: >
+    A new local account, or an existing one joined to Administrators, is how
+    access is kept once the original way in is closed. On a domain-managed
+    estate local account creation is rare enough to be worth reading every
+    time it happens.
+
+    The group names are matched in several languages because the Administrators
+    group is localised by Windows, and a rule that only knows the English name
+    silently stops working on a German or Turkish install.
+references:
+    - https://attack.mitre.org/techniques/T1136/001/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: windows
+    service: security
+detection:
+    account_created:
+        EventID: 4720
+    net_user_add:
+        CommandLine|contains|all:
+            - 'net user'
+            - '/add'
+    localgroup_add:
+        CommandLine|contains|all:
+            - 'localgroup'
+            - '/add'
+    admin_group:
+        CommandLine|contains:
+            - 'administrators'
+            - 'administratoren'
+            - 'administrateurs'
+            - 'yoneticiler'
+    condition: account_created or net_user_add or (localgroup_add and admin_group)
+falsepositives:
+    - Provisioning that creates a local service account on first boot
+level: high
+tags:
+    - attack.persistence
+    - attack.t1136.001

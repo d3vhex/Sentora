@@ -1,0 +1,42 @@
+title: Service Installed From An Administrative Share
+id: 0c5e8a37-4d19-4b62-97f3-1a8c6e2b5d40
+status: stable
+description: >
+    A service whose binary lives on \\host\ADMIN$ or \\host\C$ is how PsExec
+    and everything modelled on it executes code on a remote machine.
+
+    Restricted to the built-in hidden shares on purpose. An earlier version
+    matched any UNC path and flagged a management agent installing itself from
+    the software distribution point - which is a remote share, but not one an
+    intruder gets to use. ADMIN$ and C$ exist on every Windows host without
+    anybody creating them, and that is precisely why lateral movement tools
+    reach for them.
+
+    This is lateral movement seen from the receiving end, which is usually the
+    only end that logs it.
+references:
+    - https://attack.mitre.org/techniques/T1021/002/
+    - https://attack.mitre.org/techniques/T1569/002/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: windows
+    service: system
+detection:
+    service_installed:
+        EventID: 7045
+    admin_share:
+        ImagePath|contains:
+            - '\admin$\'
+            - '\c$\'
+            - '\ipc$'
+    condition: service_installed and admin_share
+falsepositives:
+    - A deployment tool that copies through ADMIN$ rather than a share of its
+      own. Rare, and worth knowing about either way.
+level: critical
+tags:
+    - attack.lateral_movement
+    - attack.execution
+    - attack.t1021.002
+    - attack.t1569.002

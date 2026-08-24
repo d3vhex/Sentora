@@ -53,6 +53,14 @@ class Case:
     # at all - see EvalReport.confidence_is_anchored.
     severity: str | None = None
     confidence: float | None = None
+    # Whether this case was written by hand or taken from real telemetry.
+    #
+    # It changes what the score means, so it travels with the case rather
+    # than living in a README nobody rereads. A constructed positive is the
+    # loud, textbook version of a technique; a model that catches it has
+    # cleared a low bar. A real intruder is quieter. Defaults to None for
+    # runs saved before this existed - unknown, not real.
+    constructed: bool | None = None
 
     @property
     def correct(self) -> bool:
@@ -151,6 +159,30 @@ class EvalReport:
         return sum(1 for c in should if c.surfaced) / len(should)
 
     @property
+    def surfaced_false_alarms(self) -> tuple[int, int] | None:
+        """(benign events an analyst would be shown, benign events total).
+
+        The mirror of `surfaced_recall`, and needed for the same reason. This
+        harness once reported 40% escalation recall while production surfaced
+        nothing, because it scored the verdict and the product also applies a
+        gate. Escalation precision has exactly that gap in the other
+        direction: a run can look poor on verdicts while the gate quietly
+        filters most of the noise before an analyst ever sees it.
+
+        Measured, not assumed: on the 29-case corpus the model raised twelve
+        unwarranted escalations and two of them surfaced. Quoting 43%
+        precision and stopping there describes a console nobody has.
+
+        These are the alerts that cost attention, so this is the number to
+        watch when the gate is loosened.
+        """
+        benign = [c for c in self.cases
+                  if c.expected not in ESCALATING and c.surfaced is not None]
+        if not benign:
+            return None
+        return sum(1 for c in benign if c.surfaced), len(benign)
+
+    @property
     def resolution(self) -> float | None:
         """The smallest difference in escalation recall this corpus can show.
 
@@ -170,6 +202,23 @@ class EvalReport:
         """
         support = sum(1 for c in self.cases if c.expected in ESCALATING)
         return 1.0 / support if support else None
+
+    @property
+    def provenance(self) -> tuple[int, int, int]:
+        """(constructed positives, real positives, unknown) among escalating cases.
+
+        The recall figure is only as good as what it was measured on, and the
+        two are easy to separate here and impossible to separate later. Nobody
+        has run mimikatz on this estate, so every positive is written from
+        documented technique behaviour - which makes recall an upper bound,
+        not a safety claim.
+
+        Reported because a number printed without it gets quoted without it.
+        """
+        positives = [c for c in self.cases if c.expected in ESCALATING]
+        return (sum(1 for c in positives if c.constructed is True),
+                sum(1 for c in positives if c.constructed is False),
+                sum(1 for c in positives if c.constructed is None))
 
     @property
     def constant_verdict(self) -> str | None:

@@ -5,6 +5,144 @@ made to the Sentora platform, newest first.
 
 ---
 
+## 2026-08 — Sigma detection, ATT&CK coverage, and a corpus that says what it is
+
+### Detection did not depend on the model, and now it does not have to
+
+Detection was a 1,575-entry regex list nobody outside this repository had
+reviewed, plus an LLM. The regex list stops at the first pattern that matches,
+so one broad pattern could label every event COMMAND INJECTION and hide
+everything behind it.
+
+Sigma now runs first on every collection path and the regex list is the
+fallback. Sigma matches *named fields*, which is a different kind of claim:
+`Image|endswith: '\vssadmin.exe'` cannot be defeated by the word "vssadmin"
+appearing in an unrelated message. It is also deterministic, so it keeps
+working when the model is unavailable or wrong.
+
+Compiled in process rather than via pysigma, which targets query languages
+(Splunk SPL, Elasticsearch DSL) and has no backend answering "does this dict
+match" — the only question an agent has.
+
+**An unsupported construct raises rather than compiling to false.** A rule
+that silently never fires is worse than one that fails to load: the second is
+visible on the next start, the first is discovered after an intrusion.
+
+### Sigma ran only on Windows
+
+The file and journal paths still used the regex list, so a Linux endpoint got
+no Sigma at all and no ATT&CK technique on anything — the coverage page would
+have reported a Windows-only estate as the whole estate.
+
+All three paths now share one classifier. The journal gets real field mapping
+(`_COMM`, `_CMDLINE`, `_SYSTEMD_UNIT`), because it genuinely carries those.
+Plain log files get `Message` and whatever the enricher extracted, and that
+limit is stated rather than papered over: a rule matching `CommandLine` cannot
+fire on a syslog line, and a test pins the distinction so it cannot quietly
+reverse.
+
+### The rules directory was empty on purpose, and the purpose was wrong
+
+The argument for shipping no rules — a detection nobody reviewed is not an
+improvement — is a good one. The outcome was zero ATT&CK coverage on every
+install and a coverage page with nothing to draw. "No detections" is not a
+defensible default for a product whose job is detection.
+
+15 rules now ship covering 16 techniques, scoped to what the agent actually
+collects. Measured against the eval corpus rather than asserted: **9 of 10
+attacks caught by Sigma alone, 0 of 9 hard negatives falsely flagged.** The
+miss is password spray, which is a shape across several events and stateless
+Sigma cannot express it — noted in the test rather than left as an
+unexplained failure.
+
+Two hard negatives caught real bugs in the baseline before it shipped:
+
+- A management agent installing a service from `\\corp-sccm01\SoftwareDist$`.
+  The rule matched any UNC path. ADMIN$ and C$ exist on every host without
+  anybody creating them; a vendor's own distribution share does not, and
+  restricting to the built-in hidden shares keeps the PsExec case and drops
+  the false alarm.
+- `[Convert]::FromBase64String($env:APP_CONFIG)` from a developer's terminal.
+  Base64 on a PowerShell command line is not an indicator by itself.
+
+### Two bugs in the Sigma evaluator, found by writing rules against it
+
+**`base64offset` only trimmed the leading end.** base64 packs three bytes into
+four characters, so both the first *and* last groups are shared with whatever
+surrounds the needle — a needle carrying its own final group matches only when
+it happens to sit at the very end of the payload. How much to trim from the
+end depends on where the needle *ends*, which is the padding plus its own
+length. Until this was fixed, `base64offset` found "Net.WebClient" in nothing
+at all.
+
+**No `utf16le` modifier.** PowerShell's `-EncodedCommand` takes UTF-16LE, so a
+needle encoded as UTF-8 and base64'd cannot appear in that payload. Every
+community SigmaHQ PowerShell rule uses `|utf16le|base64offset|contains`; all
+of them were being rejected. Added, along with `utf16be`, `utf16` and `wide`,
+and an encoding modifier used without base64 is now rejected outright rather
+than compiled into a comparison that can never be true.
+
+Together these are what let a rule read *inside* an encoded payload — the
+difference between detecting that something was encoded and detecting what it
+was.
+
+### Sysmon IDs would have been read on the wrong channel
+
+Sysmon's event IDs are small numbers — 1, 11, 13 — that mean something
+entirely different on the System and Application channels. A single mapping
+table would have read a System event through Sysmon's field layout, putting
+arbitrary text into `Image` and `CommandLine` and inventing evidence for
+whichever rule then matched it. Split into `SYSMON_FIELDS`, selected by
+channel.
+
+### Detections were flagged and never seen
+
+The eval said 90% escalation recall; production showed 20% of them to an
+analyst. The gap was the confidence gate.
+
+Measuring the threshold instead of guessing at it disproved the obvious fix:
+between 0.60 and 0.90 nothing changes, because the model returns 0.50 or 0.90
+and nothing in between. Dropping to 0.50 gains one attack and admits six false
+alarms. Six CRITICAL verdicts were blocked at confidence 0.50 — an LSASS dump,
+a SAM hive export, shadow copies being deleted — and every benign case also
+came back at 0.50. **The number carries no signal in either direction.**
+
+A criterion verified by `ai/criteria` is not model output: it holds only when
+the log itself contains the markers, which is a fact about the event. Those
+now bypass the confidence gate. **Reaches an analyst: 20% → 80%**, against a
+±20% noise floor the report states on every run.
+
+### Two criteria treated location as evidence
+
+Folding real telemetry into the attack corpus immediately failed a test, which
+is the outcome that justifies having done it.
+
+`C4` "persistence to a writable path" matched on the path alone. Windows Error
+Reporting writes crash dumps to `C:\ProgramData\Microsoft\Windows\WER\Temp\`,
+so three of the ten real events were being forced to CRITICAL — and a forced
+criterion bypasses the confidence gate, so each one reached an analyst. A path
+is a location; persistence is something that will run again. Each alternative
+now names a mechanism as well.
+
+`C5` "obfuscated execution" treated `-enc` as the indicator. This estate's own
+tooling runs encoded commands on ordinary afternoons. The flag is not what
+separates a cradle from a config string, so the base64 is now decoded (UTF-16LE
+and UTF-8) and searched — moving the question from "was this encoded" to "what
+does it do", which is the only one the two cases answer differently.
+
+### The corpus now says what it is
+
+Every positive case is written by hand from documented technique behaviour —
+nobody has run mimikatz on this estate and nobody is going to. That makes
+recall an upper bound, not a safety claim, and the report never said so.
+
+Provenance now travels with each case and is printed on every run. Precision
+does not have the same problem: a false alarm on a quiet estate is a real
+false alarm, so the ten labelled real events were folded in as negatives. The
+half that can be measured against reality is; the half that cannot says so.
+
+---
+
 ## 2026-08 — Authentication, endpoint audit, honest metrics
 
 ### Authentication rebuilt

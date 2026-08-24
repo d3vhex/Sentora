@@ -1,0 +1,43 @@
+title: Shell History Cleared Or Disabled
+id: 6d3b9e14-5f82-4a70-91c6-2b8d4e0a7f53
+status: experimental
+description: >
+    Truncating .bash_history or unsetting HISTFILE removes the record of what
+    was run. It is worth an alert for the same reason a cleared event log is:
+    not for the act itself, but because the quiet period that follows can no
+    longer be read as quiet.
+
+    Medium rather than high - a user clearing their own history is common and
+    usually means nothing on its own.
+references:
+    - https://attack.mitre.org/techniques/T1070/003/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: linux
+detection:
+    msg_history:
+        Message|contains:
+            - 'bash_history'
+            - 'histfile'
+            - 'history -c'
+    msg_destructive:
+        Message|contains:
+            - 'rm '
+            - 'unset'
+            - '/dev/null'
+            - 'shred'
+            - 'truncate'
+            - 'history -c'
+    cmd_history:
+        CommandLine|contains:
+            - 'bash_history'
+            - 'history -c'
+            - 'histfile'
+    condition: (msg_history and msg_destructive) or cmd_history
+falsepositives:
+    - A user clearing their own history for unremarkable reasons
+level: medium
+tags:
+    - attack.defense_evasion
+    - attack.t1070.003

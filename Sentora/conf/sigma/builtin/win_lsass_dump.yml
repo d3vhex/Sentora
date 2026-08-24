@@ -1,0 +1,41 @@
+title: LSASS Process Memory Dumped
+id: 8a1c0f3e-6b21-4d5b-9f0a-3e5c7a1d2b40
+status: stable
+description: >
+    A dump of the LSASS process, which holds the credentials of everyone
+    currently logged on. There is no routine administrative reason to write
+    LSASS to disk on an endpoint; the legitimate case is debugging an
+    authentication crash, and this firing there is worth the interrupt.
+references:
+    - https://attack.mitre.org/techniques/T1003/001/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    comsvcs:
+        CommandLine|contains|all:
+            - 'comsvcs.dll'
+            - 'MiniDump'
+    procdump:
+        CommandLine|contains: 'lsass'
+        Image|endswith:
+            - '\procdump.exe'
+            - '\procdump64.exe'
+    rundll_lsass:
+        CommandLine|contains|all:
+            - 'rundll32'
+            - 'lsass'
+    known_tool:
+        CommandLine|contains:
+            - 'dumpert'
+            - 'nanodump'
+            - 'lsassy'
+    condition: 1 of them
+falsepositives:
+    - A developer debugging an authentication crash with procdump
+level: critical
+tags:
+    - attack.credential_access
+    - attack.t1003.001

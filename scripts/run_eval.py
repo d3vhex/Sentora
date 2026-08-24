@@ -148,7 +148,7 @@ def main() -> int:
         results.append(Case(
             id=row["id"], expected=row["expected"], actual=actual,
             latency_s=elapsed, note=row.get("note", ""), surfaced=shown,
-            severity=sev, confidence=conf,
+            severity=sev, confidence=conf, constructed=row.get("constructed"),
         ))
         mark = "ok " if row["expected"] == actual else "MISS"
         print(f"  [{i:>3}/{len(cases)}] {mark} {row['id']}  "
@@ -189,14 +189,43 @@ def main() -> int:
         print(f"     {er:.0%} of attacks were flagged; {sr:.0%} would be seen.")
         print(f"     Gate: {describe_gate()}")
 
+    alarms = report.surfaced_false_alarms
+    if alarms:
+        shown, total = alarms
+        print(f"  False alarms shown .... {shown}/{total} benign events"
+              f"   (what the gate lets through)")
+        flagged = sum(1 for c in report.cases
+                      if c.expected not in ("CRITICAL", "SUSPICIOUS")
+                      and c.actual in ("CRITICAL", "SUSPICIOUS"))
+        if flagged > shown:
+            print(f"     The model over-escalated {flagged}; the gate stopped"
+                  f" {flagged - shown}.")
+            print("     Escalation precision above scores the verdict. This"
+                  " scores")
+            print("     the console, and it is the one that costs attention.")
+
+    built, real, unknown = report.provenance
+    if built or unknown:
+        print()
+        total_pos = built + real + unknown
+        print(f"  Positives ............. {built} constructed, {real} real"
+              + (f", {unknown} unknown" if unknown else ""))
+        if built + unknown == total_pos:
+            print( "     Every positive was written by hand from documented")
+            print( "     technique behaviour - nobody has run mimikatz here.")
+            print( "     These are the loud versions, so read recall as an")
+            print( "     upper bound: a miss is real evidence, a hit is weak.")
+            print( "     Watching this number fall is meaningful. The number")
+            print( "     itself is not a safety claim.")
+
     res = report.resolution
     if res is not None:
         print()
         print(f"  Resolution ............ {res:.0%} per case")
         print(f"     One case flipping moves recall by {res:.0%}. Two runs of this")
-        print(f"     corpus, same prompt, temperature 0, returned 50% and 60%:")
-        print(f"     CPU inference reduces across threads in a non-deterministic")
-        print(f"     order and a near-tie flips. Treat a difference smaller than")
+        print("     corpus, same prompt, temperature 0, returned 50% and 60%:")
+        print("     CPU inference reduces across threads in a non-deterministic")
+        print("     order and a near-tie flips. Treat a difference smaller than")
         print(f"     {2 * res:.0%} as noise, not as a result.")
 
     anchored = report.confidence_is_anchored

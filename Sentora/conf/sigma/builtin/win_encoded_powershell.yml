@@ -1,0 +1,58 @@
+title: PowerShell Run With An Encoded Or Fetched Command
+id: 6c1a8f42-9d73-4b25-a0e8-1f6b3c7d5482
+status: stable
+description: >
+    -EncodedCommand takes base64 so the payload never appears as text on the
+    command line. It is occasionally a legitimate way to pass a script full of
+    quotes, but it is overwhelmingly used to keep the payload out of exactly
+    the log this rule reads.
+references:
+    - https://attack.mitre.org/techniques/T1059/001/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    powershell:
+        Image|endswith:
+            - '\powershell.exe'
+            - '\pwsh.exe'
+    encoded:
+        CommandLine|contains:
+            - ' -enc '
+            - ' -encodedcommand '
+            - ' -e '
+            - '/enc '
+    download_cradle:
+        CommandLine|contains|all:
+            - 'net.webclient'
+            - 'downloadstring'
+    iex_fetch:
+        CommandLine|contains|all:
+            - 'iex'
+            - 'downloadstring'
+    # The same cradle, read inside the base64 rather than beside it.
+    #
+    # -EncodedCommand takes UTF-16LE, so this is where the payload of a real
+    # encoded command actually lives - the plaintext selections above see only
+    # the wrapper. Matching here is what separates an encoded command that
+    # fetches and runs remote code from one that encodes a config string,
+    # which the plaintext rules cannot tell apart at all.
+    cradle_in_payload:
+        CommandLine|utf16le|base64offset|contains:
+            - 'Net.WebClient'
+            - 'DownloadString'
+            - 'DownloadFile'
+            - 'Invoke-Expression'
+            - 'IEX ('
+            - 'FromBase64String'
+            - 'Start-Process -WindowStyle Hidden'
+    condition: (powershell and encoded) or download_cradle or iex_fetch
+        or cradle_in_payload
+falsepositives:
+    - Management software that wraps its scripts to avoid quoting problems
+level: high
+tags:
+    - attack.execution
+    - attack.t1059.001
