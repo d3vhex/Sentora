@@ -23,7 +23,13 @@ from pydantic import BaseModel, EmailStr, constr, Field, field_validator
 from typing import Optional, List
 
 class LoginRequest(BaseModel):
-    username: constr(min_length=3, max_length=50)
+    # The same pattern CreateUserRequest has always had. Login did not, which
+    # mattered because the LDAP path interpolates this straight into a search
+    # filter: `*)(uid=*` turns an authentication check into a wildcard match.
+    # A username that cannot be created is not a username that should be
+    # accepted at login either.
+    # Hyphen last, so it is a literal rather than a range and needs no escape.
+    username: constr(min_length=3, max_length=50, pattern=r'^[a-zA-Z0-9_.@-]+$')
     password: constr(min_length=6)
 
 class CreateUserRequest(BaseModel):
@@ -69,6 +75,7 @@ from sanic.response import json as sanic_json
 import ldap3
 from sanic import response
 from ldap3 import Server, Connection, ALL, Tls
+from ldap3.utils.conv import escape_filter_chars
 from ldap3.core.exceptions import LDAPSocketOpenError, LDAPBindError
 import ssl
 from cryptography.fernet import Fernet, InvalidToken
@@ -108,6 +115,7 @@ from ai.utils import load_ai_config, is_critical_log, save_ai_results
 from security import session as session_store
 from security import ssrf
 from core import config_validation
+from core import login_guard
 from core import threat_feeds
 # Installer templating: pure string generation, extracted so app.py is not
 # also 420 lines of PowerShell. See core/installers.py.
@@ -801,10 +809,14 @@ def _gen_token() -> str:
     return secrets.token_hex(32)
 
 def _client_ip(request) -> str:
-    fwd = request.headers.get("X-Forwarded-For", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.ip or "-"
+    """The client's address, per core/login_guard.client_ip.
+
+    This returned X-Forwarded-For unconditionally. With no reverse proxy in
+    front the header is whatever the caller typed, so every address in the
+    audit trail was attacker-choosable - log injection into the SIEM's own
+    audit log - and any per-address limit built on it resets itself.
+    """
+    return login_guard.client_ip(request)
 
 async def _validate_agent_auth(request) -> str | None:
     """Return agent_name if X-Agent-Key matches a non-revoked identity, else None.
@@ -833,6 +845,46 @@ async def _validate_agent_auth(request) -> str | None:
     if key == AGENT_SHARED_SECRET:
         return "*"
     return None
+
+async def _require_agent(request, agent: str):
+    """Authorise an agent-facing call, returning an error response or None.
+
+    The automation-poll pair used to carry no authentication at all, and
+    `report_automation_result_by_id` took the agent name from the request
+    body. That gave anyone who could reach the API two primitives:
+
+      GET  /<agent>/automations/pending
+          read the response actions queued for a host - an attacker sees
+          `ISOLATE_HOST` for their own machine before the agent does.
+
+      POST /<agent>/automations/report {"task_id": N, "status": "SUCCESS"}
+          walk task_id from 1 upward marking everything done. The real agent
+          then never sees those rows, because it polls WHERE status='pending'.
+          The action never runs and the console shows it green.
+
+    The second is worse than an authentication bypass. It is a way to switch
+    off every autonomous response the platform makes while it continues to
+    report that they succeeded.
+
+    Identity comes from the key, never from the URL or the body, and it has to
+    match the agent being acted on.
+    """
+    identity = await _validate_agent_auth(request)
+    if identity is None:
+        return sanic_json({"status": "error", "message": "unauthorized"},
+                          status=401)
+    # "*" is the legacy fleet-wide secret. Kept working, because agents
+    # enrolled before per-agent keys existed still use it, but it is not an
+    # identity - it cannot be used to speak for a specific host beyond what it
+    # already could.
+    if identity == "*":
+        return None
+    if _agent_name_forms(identity)[1] != _agent_name_forms(agent)[1]:
+        print(f"[!] agent key for {identity!r} used against {agent!r}", flush=True)
+        return sanic_json({"status": "error", "message": "unauthorized"},
+                          status=401)
+    return None
+
 
 @app.post("/api/agents/enroll")
 async def enroll_agent(request):
@@ -1278,11 +1330,7 @@ async def audit_log(request, action: str, resource: str, details: str = ""):
     user_id = current_user_id(request)
     username = current_username(request)
 
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        ip = xff.split(",")[0].strip()
-    else:
-        ip = request.conn_info.peername[0] if request.conn_info and request.conn_info.peername else "unknown"
+    ip = _client_ip(request)
 
     try:
         cnx = await connect_userdb()
@@ -1329,10 +1377,16 @@ async def audit_log(request, action: str, resource: str, details: str = ""):
 _PUBLIC_HANDLERS = {
     # Login endpoint and the SPA shell (the SPA routes to /login on its own).
     "login", "logout", "health_check", "serve_root", "serve_index",
-    # Agent-facing endpoints. These carry X-Agent-Key or an enrollment token
-    # (and the automation-poll pair currently carries nothing — tracked as
-    # follow-up work). The session layer must not be what gates agent traffic,
+    # Agent-facing endpoints. Public here means "no browser session", not
+    # "no authentication": each one validates X-Agent-Key or an enrollment
+    # token itself. The session layer must not be what gates agent traffic,
     # or every enrolled endpoint stops reporting the moment this ships.
+    #
+    # The automation poll/report pair really did carry nothing until now, and
+    # the consequence was not a bypass but a way to blind the console: walking
+    # task_id upward with {"status":"SUCCESS"} closed queued response actions
+    # before the agent polled them, so they never ran and the UI showed them
+    # green. They authenticate now — see _require_agent.
     "download_agent", "register_agent", "agent_bootstrap",
     "deploy_agent_linux", "deploy_agent_windows",
     "get_pending_automations_for_agent",
@@ -4497,38 +4551,65 @@ async def get_soar_actions_api(request, agent):
 @app.post("/<agent>/automations/report", name="report_automation_agent")
 @app.post("/api/agents/<agent>/automations/report", name="report_automation_api")
 async def report_automation_result(request, agent=None):
-    """
-    Agent'ın aksiyon sonucunu bildirdiği yer.
+    """Where an agent reports the result of an action it was told to take.
+
+    Same treatment as report_automation_result_by_id: the identity comes from
+    the key rather than from `metadata.agent` in the body, and a task can only
+    move from outstanding to finished.
+
+    The two `except Exception: pass` blocks are also gone. A row lives in
+    `soar_actions` or in `automations`, not both, so one of the two statements
+    was always expected to fail - and swallowing both meant a report that
+    updated nothing was indistinguishable from one that worked. The rowcounts
+    are counted instead, and a report that matched nothing is a 404.
     """
     try:
-        data = request.json
+        data = request.json or {}
         task_id = data.get("task_id")
-        status = data.get("status", "SUCCESS").upper()
+        status = str(data.get("status", "success")).strip().lower()
         output = data.get("output", "")
-        
-        if not agent:
-            agent = data.get("metadata", {}).get("agent")
-            
-        if not agent or not task_id:
-            return sanic_json({"error": "Missing agent or task_id"}, status=400)
-            
-        cnx = await connect_db_for_agent(agent)
-        cur = await cnx.cursor()
-        
-        query_soar = "UPDATE soar_actions SET status = %s, comment = %s, updated_at = NOW() WHERE id = %s"
-        query_auto = "UPDATE automations SET status = %s, comment = %s, updated_at = NOW() WHERE id = %s"
-        
-        try:
-            await cur.execute(query_soar, (status, output[:500], task_id))
-        except Exception:
-            pass
-            
-        try:
-            await cur.execute(query_auto, (status.lower(), output[:500], task_id))
-        except Exception:
-            pass
-            
-        await cnx.commit(); await cur.close(); await cnx.close()
+
+        identity = await _validate_agent_auth(request)
+        if identity is None or identity == "*":
+            return sanic_json({"error": "unauthorized"}, status=401)
+        if agent and _agent_name_forms(identity)[1] != _agent_name_forms(agent)[1]:
+            print(f"[!] agent key for {identity!r} reported for {agent!r}", flush=True)
+            return sanic_json({"error": "unauthorized"}, status=401)
+        agent = identity
+
+        if not task_id:
+            return sanic_json({"error": "Missing task_id"}, status=400)
+        if status not in _TERMINAL_AUTOMATION_STATES:
+            return sanic_json(
+                {"error": f"status must be one of {sorted(_TERMINAL_AUTOMATION_STATES)}"},
+                status=400)
+
+        async with agent_conn(agent) as cnx:
+            cur = await cnx.cursor()
+            try:
+                touched = 0
+                for table, value in (("soar_actions", status.upper()),
+                                     ("automations", status)):
+                    try:
+                        await cur.execute(
+                            f"UPDATE {table} SET status = %s, comment = %s, "
+                            f"updated_at = NOW() WHERE id = %s "
+                            f"AND LOWER(status) IN ('pending','active')",
+                            (value, output[:500], task_id))
+                        touched += cur.rowcount
+                    except Exception as e:
+                        # A missing table is normal on an agent that has never
+                        # run that kind of action. Anything else is reported.
+                        if "1146" not in str(e) and "doesn't exist" not in str(e).lower():
+                            print(f"[!] report_automation_result {table}: {e}", flush=True)
+                await cnx.commit()
+            finally:
+                await _close_async_quiet(cur)
+
+        if not touched:
+            return sanic_json(
+                {"error": "no outstanding task with that id for this agent"},
+                status=404)
         return sanic_json({"status": "ok"})
     except Exception as e:
         return sanic_json({"error": str(e)}, status=500)
@@ -5005,15 +5086,26 @@ async def login(request):
     except Exception as e:
         return response.json({"status": "error", "message": f"Invalid input: {str(e)}"}, status=400)
 
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        ip = xff.split(",")[0].strip()
-    else:
-        ip = request.conn_info.peername[0] if request.conn_info and request.conn_info.peername else "unknown"
+    ip = _client_ip(request)
 
     try:
         cnx = await connect_userdb()
         cursor = await cnx.cursor()
+
+        # Before the password check. `login_logs` already held a row for every
+        # failure and nothing read it: bcrypt at cost 12 was the only brake on
+        # online guessing, which is detection without response.
+        locked = await login_guard.check(cursor, username, ip)
+        if locked:
+            await cursor.close(); await cnx.close()
+            await log_login_attempt(username, "local", "failure",
+                                    f"locked out: {locked}", ip)
+            print(f"[auth] lockout {username!r} from {ip}: {locked}", flush=True)
+            return response.json({
+                "status": "error",
+                "message": "Too many failed attempts. Try again later.",
+            }, status=429)
+
         await cursor.execute(
             "SELECT id, username, password, created_at, role FROM users WHERE username = %s LIMIT 1",
             (username,),
@@ -5086,7 +5178,16 @@ async def login(request):
             try:
                 admin_conn = Connection(server, user=bind_dn, password=bind_password, auto_bind=True)
 
-                search_filter = login_filter % username
+                # Escaped, not interpolated raw. `login_filter % username` with
+                # a username of `*)(uid=*` produces a filter that matches every
+                # entry, so the directory returns the first user in the tree
+                # and authentication becomes "did you type anything".
+                #
+                # The pattern on LoginRequest already rejects the metacharacters;
+                # this is the second layer, because the filter template is
+                # operator-configurable and a future one could interpolate
+                # somewhere the pattern does not cover.
+                search_filter = login_filter % escape_filter_chars(username)
                 admin_conn.search(users_base, search_filter, attributes=["cn"])
                 if not admin_conn.entries:
                     admin_conn.unbind()
@@ -5097,7 +5198,10 @@ async def login(request):
 
                 admin_conn.search(
                     search_base=group_base,
-                    search_filter=f"(member={user_dn})",
+                    # The DN comes from the directory rather than the user,
+                    # but it is still interpolated into a filter, and a DN can
+                    # legitimately contain parentheses.
+                    search_filter=f"(member={escape_filter_chars(user_dn)})",
                     attributes=["cn"]
                 )
                 group_dns = [entry.entry_dn for entry in admin_conn.entries]
@@ -5729,6 +5833,10 @@ async def get_pending_automations_for_agent(request, agent):
     table hasn't been created yet (the schema is provisioned lazily). Without
     this, agents log a flood of `fetch_pending_tasks failed ... 500 ...`.
     """
+    denied = await _require_agent(request, agent)
+    if denied:
+        return denied
+
     # `async with` rather than a close on the happy path. This endpoint is
     # polled by every agent every few seconds, so it was the fastest way to
     # drain the connection pool: any error between acquiring the connection
@@ -5793,28 +5901,59 @@ async def get_pending_automations_for_agent(request, agent):
     except Exception as e:
         return sanic_json({"status": "error", "message": str(e)}, status=500)
 
+# A task may only move from outstanding to finished, never back, and never to
+# a state that would hide it from the agent that still has to run it.
+_TERMINAL_AUTOMATION_STATES = {"completed", "failed", "cancelled", "success"}
+
+
 @app.route("/automations/<task_id:int>/report", methods=["POST"])
 async def report_automation_result_by_id(request, task_id):
-    """Endpoint for agent to report task completion"""
+    """Endpoint for an agent to report that it finished a task.
+
+    `agent` used to come from the request body, which made it a claim rather
+    than an identity. It now comes from the key, and the update is scoped to
+    that agent's own database.
+    """
     data = request.json or {}
-    status = data.get("status", "completed")
+    status = str(data.get("status", "completed")).strip().lower()
     output = data.get("output", "")
-    agent = data.get("agent")
-    
-    if not agent:
-        return sanic_json({"status": "error", "message": "agent name required"}, status=400)
+
+    agent = await _validate_agent_auth(request)
+    if agent is None or agent == "*":
+        # "*" is the fleet-wide legacy secret and names no host, so it cannot
+        # say which agent finished a task.
+        return sanic_json({"status": "error", "message": "unauthorized"}, status=401)
+
+    if status not in _TERMINAL_AUTOMATION_STATES:
+        return sanic_json({
+            "status": "error",
+            "message": f"status must be one of {sorted(_TERMINAL_AUTOMATION_STATES)}",
+        }, status=400)
 
     try:
         async with agent_conn(agent) as cnx:
             cur = await cnx.cursor()
             try:
+                # Only a task that is still outstanding may be closed. Without
+                # this, the same id can be reported repeatedly and a task that
+                # already ran can be rewritten - and an attacker walking
+                # task_id from 1 could mark the queue done before the agent
+                # ever polled it.
                 await cur.execute(
-                    "UPDATE automations SET status=%s, comment=CONCAT(comment, %s), updated_at=NOW() WHERE id=%s",
+                    "UPDATE automations SET status=%s, "
+                    "comment=CONCAT(COALESCE(comment,''), %s), updated_at=NOW() "
+                    "WHERE id=%s AND status IN ('pending','active')",
                     (status, f" | Agent Report: {output}"[:200], task_id)
                 )
+                changed = cur.rowcount
                 await cnx.commit()
             finally:
                 await _close_async_quiet(cur)
+        if not changed:
+            return sanic_json({
+                "status": "error",
+                "message": "no outstanding task with that id for this agent",
+            }, status=404)
         return sanic_json({"status": "success"})
     except Exception as e:
         return sanic_json({"status": "error", "message": str(e)}, status=500)

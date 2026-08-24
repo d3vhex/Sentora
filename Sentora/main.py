@@ -852,7 +852,19 @@ def soar_events_loop(interval_sec: int = 30):
 
 
 @app.get("/health")
-async def health(_):
+async def health(request):
+    """Liveness. Unauthenticated on purpose, but no longer a disclosure.
+
+    It used to return the agent name, the SIEM server's address and port, the
+    automations API base and the full OS string to anyone who asked. That is a
+    map of the security infrastructure, handed out by every endpoint on the
+    network - which host to attack next, and what it reports to.
+
+    A liveness probe needs to answer "is it up". Everything else is behind the
+    same key as the rest of the API.
+    """
+    if not _check_auth_header(request):
+        return sanic_json({"status": "ok"})
     return sanic_json({
         "agent": AGENT_NAME,
         "server": SERVER_IP,
@@ -866,12 +878,41 @@ async def health(_):
 
 @app.post("/self_destruct")
 async def self_destruct(request: Request):
+    """Uninstall this agent. Irreversible.
+
+    This had no authentication at all, on a listener bound to 0.0.0.0:9099.
+    One unauthenticated POST from anywhere on the network removed the EDR from
+    the host, which makes it the first step of any competent intrusion rather
+    than an administrative feature. Tamper resistance is the property a
+    security agent exists to have.
+
+    `enrolment_key_only`: the fleet-wide master secret is not enough. The
+    server holds this agent's own key and uses it first, so nothing legitimate
+    breaks, but a leaked master secret can no longer wipe every endpoint at
+    once.
+    """
+    if not _check_auth_header(request, enrolment_key_only=True):
+        print("[!] REJECTED unauthenticated self-destruct request from "
+              f"{request.ip}", flush=True)
+        return sanic_json({"ok": False, "error": "unauthorized"}, status=401)
+
+    print(f"[!] Self-destruct authorised, requested by {request.ip}", flush=True)
     threading.Thread(target=perform_destruction, daemon=True).start()
     return sanic_json({"status": "Destruction initiated"})
 
 
 @app.post("/restart")
 async def restart_agent(request):
+    """Restart the agent process. Also had no authentication.
+
+    Less destructive than self-destruct and still worth having: an unauthorised
+    caller could restart the agent in a loop, which is a denial of the
+    telemetry the platform depends on, and every restart is a window with no
+    collection.
+    """
+    if not _check_auth_header(request):
+        return sanic_json({"ok": False, "error": "unauthorized"}, status=401)
+
     def restart():
         old_pid = os.getpid()
         print(f"[*] Restarting agent. Old PID: {old_pid}", flush=True)
@@ -899,7 +940,13 @@ async def restart_agent(request):
 
 
 @app.post("/reload_auth")
-async def reload_auth(_):
+async def reload_auth(request):
+    """Re-fetch the telemetry encryption key. Also had no authentication.
+
+    An unauthorised caller could force a bootstrap round-trip on demand.
+    """
+    if not _check_auth_header(request):
+        return sanic_json({"ok": False, "error": "unauthorized"}, status=401)
     try:
         fk = _bootstrap_client.get_fernet_key()  # type: ignore
         _apply_fernet_key_to_enc_db(fk)
@@ -908,20 +955,81 @@ async def reload_auth(_):
         return sanic_json({"ok": False, "error": str(e)}, status=500)
 
 
+# Directories that must never be the target of an uninstall, whatever the
+# agent thinks its own location is. If AGENT_DIR resolves to one of these,
+# something is wrong and deleting is not the safe response.
+_UNDELETABLE = {
+    "/", "/usr", "/bin", "/sbin", "/lib", "/etc", "/var", "/opt", "/home",
+    "/root", "/boot", "/dev", "/proc", "/sys",
+    "c:\\", "c:\\windows", "c:\\windows\\system32", "c:\\program files",
+    "c:\\program files (x86)", "c:\\users",
+}
+
+
+def _destruction_target() -> str | None:
+    """The directory to remove, or None if it cannot be established safely."""
+    target = os.path.abspath(AGENT_DIR)
+    normalised = target.rstrip("\\/").lower() or target.lower()
+    if normalised in _UNDELETABLE or os.path.dirname(target) == target:
+        return None
+    # The agent's own binary or main.py must be in there. If it is not, this
+    # is not the install directory and we have the wrong path.
+    marker = os.path.join(target, "main.py")
+    binary = os.path.join(target, "SentoraAgent.exe")
+    if not (os.path.exists(marker) or os.path.exists(binary)):
+        return None
+    return target
+
+
 def perform_destruction():
+    """Remove the agent's own installation directory.
+
+    This used to delete `$(pwd)` - `Remove-Item -Recurse -Force
+    (Get-Item -Path .).FullName` on Windows, `rm -rf "$(pwd)"` elsewhere.
+
+    The working directory is not the install directory. A Scheduled Task
+    registered without a start-in path runs with the working directory it
+    inherits, which for a SYSTEM task is `C:\\Windows\\System32`. The agent
+    runs elevated, so the command would have been carried out. An uninstall
+    feature that can take out the host is worse than no uninstall feature.
+
+    AGENT_DIR is derived from the executable (or this file), checked against a
+    list of paths nothing may ever delete, and required to actually contain
+    the agent. If any of that does not hold, the agent exits without deleting
+    anything and says why - leaving a stale install behind is recoverable,
+    the alternative is not.
+    """
     system = platform.system().lower()
-    print(f"[*] Initiating self-destruction sequence on {system}...")
-    
+    target = _destruction_target()
+    if not target:
+        print(f"[!] Refusing to self-destruct: {AGENT_DIR!r} does not look "
+              f"like an agent installation directory. Nothing was deleted.",
+              flush=True)
+        os._exit(1)
+
+    print(f"[*] Initiating self-destruction on {system}, removing {target}",
+          flush=True)
+
     try:
         if system == "windows":
-            cmd = "powershell -Command \"Start-Sleep -s 5; Remove-Item -Recurse -Force (Get-Item -Path .).FullName\""
-            subprocess.Popen(cmd, shell=True)
+            # -LiteralPath so a directory containing [ ] or ` is treated as a
+            # name rather than a wildcard pattern.
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 f"Start-Sleep -Seconds 5; Remove-Item -LiteralPath '{target}' "
+                 f"-Recurse -Force -ErrorAction SilentlyContinue"],
+                close_fds=True,
+            )
         else:
-            cmd = "sleep 5 && rm -rf \"$(pwd)\""
-            subprocess.Popen(cmd, shell=True)
-            
+            # No shell: the path is an argument, not a string the shell
+            # re-parses. `sh -c "rm -rf $(pwd)"` would split on spaces.
+            subprocess.Popen(
+                ["/bin/sh", "-c", 'sleep 5; rm -rf -- "$0"', target],
+                close_fds=True,
+            )
+
         print("[*] Self-destruction command dispatched. Agent will exit.")
-        if platform.system() == "Windows":
+        if system == "windows":
             os._exit(0)
         else:
             os.kill(os.getpid(), signal.SIGKILL)
@@ -1186,39 +1294,61 @@ def _accepted_auth_tokens() -> set:
     return keys
 
 
-def _is_permissive_auth() -> bool:
-    """Permissive mode kicks in when the agent has its own runtime
-    AGENT_SHARED_SECRET (so it knows who IT is) but the operator hasn't
-    propagated the server's master shared secret to this host yet. We
-    accept any non-empty header in that case and log a warning, instead
-    of hard-failing every server→agent call. Setting AGENT_MASTER_SECRET
-    (or AGENT_SHARED_SECRET) on this host disables this.
+# `_is_permissive_auth` was here, and it accepted ANY non-empty X-Agent-Key
+# whenever AGENT_MASTER_SECRET was unset on the host.
+#
+# Nothing in this repository ever set that variable - not the installer, not
+# the scheduled task, not the systemd unit - so every default installation ran
+# permissively. `curl -H 'X-Agent-Key: a' .../soar/execute` with
+# `{"action":"run_cmd", ...}` was unauthenticated remote code execution as
+# SYSTEM, fleet-wide, and `/config/rules.yaml` let the same caller switch
+# detection off first.
+#
+# The mode existed so server→agent calls would not fail during rollout. That
+# trade is on the wrong side: an EDR that fails open is worse than no EDR,
+# because the console reports that the endpoint is protected.
+#
+# It is also unnecessary. `_get_agent_keys` on the server tries the per-agent
+# enrolment key from `agent_identities` FIRST, and that key is exactly what
+# `_accepted_auth_tokens` holds. The fallback path was covering a case the
+# server does not produce.
+
+
+def _timing_safe_in(candidate: str, accepted: set) -> bool:
+    """Compare against every accepted key without an early exit.
+
+    `key in set` compares with ==, which returns as soon as bytes differ. Over
+    a network that difference is mostly noise, but the fix costs nothing.
     """
-    if not AGENT_SHARED_SECRET:
-        return False
-    for env_var in ("AGENT_MASTER_SECRET", "AGENT_SHARED_SECRET"):
-        if os.getenv(env_var, "").strip():
-            return False
-    return True
+    import hmac
+    matched = False
+    for known in accepted:
+        if hmac.compare_digest(candidate, known):
+            matched = True
+    return matched
 
 
-def _check_auth_header(request) -> bool:
+def _check_auth_header(request, *, enrolment_key_only: bool = False) -> bool:
+    """Authorise an inbound server→agent call.
+
+    `enrolment_key_only` narrows the accepted set to this agent's own key,
+    excluding the fleet-wide master secret. Used for the destructive
+    endpoints: a leaked master secret should not be able to wipe every
+    endpoint at once, and the server has the per-agent key for anything it is
+    legitimately entitled to do.
+    """
     srv_key = (request.headers.get("X-Agent-Key") or "").strip()
-    accepted = _accepted_auth_tokens()
-    if accepted and srv_key in accepted:
+    accepted = {AGENT_SHARED_SECRET} - {None, ""} if enrolment_key_only \
+        else _accepted_auth_tokens()
+
+    if srv_key and accepted and _timing_safe_in(srv_key, accepted):
         return True
-    if _is_permissive_auth() and srv_key:
-        accepted_fps = sorted(k[:6] + "…" for k in accepted)
-        print(
-            f"[auth] permissive accept — sent={srv_key[:6]}…, "
-            f"agent_known={accepted_fps}. "
-            f"Set AGENT_MASTER_SECRET env on this host to enforce.",
-            flush=True,
-        )
-        return True
+
     accepted_fps = sorted(k[:6] + "…" for k in accepted) if accepted else []
     srv_fp = (srv_key[:6] + "…") if srv_key else "<empty>"
-    print(f"[auth] reject — sent={srv_fp}, accepted={accepted_fps}", flush=True)
+    scope = "enrolment-key-only" if enrolment_key_only else "any-accepted"
+    print(f"[auth] reject ({scope}) — sent={srv_fp}, accepted={accepted_fps}",
+          flush=True)
     return False
 
 
@@ -1411,18 +1541,21 @@ async def set_config(request, cfg_type):
 
 
 def _ws_authorized(request) -> bool:
-    """WebSocket-friendly auth: header X-Agent-Key OR query string ?key=."""
+    """WebSocket auth: header X-Agent-Key, or `?key=` when a header is impossible.
+
+    Browsers cannot set headers on a WebSocket handshake, so the query string
+    is the only option for the screen viewer. It is a worse place for a
+    secret - it reaches proxy access logs and browser history - but the
+    alternative was the permissive branch that used to sit at the bottom of
+    this function, which accepted any non-empty value and made a live screen
+    stream available to anyone who could reach port 9099.
+    """
     if _check_auth_header(request):
         return True
     qkey = (request.args.get("key") or "").strip() if hasattr(request, "args") else ""
     if not qkey:
         return False
-    accepted = _accepted_auth_tokens()
-    if accepted and qkey in accepted:
-        return True
-    if _is_permissive_auth() and qkey:
-        return True
-    return False
+    return _timing_safe_in(qkey, _accepted_auth_tokens())
 
 
 @app.websocket("/screen/ws")
@@ -1595,9 +1728,31 @@ if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
 
+    # Configurable, and deliberately still 0.0.0.0 by default.
+    #
+    # Binding to loopback is the right end state and it cannot be the default
+    # today: the server reaches agents by direct HTTP to this port, so
+    # flipping it would silently stop SOAR dispatch, config reads and the
+    # screen stream across the fleet. That needs a transport to replace it
+    # (an outbound agent-initiated channel, or mTLS through a broker), not a
+    # one-line change.
+    #
+    # What made the exposure critical was that /self_destruct, /restart and
+    # /reload_auth had no authentication at all, and that permissive auth
+    # accepted any non-empty key on every other route. Both are fixed above.
+    # The listener is now authenticated; it is not yet unreachable.
+    bind_host = os.getenv("AGENT_BIND", "0.0.0.0")
+    bind_port = int(os.getenv("AGENT_PORT", "9099"))
+    if bind_host == "0.0.0.0":
+        print(f"[*] Agent API on {bind_host}:{bind_port} — reachable from the "
+              f"network. Every route requires X-Agent-Key. Set AGENT_BIND=127.0.0.1 "
+              f"once server→agent traffic no longer needs it.", flush=True)
+    else:
+        print(f"[*] Agent API on {bind_host}:{bind_port}", flush=True)
+
     app.run(
-        host="0.0.0.0",
-        port=9099,
+        host=bind_host,
+        port=bind_port,
         single_process=True,
         workers=1,
         access_log=False,
