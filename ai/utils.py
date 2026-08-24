@@ -93,9 +93,12 @@ def _normalize_ollama_url(endpoint: str) -> str:
 # reworded prompt cannot keep serving verdicts produced by the old one — the
 # previous cache had no such notion and a stale answer lived forever.
 # v2: the triage prompt was rewritten and the schema field order changed.
-# Both alter what the model answers, so every cached verdict from v1 is a
-# verdict to a different question and must not be reused.
-PROMPT_VERSION = os.getenv("AI_PROMPT_VERSION", "v2")
+# v3: `observed` added, and the criteria rewritten as literal evidence rather
+#     than technique descriptions - v2 copied its own criterion text into the
+#     summary and escalated an EID 4672 SYSTEM logon as credential dumping.
+# Each of these changes what the model answers, so cached verdicts from an
+# earlier version answer a different question and must not be reused.
+PROMPT_VERSION = os.getenv("AI_PROMPT_VERSION", "v3")
 
 # Observed: llama3.2:3b on CPU takes ~47s for a single 2 KB event. The manual
 # worker batches ten events into one prompt, so its prompts are an order of

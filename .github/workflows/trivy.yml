@@ -1,5 +1,17 @@
 name: Trivy Security Scan
 
+# Scans the locked dependency set, not the loose one.
+#
+# `requirements.txt` names twenty packages with no versions. Scanning a tree
+# containing only that told Trivy what we depend on and nothing about which
+# code would be installed, so a green run described whatever PyPI happened to
+# serve that afternoon — and the image built the next day could pull a
+# different, vulnerable version without anything turning red.
+#
+# `requirements.lock` pins every direct and transitive package, and the
+# Dockerfile installs from it, so a finding here is a finding about the image
+# this commit produces.
+
 on:
   push:
     branches: [ "master", "main" ]
@@ -10,7 +22,7 @@ jobs:
   build:
     name: Build and Scan
     runs-on: ubuntu-24.04
-    
+
     permissions:
       contents: read
       security-events: write
@@ -19,19 +31,39 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # The lock is generated from requirements.txt inside the image Python.
+      # If someone adds a dependency and forgets to regenerate, the scan below
+      # would silently cover the old set, so fail here instead of scanning
+      # something that does not describe the build.
+      - name: Check the lock covers requirements.txt
+        run: |
+          missing=0
+          while read -r line; do
+            name="${line%%[*}"
+            name="${name%%[<>=;]*}"
+            name="$(echo "$name" | tr -d '[:space:]' | tr 'A-Z_' 'a-z-')"
+            [ -z "$name" ] && continue
+            case "$name" in \#*) continue ;; esac
+            if ! grep -qiE "^${name}==" requirements.lock; then
+              echo "::error::$name is in requirements.txt but not in requirements.lock"
+              missing=1
+            fi
+          done < requirements.txt
+          exit $missing
+
       - name: Run Trivy vulnerability scanner in fs mode
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: 'fs'
           scan-ref: '.'
-          format: 'sarif'                   
-          output: 'trivy-results.sarif'      
+          format: 'sarif'
+          output: 'trivy-results.sarif'
           ignore-unfixed: true
           vuln-type: 'os,library'
           severity: 'LOW,MEDIUM,HIGH,CRITICAL'
 
       - name: Upload Trivy scan results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v4
-        if: always()                         
+        if: always()
         with:
           sarif_file: 'trivy-results.sarif'

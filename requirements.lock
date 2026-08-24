@@ -1,0 +1,168 @@
+# Generated - do not edit by hand.
+#
+# requirements.txt names what we depend on; this file records the exact
+# versions an image is built from. Without it "the dependency set" was
+# whatever PyPI served on the day of the build, so two builds of the same
+# commit installed different code - and a Trivy result was a statement about
+# one particular afternoon rather than about this repository.
+#
+# Regenerate inside the image Python, not on a developer machine: resolution
+# is platform-specific and a lock produced on Windows describes a build that
+# never happens.
+#
+#   docker run --rm -v "$PWD:/w" -w /w python:3.10-slim sh -c '
+#     pip install --quiet pip-tools &&
+#     pip-compile --quiet --no-header --strip-extras #       --output-file requirements.lock requirements.txt'
+#
+# To take a new version of something, change requirements.txt (add a bound if
+# the change is deliberate) and regenerate. Editing a pin here alone means the
+# next regeneration silently undoes it.
+
+aio-pika==9.6.2
+    # via -r requirements.txt
+aiofiles==25.1.0
+    # via sanic
+aiomysql==0.3.2
+    # via -r requirements.txt
+aiormq==6.9.4
+    # via aio-pika
+annotated-types==0.8.0
+    # via pydantic
+bcrypt==5.0.0
+    # via passlib
+certifi==2026.7.22
+    # via
+    #   opensearch-py
+    #   requests
+cffi==2.1.1
+    # via cryptography
+charset-normalizer==3.5.1
+    # via requests
+cryptography==50.0.0
+    # via -r requirements.txt
+dnspython==2.8.0
+    # via email-validator
+docker==7.2.0
+    # via -r requirements.txt
+email-validator==2.3.0
+    # via -r requirements.txt
+events==0.5
+    # via opensearch-py
+exceptiongroup==1.3.1
+    # via aio-pika
+grpcio==1.83.0
+    # via opensearch-protobufs
+html5tagger==2.0.0
+    # via
+    #   sanic
+    #   tracerite
+httptools==0.8.0
+    # via sanic
+idna==3.19
+    # via
+    #   email-validator
+    #   requests
+    #   yarl
+ldap3==2.9.1
+    # via -r requirements.txt
+multidict==6.7.1
+    # via
+    #   sanic
+    #   yarl
+mysql-connector-python==26.7.0
+    # via -r requirements.txt
+numpy==2.2.6
+    # via pandas
+opensearch-protobufs==1.2.0
+    # via opensearch-py
+opensearch-py==3.2.0
+    # via -r requirements.txt
+packaging==26.3
+    # via sanic-cors
+pamqp==3.3.0
+    # via aiormq
+pandas==2.3.3
+    # via -r requirements.txt
+passlib==1.7.4
+    # via -r requirements.txt
+propcache==0.5.2
+    # via yarl
+protobuf==7.36.0
+    # via opensearch-protobufs
+psutil==7.2.2
+    # via -r requirements.txt
+psycopg2-binary==2.9.12
+    # via -r requirements.txt
+pyasn1==0.6.4
+    # via ldap3
+pycparser==3.0
+    # via cffi
+pydantic==2.13.4
+    # via -r requirements.txt
+pydantic-core==2.46.4
+    # via pydantic
+pymysql==1.2.0
+    # via aiomysql
+python-dateutil==2.9.0.post0
+    # via
+    #   opensearch-py
+    #   pandas
+python-dotenv==1.2.3
+    # via -r requirements.txt
+pytz==2026.3.post1
+    # via pandas
+pyyaml==6.0.3
+    # via -r requirements.txt
+requests==2.34.2
+    # via
+    #   -r requirements.txt
+    #   docker
+    #   opensearch-py
+sanic==25.12.1
+    # via
+    #   -r requirements.txt
+    #   sanic-cors
+sanic-cors==2.2.0
+    # via -r requirements.txt
+sanic-routing==23.12.0
+    # via sanic
+six==1.17.0
+    # via python-dateutil
+tracerite==2.6.5
+    # via sanic
+typing-extensions==4.16.0
+    # via
+    #   cryptography
+    #   exceptiongroup
+    #   grpcio
+    #   multidict
+    #   pydantic
+    #   pydantic-core
+    #   sanic
+    #   typing-inspection
+typing-inspection==0.4.4
+    # via pydantic
+tzdata==2026.3
+    # via pandas
+ujson==5.13.0
+    # via sanic
+urllib3==2.7.0
+    # via
+    #   docker
+    #   opensearch-py
+    #   requests
+uvloop==0.22.1
+    # via sanic
+watchdog==6.0.0
+    # via -r requirements.txt
+websockets==16.1.1
+    # via
+    #   -r requirements.txt
+    #   sanic
+yarl==1.24.5
+    # via
+    #   aio-pika
+    #   aiormq
+
+# The following packages are considered to be unsafe in a requirements file:
+# setuptools
