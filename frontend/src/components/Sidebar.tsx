@@ -57,6 +57,19 @@ const SidebarLink: React.FC<{ to: string, icon: React.ReactNode, label: string }
 const Sidebar: React.FC<SidebarProps> = ({ isOpen }) => {
   const user = authService.getUser();
   const [showPasswordModal, setShowPasswordModal] = useState(false);
+
+  // The server refuses every route except the password change while the
+  // account still carries the credential published in db/init_userdb.sql.
+  // Without this the console renders empty and says nothing: the pages load,
+  // every request 403s, and the cause is invisible.
+  const [mustChange, setMustChange] = useState(
+    () => localStorage.getItem('mustChangePassword') === '1'
+  );
+  React.useEffect(() => {
+    const onForced = () => setMustChange(true);
+    window.addEventListener('sentora:must-change-password', onForced);
+    return () => window.removeEventListener('sentora:must-change-password', onForced);
+  }, []);
   const [passwordData, setPasswordData] = useState({ current_password: '', new_password: '', confirm_password: '' });
 
   const handleLogout = async () => {
@@ -78,6 +91,8 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen }) => {
         new_password: passwordData.new_password
       });
       setShowPasswordModal(false);
+      setMustChange(false);
+      localStorage.removeItem('mustChangePassword');
       setPasswordData({ current_password: '', new_password: '', confirm_password: '' });
       // The server revokes every session issued against the old password,
       // this browser's included, so staying on the page would just 401.
@@ -172,6 +187,31 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen }) => {
         opacity: isOpen ? 1 : 0,
         transition: 'opacity 0.3s ease'
       }}>
+        {mustChange && (
+          <button
+            onClick={() => setShowPasswordModal(true)}
+            style={{
+              width: '100%',
+              textAlign: 'left',
+              marginBottom: '14px',
+              padding: '12px 14px',
+              borderRadius: '10px',
+              border: '1px solid rgba(248, 113, 113, 0.45)',
+              backgroundColor: 'rgba(248, 113, 113, 0.12)',
+              color: '#fca5a5',
+              cursor: 'pointer',
+              lineHeight: 1.45,
+            }}
+          >
+            <strong style={{ display: 'block', marginBottom: '4px' }}>
+              Set a password to continue
+            </strong>
+            <span style={{ fontSize: '0.8rem', opacity: 0.9 }}>
+              This account still uses the default from the repository, so the
+              console is showing nothing. Click here to change it.
+            </span>
+          </button>
+        )}
         <div style={{ display: 'flex', alignItems: 'center', gap: '14px', marginBottom: '16px' }}>
           <div style={{ 
             width: '36px', 
