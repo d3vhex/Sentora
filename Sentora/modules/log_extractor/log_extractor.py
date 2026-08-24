@@ -21,11 +21,39 @@ import modules.enc_db as enc_db
 insert_record_enc = enc_db.insert_record_enc
 fetch_where_dec   = enc_db.fetch_where_dec
 
+# Sigma is optional at import time. The agent ships with core/ but a partial
+# deployment must degrade to the regex rules rather than failing to start:
+# an EDR that will not boot is worse than one detecting less.
+_SEVERITY_ORDER = {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+try:
+    from core.sigma import severity_of as sigma_severity
+    from core.sigma_loader import match_all as sigma_match
+    from core.sigma_loader import windows_event_fields as sigma_fields
+    HAS_SIGMA = True
+except ImportError:
+    HAS_SIGMA = False
+
+    def sigma_severity(_rule):          # pragma: no cover
+        return "MEDIUM"
+
+    def sigma_match(_rules, _fields):   # pragma: no cover
+        return []
+
+    def sigma_fields(*_a, **_kw):       # pragma: no cover
+        return {}
+
+
 IS_WINDOWS = platform.system() == "Windows"
 
 here = os.path.dirname(os.path.abspath(__file__))
 default_cfg = os.path.normpath(os.path.join(here, "../../conf/log_paths.yaml"))
 RULES_YAML_PATH = os.path.normpath(os.path.join(here, "../../conf/rules.yaml"))
+# Community Sigma rules live here. Empty by default: the operator chooses
+# which rulesets to install, because a detection nobody reviewed is not an
+# improvement on one nobody reviewed.
+SIGMA_RULES_PATH = os.getenv(
+    "SIGMA_RULES_PATH",
+    os.path.normpath(os.path.join(here, "../../conf/sigma")))
 PATHS_YAML_PATH = default_cfg
 
 try:
@@ -71,6 +99,11 @@ class LogEvent:
     user: Optional[str] = None
     event_hash: Optional[str] = None
     enriched_data: Optional[Dict] = None
+    # MITRE ATT&CK technique IDs, from whichever Sigma rules matched. Empty
+    # for a regex match: conf/rules.yaml has no ATT&CK mapping and never had
+    # one, which is the reason Sigma is worth loading at all.
+    techniques: Optional[List[str]] = None
+    rule_title: Optional[str] = None
 
 DEFAULT_EXCLUDE_PATTERNS = []
 
@@ -535,7 +568,9 @@ def enhanced_output_worker(output_cfg: Dict, metrics: MetricsCollector,
                     'ip_address': event.ip_address,
                     'user': event.user,
                     'hash': event.event_hash,
-                    'enriched': event.enriched_data
+                    'enriched': event.enriched_data,
+                    'techniques': event.techniques or [],
+                    'rule': event.rule_title,
                 }
                 output = json.dumps(event_dict, ensure_ascii=False)
             else:
@@ -569,7 +604,12 @@ def enhanced_output_worker(output_cfg: Dict, metrics: MetricsCollector,
                         'source': event.source_file,
                         'severity': event.severity,
                         'message': output,
-                        'dup_fp': dup_fp
+                        'dup_fp': dup_fp,
+                        # A column, not only a field in the JSON body: ATT&CK
+                        # coverage is a question you ask across every event
+                        # ("which techniques have we ever seen"), and that is
+                        # not answerable by parsing a text column.
+                        'techniques': ','.join(event.techniques or []) or None,
                     })
 
             metrics.increment('events_output')
@@ -585,7 +625,8 @@ def enhanced_output_worker(output_cfg: Dict, metrics: MetricsCollector,
 
 def follow_windows_eventlog(rules_list: List[Dict], exclude_patterns, log_type,
                             enricher: EventEnricher, metrics: MetricsCollector,
-                            rate_limiter: RateLimiter, duplicate_filter: DuplicateFilter):
+                            rate_limiter: RateLimiter, duplicate_filter: DuplicateFilter,
+                            sigma_rules=None):
     import win32evtlog
     server = 'localhost'
     
@@ -620,14 +661,41 @@ def follow_windows_eventlog(rules_list: List[Dict], exclude_patterns, log_type,
                     
                     full_msg = f"{event_summary} | {message}"
 
+                    # Sigma first. It matches on named fields, so it can
+                    # tell `Image=vssadmin.exe` from the word "vssadmin"
+                    # appearing in a message, and it carries the ATT&CK
+                    # technique with it. The regex list is the fallback for
+                    # everything Sigma has no rule for.
+                    sigma_hits = []
+                    techniques = []
+                    rule_title = None
+                    severity = None
+                    category = None
+                    if sigma_rules:
+                        fields = sigma_fields(eid, inserts, message=full_msg,
+                                              channel=log_type, provider=source)
+                        sigma_hits = sigma_match(sigma_rules, fields)
+                        if sigma_hits:
+                            # Every rule that fired, not the first. Techniques
+                            # accumulate, and the most severe wins the label.
+                            best = max(sigma_hits, key=lambda r: _SEVERITY_ORDER.get(
+                                sigma_severity(r), 0))
+                            severity = sigma_severity(best)
+                            category = best.title
+                            rule_title = best.title
+                            techniques = sorted({t for r in sigma_hits
+                                                 for t in r.techniques})
+
                     matched_rule = None
-                    for rule in rules_list:
-                        if rule['regex'].search(full_msg):
-                            matched_rule = rule
-                            break
-                    
-                    if not matched_rule:
-                        continue
+                    if not sigma_hits:
+                        for rule in rules_list:
+                            if rule['regex'].search(full_msg):
+                                matched_rule = rule
+                                break
+                        if not matched_rule:
+                            continue
+                        severity = matched_rule['severity']
+                        category = matched_rule['category']
 
                     if any(p.search(full_msg) for p in exclude_patterns):
                         continue
@@ -640,8 +708,10 @@ def follow_windows_eventlog(rules_list: List[Dict], exclude_patterns, log_type,
                     # the provider says what produced it.
                     origin = f"{log_type}/{source}" if source and source != "Unknown" else log_type
                     event = enricher.enrich_event(full_msg, origin)
-                    event.event_type = matched_rule['category']
-                    event.severity = matched_rule['severity']
+                    event.event_type = category
+                    event.severity = severity
+                    event.techniques = techniques
+                    event.rule_title = rule_title
 
                     if not duplicate_filter.is_duplicate(event.event_hash):
                         event_queue.put(event)
@@ -717,6 +787,20 @@ def main():
 
     if not rules_list:
         logging.warning("WARNING: No rules loaded. SIEM will be silent.")
+
+    # Sigma rules, if any are installed. They are additive: the regex list
+    # still runs for events no Sigma rule addresses, so installing none
+    # changes nothing.
+    sigma_rules = []
+    if HAS_SIGMA:
+        from core.sigma_loader import load_dir
+        result = load_dir(SIGMA_RULES_PATH)
+        sigma_rules = result.rules
+        logging.info("%s from %s", result.summary(), SIGMA_RULES_PATH)
+        for path, reason in result.rejected:
+            # Named, not counted. A rule an operator installed and believes is
+            # running, which is not, is the failure this reports.
+            logging.warning("Sigma rule rejected: %s - %s", path, reason)
     
     exclude_patterns = compile_exclude_patterns(DEFAULT_EXCLUDE_PATTERNS)
 
@@ -748,7 +832,7 @@ def main():
             threading.Thread(
                 target=follow_windows_eventlog,
                 args=(rules_list, exclude_patterns, lt, enricher, metrics,
-                      rate_limiter, duplicate_filter),
+                      rate_limiter, duplicate_filter, sigma_rules),
                 daemon=True
             ).start()
     else:
