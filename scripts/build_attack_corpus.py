@@ -239,11 +239,16 @@ CASES = [
      "was enumerated', here by Git Bash starting up, for the user's own "
      "account. The model called it Credential Access and recommended "
      "ISOLATE_HOST.",
+     # Hostname and SID replaced with placeholders of the same shape. This
+     # file is tracked, unlike evals/corpus.jsonl; which machine the event was
+     # seen on is not the part that makes it a useful hard negative, and the
+     # corpus should not carry one deployment's identifiers into everybody
+     # else's checkout.
      event(SEC, "CRITICAL", "DESERIALIZATION",
-           "[Microsoft-Windows-Security-Auditing] EID=4798, Cat=13824 | pc | "
-           "DESKTOP-EVS8H9J | S-1-5-21-531660122-344579815-2653107626-1001 | "
-           "S-1-5-21-531660122-344579815-2653107626-1001 | pc | "
-           "DESKTOP-EVS8H9J | 0xf7bc2 | 0x3fe4 | "
+           "[Microsoft-Windows-Security-Auditing] EID=4798, Cat=13824 | jdoe | "
+           "WKSTN-14 | S-1-5-21-1111111111-2222222222-3333333333-1001 | "
+           "S-1-5-21-1111111111-2222222222-3333333333-1001 | jdoe | "
+           "WKSTN-14 | 0xf7bc2 | 0x3fe4 | "
            "C:\\Program Files\\Git\\usr\\bin\\bash.exe")),
 
     ("observed-7040-service-start-type", "NOT_CRITICAL",
@@ -269,6 +274,15 @@ CASES = [
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=str(OUT))
+    ap.add_argument(
+        "--with-observed", nargs="?", const=str(ROOT / "evals" / "corpus.jsonl"),
+        default="",
+        help="fold labelled real telemetry in as extra negatives. OFF by "
+             "default and it must stay that way: evals/corpus.jsonl is one "
+             "machine's real logs - hostnames, kernel addresses, crash GUIDs "
+             "- and is gitignored for that reason. Folding it into the "
+             "tracked corpus would put it under version control. Use it with "
+             "an --out that is not the tracked file.")
     args = ap.parse_args()
 
     out = pathlib.Path(args.out)
@@ -297,10 +311,47 @@ def main() -> int:
     positives = sum(1 for _, e, _, _ in CASES if e in ("CRITICAL", "SUSPICIOUS"))
     print(f"[+] {len(CASES)} constructed case(s) -> {out}")
     print(f"    {positives} positive, {len(CASES) - positives} hard negative")
+    folded = 0
+    if args.with_observed:
+        # Fold in the real telemetry as extra negatives.
+        #
+        # Real positives cannot be had - nobody has run mimikatz here, and
+        # nobody is going to - so recall stays measurable only against
+        # constructed cases. Precision does not have that problem: every
+        # false alarm the model raises on a quiet estate is a real false
+        # alarm, and six of them per nineteen events is the difference
+        # between a console an analyst reads and one they mute.
+        #
+        # So the half that can be measured against reality is measured
+        # against reality, and the half that cannot says so.
+        observed = pathlib.Path(args.with_observed)
+        if pathlib.Path(args.out).resolve() == OUT.resolve():
+            print(f"    ! refusing to fold real telemetry into {OUT.name},")
+            print("      which is tracked. Pass --out evals/corpus_local.jsonl")
+            print("      (gitignored) instead.")
+        elif observed.exists():
+            seen = {f"constructed:{c}" for c, _, _, _ in CASES}
+            with out.open("a", encoding="utf-8") as fh:
+                for line in observed.read_text(encoding="utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    if not row.get("expected") or row["id"] in seen:
+                        continue          # unlabelled, or already present
+                    row["constructed"] = False
+                    fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+                    folded += 1
+            print(f"    + {folded} observed case(s) folded in from {observed}")
+        else:
+            print(f"    ! {observed} not found - no real cases folded in")
+
     print()
-    print("    These are CONSTRUCTED, not observed. A miss is real evidence;")
-    print("    a hit is weak evidence, because these are the loud versions of")
-    print("    each technique. Read recall here as an upper bound.")
+    print("    Positives here are CONSTRUCTED, not observed. A miss is real")
+    print("    evidence; a hit is weak evidence, because these are the loud")
+    print("    versions of each technique. Read recall as an upper bound.")
+    if folded:
+        print(f"    The {folded} folded-in negative(s) ARE real, so precision")
+        print("    is a claim about production in a way recall is not.")
     print()
     print(f"    python scripts/run_eval.py --corpus {out}")
     return 0

@@ -192,6 +192,12 @@ def main() -> int:
                 "note": "",
                 "recorded_severity": event.get("severity"),
                 "below_floor": bool(args.below_floor),
+                # This row came out of the database. Recorded so a report can
+                # say what its numbers were measured on: precision over real
+                # telemetry is a claim about production, precision over
+                # hand-written cases is a claim about the person who wrote
+                # them.
+                "constructed": False,
             }, ensure_ascii=False, default=str) + "\n")
             written += 1
 
