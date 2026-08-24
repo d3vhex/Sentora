@@ -184,6 +184,16 @@ def main() -> int:
         print(f"     {er:.0%} of attacks were flagged; {sr:.0%} would be seen.")
         print(f"     Gate: {describe_gate()}")
 
+    res = report.resolution
+    if res is not None:
+        print()
+        print(f"  Resolution ............ {res:.0%} per case")
+        print(f"     One case flipping moves recall by {res:.0%}. Two runs of this")
+        print(f"     corpus, same prompt, temperature 0, returned 50% and 60%:")
+        print(f"     CPU inference reduces across threads in a non-deterministic")
+        print(f"     order and a near-tie flips. Treat a difference smaller than")
+        print(f"     {2 * res:.0%} as noise, not as a result.")
+
     anchored = report.confidence_is_anchored
     if anchored is not None:
         print()

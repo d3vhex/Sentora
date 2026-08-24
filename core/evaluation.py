@@ -151,6 +151,27 @@ class EvalReport:
         return sum(1 for c in should if c.surfaced) / len(should)
 
     @property
+    def resolution(self) -> float | None:
+        """The smallest difference in escalation recall this corpus can show.
+
+        One case flipping moves recall by 1/support. With ten positives that
+        is ten points, so two runs differing by less than that have told you
+        nothing about the change between them.
+
+        This is not hypothetical and it is not fixed by setting temperature to
+        zero, which the harness already does. Two runs of the identical corpus
+        and prompt returned 50% and 60%: llama.cpp on CPU reduces across
+        threads in a non-deterministic order, and a near-tie flips. A prompt
+        edit measured at +10 points on this corpus is indistinguishable from
+        the model having a different afternoon.
+
+        Reported so the number is read with its error bar rather than as a
+        result.
+        """
+        support = sum(1 for c in self.cases if c.expected in ESCALATING)
+        return 1.0 / support if support else None
+
+    @property
     def constant_verdict(self) -> str | None:
         """The verdict this model gave to everything, if it gave one verdict.
 

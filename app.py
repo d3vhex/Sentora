@@ -5044,7 +5044,9 @@ async def login(request):
             }, status=429)
 
         await cursor.execute(
-            "SELECT id, username, password, created_at, role FROM users WHERE username = %s LIMIT 1",
+            "SELECT id, username, password, created_at, role, "
+            "COALESCE(must_change_password, 0) FROM users "
+            "WHERE username = %s LIMIT 1",
             (username,),
         )
         row = await cursor.fetchone()
@@ -5052,7 +5054,7 @@ async def login(request):
         await cnx.close()
 
         if row:
-            user_id, db_username, db_password, created_at, db_role = row
+            user_id, db_username, db_password, created_at, db_role, must_change = row
             if bcrypt.checkpw(password.encode('utf-8'), db_password.encode('utf-8')):
                 await log_login_attempt(username, "local", "success", "", ip)
 
@@ -5073,7 +5075,12 @@ async def login(request):
                         # Was hardcoded to `"admin" if username == "admin"`,
                         # which silently ignored the role column.
                         "role": db_role,
-                        "permissions": user_perms
+                        "permissions": user_perms,
+                        # So the console can say why it is empty. The
+                        # middleware refuses every other route while this is
+                        # set, and without the flag reaching the UI the only
+                        # symptom was blank pages.
+                        "must_change_password": bool(must_change),
                     }
                 })
                 _set_session_cookie(resp, raw_token)

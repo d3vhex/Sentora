@@ -22,6 +22,11 @@ import mysql.connector
 
 from security import session as session_store
 
+# The bcrypt hash db/init_userdb.sql seeds `admin` with. It is published in
+# this repository, so it is a placeholder rather than a secret - which is
+# exactly why an account still carrying it must set a real one.
+SEEDED_ADMIN_HASH = "$2b$12$YrcCyrQMGN16pntv7BfpWuayUJ2Kg7Dpr4XsYOSa4JXLDEMDzkNW."
+
 DEFAULT_ALERT_TEMPLATE = None      # injected by app.py; see set_defaults()
 sync_mysql_conn = None
 
@@ -247,11 +252,24 @@ async def init_password_policy():
                     "ALTER TABLE users ADD COLUMN must_change_password "
                     "TINYINT(1) NOT NULL DEFAULT 0"
                 )
-                # Only the seeded account. Anyone who has since set their own
-                # password is not forced to set another one.
+                # Only an account whose password is still the one published
+                # in db/init_userdb.sql.
+                #
+                # The first version of this matched on username and
+                # created_by, which flags the seeded admin whether or not the
+                # password was ever changed. On a running deployment that is
+                # not a policy, it is a lockout: every request except
+                # /change-password starts returning 403 to somebody who had
+                # already set a password months ago.
+                #
+                # Comparing the hash is exact. bcrypt embeds its own salt, so
+                # this literal only matches an account still using the shipped
+                # credential.
                 cur.execute(
                     "UPDATE users SET must_change_password = 1 "
-                    "WHERE username = 'admin' AND created_by = 'system'"
+                    "WHERE username = 'admin' AND created_by = 'system' "
+                    "AND password = %s",
+                    (SEEDED_ADMIN_HASH,)
                 )
                 conn.commit()
                 print("[Auth] users.must_change_password added; the seeded "
