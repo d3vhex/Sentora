@@ -185,10 +185,22 @@ def _render_windows_install(server_url: str, server_ip: str, token: str) -> str:
                     # Close out the token anyway. Skipping the call left it
                     # unused forever, so the Deploy page kept reporting
                     # "waiting" after a deployment that had already succeeded.
-                    # The server verifies the key before accepting this.
+                    #
+                    # The reply is used, not discarded. If the server does not
+                    # recognise the key it holds - a machine whose identity
+                    # outlived the server's database - it enrols this host
+                    # afresh and returns a NEW key. Throwing that away left the
+                    # installer downloading with a credential the server had
+                    # just told it was dead, which fails as 403 Forbidden with
+                    # nothing explaining why.
                     $UpBody = @{{ token = $Token; agent_name = $AgentName; agent_key = $AgentKey; hostname = $Hostname; os_type = $OsType }} | ConvertTo-Json -Compress
                     try {{
-                        Invoke-RestMethod -Method Post -Uri "$ServerUrl/api/agents/register" -ContentType "application/json" -Body $UpBody | Out-Null
+                        $UpResp = Invoke-RestMethod -Method Post -Uri "$ServerUrl/api/agents/register" -ContentType "application/json" -Body $UpBody
+                        if ($UpResp.agent_key -and $UpResp.agent_key -ne $AgentKey) {{
+                            $AgentName = $UpResp.agent_name
+                            $AgentKey  = $UpResp.agent_key
+                            Write-Host "    Server did not recognise the stored key; re-enrolled as $AgentName." -ForegroundColor Yellow
+                        }}
                     }} catch {{
                         # Not fatal: the agent already holds working credentials.
                         Write-Host "    (could not mark the enrolment token used: $($_.Exception.Message))" -ForegroundColor DarkGray
