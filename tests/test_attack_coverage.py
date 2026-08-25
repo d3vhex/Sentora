@@ -209,7 +209,7 @@ def test_an_empty_grid_says_why_it_is_empty():
     """With no rules installed the grid is empty, and an operator reading it
     as 'nothing to worry about' would be reading it exactly backwards."""
     page = (FRONTEND / "pages" / "AttackCoverage.tsx").read_text(encoding="utf-8")
-    assert "No Sigma rules installed" in page
+    assert "No detection rules loaded" in page
 
 
 def test_a_failed_fetch_is_not_shown_as_zero_coverage():
@@ -253,3 +253,61 @@ def test_coverage_is_not_zero_out_of_the_box():
     also, until rules shipped, what every install saw."""
     from core.sigma_loader import load_dir
     assert load_dir(ROOT / "Sentora" / "conf" / "sigma").techniques
+
+
+def test_correlation_coverage_is_counted_too():
+    """Correlation detects techniques no Sigma rule can express. Leaving it
+    out of the index would report T1110.003 as a blind spot on an estate that
+    detects it - and the page's whole purpose is telling "quiet" from
+    "blind"."""
+    body = ast.unparse(_handler("_sigma_technique_index"))
+    assert "techniques_covered" in body
+    assert "correlation" in body
+
+
+def test_the_index_survives_one_source_failing():
+    """If the Sigma directory is unreadable, correlation coverage is still
+    real and should still be reported. Two try blocks, not one - a shared
+    handler would silently drop both."""
+    body = ast.unparse(_handler("_sigma_technique_index"))
+    assert body.count("try:") >= 2
+
+
+# --------------------------------------------------------------------------
+# The documentation quotes numbers. Numbers go stale.
+# --------------------------------------------------------------------------
+
+def test_the_documented_rule_and_technique_counts_are_current():
+    """README and conf/sigma/README quote "15 rules covering 16 techniques"
+    and "19" total. A reader has no way to tell a stale number from a true
+    one, and a coverage claim is the worst kind to be wrong about.
+    """
+    import re
+
+    from core.correlation import techniques_covered
+    from core.sigma_loader import load_dir
+
+    loaded = load_dir(ROOT / "Sentora" / "conf" / "sigma")
+    sigma_rules = len(loaded.rules)
+    sigma_techniques = len(loaded.techniques)
+    total = len(loaded.techniques | techniques_covered())
+
+    for name in ("README.md", "Sentora/conf/sigma/README.md"):
+        text = (ROOT / name).read_text(encoding="utf-8")
+        for found in re.finditer(r"(\d+) rules? covering (\d+)", text):
+            assert int(found.group(1)) == sigma_rules, name
+            assert int(found.group(2)) == sigma_techniques, name
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert f"coverage to {total}" in readme, \
+        f"README's total coverage claim is stale; it is now {total}"
+
+
+def test_correlation_adds_coverage_sigma_cannot_reach():
+    """If it added nothing, it would be cost without capability."""
+    from core.correlation import techniques_covered
+    from core.sigma_loader import load_dir
+
+    sigma = load_dir(ROOT / "Sentora" / "conf" / "sigma").techniques
+    assert techniques_covered() - sigma, \
+        "correlation covers nothing Sigma does not already"

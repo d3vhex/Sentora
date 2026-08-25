@@ -6,29 +6,70 @@ that scores the model. They had drifted apart, and the gap hid a result:
     eval   escalation recall 40%   (the model flagged 4 of 10 attacks)
     live   0 of 542 events surfaced
 
-The eval scored the raw verdict. Production also requires a severity and a
-confidence, and the model answered SUSPICIOUS / MEDIUM / 0.60 to every attack
-it noticed - just under the 0.75 that SUSPICIOUS needs. Every one of those
-detections was filed as a quiet `Reviewed_` row.
+The eval scored the raw verdict. Production also applied a gate, and the model
+answered just under it on every detection, so each one was filed as a quiet
+`Reviewed_` row. A harness that measures something the product does not do
+reports progress nobody experiences, so `surfaces()` lives here and both call
+it.
 
-A harness that measures something the product does not do will report progress
-that nobody experiences. So `surfaces()` lives here and both call it.
+Confidence is not consulted, and that is the whole design
+---------------------------------------------------------
+The gate used to be a confidence threshold. Two rounds of measurement took it
+apart:
 
-On the thresholds themselves: the model returned exactly 0.60 on all four
-detections. That is not calibration, it is an anchor, and a gate built on a
-number the model is not really computing will behave arbitrarily. Treat the
-defaults as a placeholder until there is enough labelled data to choose them
-from a curve.
+    Six CRITICAL verdicts were held at 0.50 - an LSASS dump, a SAM hive
+    export, shadow copies being deleted - and a seventh at 0.00. Every benign
+    case also came back at 0.50.
+
+    Moving the threshold changes nothing between 0.60 and 0.90, because the
+    model emits 0.50 or 0.90 and almost nothing in between.
+
+Then, over 29 cases including ten real events:
+
+    Every one of the nine attacks that surfaced had a verified criterion.
+    The confidence path contributed no detection that evidence did not
+    already carry.
+
+    Both false alarms that reached an analyst got there on confidence alone -
+    SUSPICIOUS / CRITICAL / 0.80 on two Docker container lifecycle events,
+    this platform restarting its own containers.
+
+So the number was admitting noise and catching nothing. The gate now asks one
+question: does the log contain the evidence? `ai/criteria` answers it by
+looking, not by judging, and `AI_CRIT_CONF` / `AI_SUS_CONF` are read only to
+warn that they no longer do anything.
+
+On SUSPICIOUS
+-------------
+The model's SUSPICIOUS label scored precision 0.00 and recall 0.00 on that
+corpus - it never applied it to a case that deserved it, and never withheld it
+from one that did not. It can use the top of the scale and not the middle.
+
+`criteria.apply` promotes a supported criterion to CRITICAL, so in practice a
+SUSPICIOUS verdict never carries verified evidence and never surfaces. That is
+deliberate rather than incidental: the middle of the scale is real, and it
+comes from the layers that can be checked - a Sigma rule at MEDIUM, or a
+correlation window - not from asking a 3B model to feel uncertain.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 
+ESCALATING_SEVERITIES = ("CRITICAL", "HIGH")
+
+# Read, compared, and otherwise unused. Silently ignoring configuration
+# somebody deliberately set is its own bug class, so a non-default value says
+# so once at import rather than behaving as though it had been applied.
 CRITICAL_CONFIDENCE = float(os.getenv("AI_CRIT_CONF", "0.6"))
 SUSPICIOUS_CONFIDENCE = float(os.getenv("AI_SUS_CONF", "0.75"))
 
-ESCALATING_SEVERITIES = ("CRITICAL", "HIGH")
+if (CRITICAL_CONFIDENCE, SUSPICIOUS_CONFIDENCE) != (0.6, 0.75):
+    logging.getLogger(__name__).warning(
+        "AI_CRIT_CONF/AI_SUS_CONF are set but no longer affect anything: the "
+        "gate asks whether the log contains the evidence, not how confident "
+        "the model felt. See ai/gating.py.")
 
 
 def surfaces(verdict) -> bool:
@@ -43,37 +84,15 @@ def surfaces(verdict) -> bool:
 
     outcome = str(getattr(verdict, "verdict", "") or "").upper()
     severity = str(getattr(verdict, "severity", "") or "").upper()
-    try:
-        confidence = float(getattr(verdict, "confidence", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        confidence = 0.0
 
-    # A verified criterion is not model output. `ai/criteria.apply` only
-    # leaves a criterion named here when the log itself contains that
-    # criterion's markers, which is a fact about the event rather than the
-    # model's opinion of it - so the confidence gate does not apply.
-    #
-    # This is not a loosening for its own sake. Measured on the attack corpus:
-    # six CRITICAL verdicts whose severity was also CRITICAL were blocked at
-    # confidence 0.50, including an LSASS dump, a SAM hive export and shadow
-    # copies being deleted. A seventh sat at 0.00. Meanwhile every benign case
-    # also came back at 0.50 - the number carries no signal in either
-    # direction, so gating real detections on it discards them and admits
-    # nothing.
-    #
-    # Lowering the threshold instead was measured and does not work: between
-    # 0.60 and 0.90 the output is identical, because the model returns 0.50 or
-    # 0.90 and nothing in between. Dropping to 0.50 gains one attack and adds
-    # six false alarms.
-    if outcome == "CRITICAL":
-        if severity not in ESCALATING_SEVERITIES:
-            return False
-        if criterion_verified(verdict):
-            return True
-        return confidence >= CRITICAL_CONFIDENCE
-    if outcome == "SUSPICIOUS":
-        return confidence >= SUSPICIOUS_CONFIDENCE
-    return False
+    if outcome not in ("CRITICAL", "SUSPICIOUS"):
+        return False
+    if severity not in ESCALATING_SEVERITIES:
+        # A criterion match raises severity to at least HIGH, so anything
+        # lower means something overrode it and the verdict disagrees with
+        # itself.
+        return False
+    return criterion_verified(verdict)
 
 
 def criterion_verified(verdict) -> bool:
@@ -89,6 +108,5 @@ def criterion_verified(verdict) -> bool:
 
 def describe() -> str:
     """The gate in words, for reports that need to say what they measured."""
-    return (f"CRITICAL needs severity CRITICAL/HIGH, and either a verified "
-            f"criterion or confidence >={CRITICAL_CONFIDENCE}; SUSPICIOUS "
-            f"needs confidence >={SUSPICIOUS_CONFIDENCE}")
+    return ("severity CRITICAL/HIGH and a criterion the log was checked "
+            "against and found to support; model confidence is not consulted")

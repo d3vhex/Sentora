@@ -31,6 +31,7 @@ try:
     from core.sigma_loader import windows_event_fields as sigma_fields
     from core.sigma_loader import journal_event_fields as sigma_journal_fields
     from core.sigma_loader import text_event_fields as sigma_text_fields
+    from core.correlation import default_engine as _default_correlation
     HAS_SIGMA = True
 except ImportError:
     HAS_SIGMA = False
@@ -49,6 +50,9 @@ except ImportError:
 
     def sigma_text_fields(*_a, **_kw):      # pragma: no cover
         return {}
+
+    def _default_correlation(*_a, **_kw):   # pragma: no cover
+        return None
 
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -476,6 +480,49 @@ def classify(text, fields, sigma_rules, rules_list):
     return None
 
 
+def correlated_events(correlator, fields, enricher, source, when=None):
+    """Any correlation windows this event closed, as events of their own.
+
+    A correlation detection is not a property of the event that happened to
+    complete it - the fifth failed logon is no more interesting than the
+    first. It is a statement about a window, so it gets its own event rather
+    than relabelling one that already exists. Otherwise the console shows a
+    routine 4625 marked CRITICAL and nothing explains why.
+
+    Returns a list, usually empty. Failures here are swallowed on purpose:
+    this runs on the collection thread and a correlation bug must cost a
+    detection, not the host's telemetry.
+
+    `when` overrides the clock. Only tests pass it, and they have to: a
+    correlation bug is nearly always a timing bug, and one that needs a real
+    five-minute wait to reproduce is one nobody reproduces.
+    """
+    if not correlator or not fields:
+        return []
+    try:
+        found = (correlator.observe(fields) if when is None
+                 else correlator.observe(fields, now=when))
+    except Exception:
+        logging.exception("correlation failed; continuing collection")
+        return []
+
+    out = []
+    for detection in found:
+        event = enricher.enrich_event(detection.summary(), source)
+        event.event_type = detection.title
+        event.severity = detection.severity
+        event.techniques = list(detection.techniques)
+        event.rule_title = detection.title
+        # The window is the identity, not the text. Without this the same
+        # spray re-detected after its cooldown looks like a duplicate and is
+        # dropped by the dedup filter that exists for repeated log lines.
+        event.event_hash = hashlib.sha256(
+            f"{detection.rule}|{detection.group}|{detection.seq}".encode()
+        ).hexdigest()
+        out.append(event)
+    return out
+
+
 def make_dup_fp_for_event(message: str) -> str:
     msg = (message or "").strip()
     return hashlib.sha256(msg.encode("utf-8")).hexdigest()
@@ -483,7 +530,8 @@ def make_dup_fp_for_event(message: str) -> str:
 def enhanced_follow_file(path: str, rules_list: List[Dict],
                         exclude_patterns: List[re.Pattern], enricher: EventEnricher,
                         metrics: MetricsCollector, rate_limiter: RateLimiter,
-                        duplicate_filter: DuplicateFilter, sigma_rules=None):
+                        duplicate_filter: DuplicateFilter, sigma_rules=None,
+                        correlator=None):
     last_position = 0
     consecutive_errors = 0
     max_errors = 5
@@ -513,8 +561,13 @@ def enhanced_follow_file(path: str, rules_list: List[Dict],
                         metrics.increment('rate_limited_events')
                         continue
 
-                    hit = classify(line, sigma_text_fields(line, path),
-                                   sigma_rules, rules_list)
+                    fields = sigma_text_fields(line, path)
+                    for extra in correlated_events(correlator, fields,
+                                                   enricher, path):
+                        event_queue.put(extra)
+                        metrics.increment('events_processed')
+
+                    hit = classify(line, fields, sigma_rules, rules_list)
                     if hit is None:
                         continue
 
@@ -552,7 +605,8 @@ def enhanced_follow_file(path: str, rules_list: List[Dict],
 
 def enhanced_follow_journal(rules_list: List[Dict], exclude_patterns, enricher: EventEnricher,
                             metrics: MetricsCollector, rate_limiter: RateLimiter,
-                            duplicate_filter: DuplicateFilter, sigma_rules=None):
+                            duplicate_filter: DuplicateFilter, sigma_rules=None,
+                            correlator=None):
     try:
         j = Journal(flags=0)
         j.log_level(LOG_INFO)
@@ -575,8 +629,13 @@ def enhanced_follow_journal(rules_list: List[Dict], exclude_patterns, enricher: 
                         metrics.increment('rate_limited_events')
                         continue
 
-                    hit = classify(msg, sigma_journal_fields(entry),
-                                   sigma_rules, rules_list)
+                    fields = sigma_journal_fields(entry)
+                    for extra in correlated_events(correlator, fields,
+                                                   enricher, 'journal'):
+                        event_queue.put(extra)
+                        metrics.increment('events_processed')
+
+                    hit = classify(msg, fields, sigma_rules, rules_list)
                     if hit is None:
                         continue
 
@@ -692,7 +751,7 @@ def enhanced_output_worker(output_cfg: Dict, metrics: MetricsCollector,
 def follow_windows_eventlog(rules_list: List[Dict], exclude_patterns, log_type,
                             enricher: EventEnricher, metrics: MetricsCollector,
                             rate_limiter: RateLimiter, duplicate_filter: DuplicateFilter,
-                            sigma_rules=None):
+                            sigma_rules=None, correlator=None):
     import win32evtlog
     server = 'localhost'
     
@@ -735,6 +794,11 @@ def follow_windows_eventlog(rules_list: List[Dict], exclude_patterns, log_type,
                     fields = sigma_fields(eid, inserts, message=full_msg,
                                           channel=log_type,
                                           provider=source) if sigma_rules else None
+                    for extra in correlated_events(correlator, fields,
+                                                   enricher, log_type):
+                        event_queue.put(extra)
+                        metrics.increment('events_processed')
+
                     hit = classify(full_msg, fields, sigma_rules, rules_list)
                     if hit is None:
                         continue
@@ -843,7 +907,23 @@ def main():
             # Named, not counted. A rule an operator installed and believes is
             # running, which is not, is the failure this reports.
             logging.warning("Sigma rule rejected: %s - %s", path, reason)
-    
+
+    # One engine shared by every collector thread. Deliberately shared: a
+    # spray that arrives partly through the Security channel and partly
+    # through a file would be split across two windows and reach neither
+    # threshold if each thread counted alone.
+    #
+    # `observe` is called from several threads. Its work is bounded and it
+    # takes no lock, so the worst a race does is miscount by one across a
+    # window of five - which is why this is not worth serialising on the
+    # collection path.
+    correlator = _default_correlation() if HAS_SIGMA else None
+    if correlator:
+        from core.correlation import techniques_covered
+        logging.info("%d correlation rule(s) loaded, %d ATT&CK technique(s)",
+                     len(correlator.rules), len(techniques_covered()))
+
+
     exclude_patterns = compile_exclude_patterns(DEFAULT_EXCLUDE_PATTERNS)
 
     y = load_paths_from_yaml(PATHS_YAML_PATH)
@@ -856,7 +936,7 @@ def main():
             threading.Thread(
                 target=enhanced_follow_file,
                 args=(path, rules_list, exclude_patterns, enricher, metrics,
-                        rate_limiter, duplicate_filter, sigma_rules),
+                        rate_limiter, duplicate_filter, sigma_rules, correlator),
                 daemon=True
             ).start()
         else:
@@ -882,7 +962,7 @@ def main():
             threading.Thread(
                 target=enhanced_follow_journal,
                 args=(rules_list, exclude_patterns, enricher, metrics,
-                      rate_limiter, duplicate_filter, sigma_rules),
+                      rate_limiter, duplicate_filter, sigma_rules, correlator),
                 daemon=True
             ).start()
 

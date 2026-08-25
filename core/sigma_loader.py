@@ -40,6 +40,8 @@ of the logs rather than of the rules:
 from __future__ import annotations
 
 import pathlib
+import re
+from re import error
 from dataclasses import dataclass, field
 
 from core.sigma import SigmaError, SigmaRule, parse
@@ -285,21 +287,110 @@ def journal_event_fields(entry: dict) -> dict:
     return out
 
 
+# Syslog is text, but it is not *arbitrary* text. A handful of daemons write
+# almost everything worth correlating on a Linux host, and each writes in a
+# fixed shape. Parsing those shapes is the difference between a rule that can
+# say "Image endswith sshd" and one that can only grep the line.
+#
+# Each entry is (compiled pattern, {capture group -> Sigma field name}). Every
+# pattern that matches contributes; they are not mutually exclusive, because a
+# sudo line carries both a user and a command and both are worth having.
+#
+# What this deliberately does not do is try to parse every format. These are
+# the ones that carry authentication and execution - the two things the
+# detections here are about.
+_SYSLOG_PATTERNS: list[tuple[re.Pattern, dict[str, str]]] = [
+    # sshd: the single most useful line on an internet-facing host.
+    (re.compile(r"sshd\[\d+\]:\s+Failed (?:password|publickey) for "
+                r"(?:invalid user )?(?P<user>\S+) from (?P<ip>\S+)", re.I),
+     {"user": "TargetUserName", "ip": "IpAddress"}),
+    (re.compile(r"sshd\[\d+\]:\s+Accepted (?:password|publickey|keyboard-interactive)"
+                r"(?:/\S+)? for (?P<user>\S+) from (?P<ip>\S+)", re.I),
+     {"user": "TargetUserName", "ip": "IpAddress"}),
+    # sudo: the command is in the line, which is why the Linux Sigma rules can
+    # match on a plain file at all.
+    (re.compile(r"sudo:\s+(?P<user>\S+)\s*:.*?COMMAND=(?P<cmd>.+)$", re.I),
+     {"user": "SubjectUserName", "cmd": "CommandLine"}),
+    (re.compile(r"sudo:.*?USER=(?P<target>\S+)", re.I),
+     {"target": "TargetUserName"}),
+    # PAM, which is where su and login failures land. `user=` is matched
+    # separately rather than as an optional tail: PAM writes its fields in
+    # no fixed order, and an optional group after `.*?` matches empty every
+    # time - which is why the su line came back with no account at all.
+    (re.compile(r"pam_unix\((?P<svc>[^:]+):auth\):\s+authentication failure",
+                re.I),
+     {"svc": "ServiceName"}),
+    (re.compile(r"\buser=(?P<user>\S+)", re.I), {"user": "TargetUserName"}),
+    (re.compile(r"\brhost=(?P<ip>\S+)", re.I), {"ip": "IpAddress"}),
+    # cron.
+    (re.compile(r"CRON\[\d+\]:\s+\((?P<user>[^)]+)\)\s+CMD\s+\((?P<cmd>.+)\)"),
+     {"user": "SubjectUserName", "cmd": "CommandLine"}),
+    # auditd, if it is forwarded to a file.
+    (re.compile(r'\bcomm="(?P<comm>[^"]+)"'), {"comm": "Image"}),
+    (re.compile(r'\bexe="(?P<exe>[^"]+)"'), {"exe": "ImagePath"}),
+    # The daemon that wrote the line, when nothing more specific matched.
+    (re.compile(r"^\w{3}\s+\d+\s[\d:]+\s+\S+\s+(?P<prog>[\w./-]+)(?:\[\d+\])?:"),
+     {"prog": "ServiceName"}),
+]
+
+# Whether the line is an authentication attempt, and how it went. Synthesised
+# rather than parsed: Linux has no equivalent of EventID 4624/4625, so the
+# correlation rules need something stable to key on that is not "does this
+# text contain the word failed".
+_AUTH_FAILURE = re.compile(
+    r"Failed (?:password|publickey)|authentication failure|"
+    r"Invalid user|Failed none for|maximum authentication attempts", re.I)
+_AUTH_SUCCESS = re.compile(
+    r"Accepted (?:password|publickey|keyboard-interactive)|"
+    r"session opened for user", re.I)
+
+
 def text_event_fields(line: str, source: str = "", ip: str = "",
                       user: str = "") -> dict:
     """A plain log line, with whatever could be pulled out of it.
 
-    Deliberately thin, and the limit is worth stating rather than papering
-    over: a syslog line is text, so only `Message|contains` style rules can
-    fire here. A Sigma rule matching `Image|endswith` will not match, not
-    because the event is uninteresting but because the field does not exist.
+    This used to return `Message` and nothing else, on the reasoning that
+    parsing every log format is not worth it. That reasoning was half right:
+    parsing *every* format is not worth it, and parsing the handful that carry
+    authentication and command execution is - it is the difference between a
+    host on rsyslog getting field-matching rules and correlation, and getting
+    neither.
 
-    Anything richer would mean parsing every log format, which is what the
-    journal and the Windows event log already do properly.
+    What still cannot be had here is anything the line does not contain. An
+    auditd SYSCALL record names the binary; a bare `sshd` line does not name
+    the command. Fields absent from the text stay absent rather than being
+    guessed at, because a wrong `Image` is worse than a missing one - it
+    matches rules the event has nothing to do with.
+
+    `ip` and `user` are what the enricher already extracted, and they lose to
+    anything parsed out of the line here, which is more specific.
     """
-    fields = {"Message": str(line or ""), "LogFile": str(source or "")}
+    text = str(line or "")
+    fields: dict[str, str] = {"Message": text, "LogFile": str(source or "")}
     if ip:
         fields["SourceIp"] = ip
     if user:
         fields["User"] = user
+
+    for pattern, mapping in _SYSLOG_PATTERNS:
+        found = pattern.search(text)
+        if not found:
+            continue
+        for group, name in mapping.items():
+            try:
+                value = found.group(group)
+            except (IndexError, error):
+                continue
+            if value and name not in fields:
+                fields[name] = value.strip()
+
+    if "IpAddress" in fields:
+        fields.setdefault("SourceIp", fields["IpAddress"])
+    if "TargetUserName" in fields:
+        fields.setdefault("User", fields["TargetUserName"])
+
+    if _AUTH_FAILURE.search(text):
+        fields["AuthResult"] = "failure"
+    elif _AUTH_SUCCESS.search(text):
+        fields["AuthResult"] = "success"
     return fields

@@ -6754,19 +6754,32 @@ async def get_attack_coverage(request):
 
 
 def _sigma_technique_index() -> set:
-    """Techniques the installed Sigma rules can detect.
+    """Techniques the agent can detect: Sigma rules plus correlation.
 
-    Read from the same directory the agent loads, so the console cannot claim
-    coverage the endpoints do not have.
+    Read from the same directory and the same rule set the agent loads, so the
+    console cannot claim coverage the endpoints do not have.
+
+    Correlation is included because it is real coverage the operator has, and
+    leaving it out would report T1110.003 as a blind spot on an estate that
+    detects it. The two are counted together on purpose - the page's question
+    is "would anything catch this", not "which layer would".
     """
+    techniques = set()
     try:
         from core.sigma_loader import load_dir
         path = os.getenv("SIGMA_RULES_PATH",
                          os.path.join("Sentora", "conf", "sigma"))
-        return load_dir(path).techniques
+        techniques |= load_dir(path).techniques
     except Exception as e:
         print(f"[!] could not read Sigma rules for coverage: {e}", flush=True)
-        return set()
+
+    try:
+        from core.correlation import techniques_covered
+        techniques |= techniques_covered()
+    except Exception as e:
+        print(f"[!] could not read correlation rules for coverage: {e}", flush=True)
+
+    return techniques
 
 
 @app.get("/api/dashboard/summary")

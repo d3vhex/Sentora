@@ -347,9 +347,53 @@ The same image runs in three roles, selected by `WORKER_TYPE` env:
 
 | Worker | Queue | Role |
 | :--- | :--- | :--- |
-| Automation | `ai_automation_queue` | Continuous triage of incoming logs. Strict JSON verdict prompt (`CRITICAL`, `SUSPICIOUS`, `NOT_CRITICAL` plus confidence). Saves only high-confidence findings or threat-intel-confirmed hits. |
+| Automation | `ai_automation_queue` | Continuous triage of incoming logs. Strict JSON verdict prompt (`CRITICAL`, `SUSPICIOUS`, `NOT_CRITICAL`). Every verdict is saved; what varies is whether it is shown to an analyst or filed quietly — see 3.1.1. |
 | Manual | `ai_manual_queue` | Operator-initiated deep scans. Always saves something (user explicitly requested). Output includes MITRE techniques, IOCs, next steps. |
 | Defensive | `ai_soar_queue` | Recommends a SOAR action and autonomously dispatches it when verdict is `ACT`, confidence is at or above `AI_AUTO_ACT_CONF` (default 0.75), and the action is on the safe-list. |
+
+### 3.1.1 What Reaches an Analyst (`ai/gating.py`, `ai/criteria.py`)
+
+The automation worker files every verdict. `Realtime_<table>` is shown;
+`Reviewed_<table>` is kept and quiet. One function decides — `gating.surfaces`
+— and both the worker and the eval harness call it, because when they were
+separate copies the harness reported 40% escalation recall on runs where
+production surfaced nothing at all.
+
+**The rule: severity CRITICAL or HIGH, and a criterion the log was checked
+against and found to support. Model confidence is not consulted.**
+
+That is not a stylistic preference. Two rounds of measurement removed it:
+
+- Six CRITICAL verdicts were held at confidence 0.50 — an LSASS dump, a SAM
+  hive export, shadow copies being deleted — and a seventh at 0.00. Every
+  benign case also came back at 0.50, so the number separated nothing.
+- Moving the floor changes nothing between 0.60 and 0.90; the model emits 0.50
+  or 0.90 and almost nothing between.
+- Over 29 cases, every attack that surfaced already had a verified criterion.
+  Both false alarms that reached an analyst got there on confidence alone —
+  SUSPICIOUS / CRITICAL / 0.80 on this platform's own containers restarting.
+
+`AI_CRIT_CONF` and `AI_SUS_CONF` are still read, only so that a non-default
+value logs a warning saying it no longer applies.
+
+**`ai/criteria.py` is what makes this possible.** The model proposes a
+criterion; the code decides whether the log supports it, by looking for that
+criterion's literal markers. It works in both directions — it refuses a
+claimed criterion the log does not contain, corrects one the model filed
+under the wrong letter, and finds one the model missed entirely. Base64 on a
+command line is decoded (UTF-16LE and UTF-8) before searching, because
+`-EncodedCommand` is exactly where a payload goes to stop being searchable,
+and the question worth asking is what it does rather than that it was
+encoded.
+
+**On the model's SUSPICIOUS label:** precision 0.00, recall 0.00 over that
+corpus. It uses the top of the scale and not the middle. Since a supported
+criterion is promoted to CRITICAL, a SUSPICIOUS verdict never carries verified
+evidence and never surfaces. The middle of the scale is real and comes from
+layers that can be checked — a Sigma rule at MEDIUM, or a correlation window
+(4.1.2) — not from asking a 3B model to feel uncertain.
+
+Threat-intel matches surface regardless, and are handled by the caller.
 
 ### 3.2 Defensive Auto-Action Allow-List
 
@@ -520,11 +564,62 @@ difference is a property of the logs rather than of the rules:
 | --- | --- | --- |
 | Windows Event Log | full, via `WINDOWS_FIELDS` | yes |
 | systemd journal | process, command line, unit | yes |
-| plain log files | `Message`, `SourceIp`, `User` | no — text has no `CommandLine` |
+| plain log files | parsed from the line — see below | partially |
+
+`text_event_fields` returned `Message` and nothing else at first, on the
+reasoning that parsing every log format is not worth it. That was half right:
+parsing *every* format is not worth it, and parsing the handful carrying
+authentication and command execution is — it decides whether a host on rsyslog
+gets field rules and correlation, or neither.
+
+sshd, sudo, PAM, cron and auditd each write in a fixed shape, so
+`SYSLOG_PATTERNS` pulls `TargetUserName`, `IpAddress`, `CommandLine` and
+`Image` out of them, plus a synthesised `AuthResult` — Linux has no
+equivalent of EventID 4624/4625, and correlation needs something stabler to
+key on than "does this text contain the word failed".
+
+Fields the line does not contain stay absent rather than being guessed at. A
+wrong `Image` is worse than a missing one: it matches rules the event has
+nothing to do with.
 
 **ATT&CK coverage** is read from the loaded rules' own `tags`, so there is no
 mapping table to keep current, and a rule that failed to load cannot claim
 coverage it is not providing.
+
+### 4.1.2 Correlation (`core/correlation.py`)
+
+Sigma matches a rule against one event dict. It cannot express "count
+distinct users where the source is the same, within a window", so an entire
+class of detection was invisible: password spray, brute force, and the one
+that matters most — repeated failures followed by a success.
+
+Not Sigma's own `correlation:` spec, which arrived in 2024 and would mean a
+stateful rule engine buffering events per rule and resolving references
+between them. That is a lot of machinery on something running on every
+endpoint, for four shapes that are few and specific enough to write directly.
+
+Three properties are load-bearing:
+
+- **Fires once per window, not once per event.** A sustained spray produces
+  one detection, then silence for the cooldown. The same bug class had the
+  defensive sweep re-queueing 4,919 duplicate alerts: a condition that stays
+  true keeps producing work unless something says "already told you".
+- **Bounded memory.** Group keys are attacker-supplied — a username, a source
+  address. Timestamps outside the window are dropped on every observation and
+  the number of tracked groups is capped with least-recently-seen eviction.
+- **One predicate per platform-independent concept.** `_is_failed_logon` is
+  EventID 4625 *or* the `AuthResult` field synthesised from Linux auth lines.
+  A spray is the same shape wherever it happens; two rule sets is how the
+  thresholds drift apart.
+
+A window that fires becomes an **event of its own** rather than relabelling
+the event that completed it — the fifth failed logon is no more interesting
+than the first, and marking it CRITICAL would show an analyst a routine 4625
+with nothing explaining why.
+
+**It runs on the agent, so correlation is per host.** Five accounts sprayed
+against one machine is caught; one account sprayed across fifty machines,
+once each, is not — nothing on any single host sees more than one event.
 
 ### 4.2 Tables Synced From Agent to Server
 
@@ -624,6 +719,63 @@ pytest -ra                                   # no MySQL or RabbitMQ needed
 python -m compileall -q app.py core security
 cd frontend && npx tsc --noEmit && npm run build && cd ..
 ```
+
+### 7.1 Measuring the Model (`scripts/run_eval.py`)
+
+```bash
+python scripts/build_attack_corpus.py
+python scripts/run_eval.py --corpus evals/corpus_attacks.jsonl --save evals/runs/x.json
+python scripts/run_eval.py --corpus evals/corpus_attacks.jsonl --no-cache
+```
+
+The report is deliberately noisy about what it does **not** prove, because
+every number here has been misread at least once:
+
+| Line | What it means |
+| :--- | :--- |
+| Escalation recall | Of events that should escalate, how many the model flagged |
+| Escalation precision | Of its escalations, how many deserved it — scores the *verdict* |
+| Reaches an analyst | Of those, how many production would actually show — scores the *product* |
+| False alarms shown | Benign events that get past the gate — the ones that cost attention |
+| Positives | How many were hand-written, and how many are real |
+| Resolution | How much one case flipping moves recall |
+
+**Recall is an upper bound.** Every positive is written from documented
+technique behaviour — nobody has run mimikatz on this estate — so these are
+the loud versions of each technique and a real intruder is quieter. A miss is
+real evidence; a hit is weak evidence. The report prints this on every run
+rather than leaving it in a README.
+
+**Precision and "false alarms shown" are different claims,** in the same way
+recall and "reaches an analyst" are. On one 29-case run the model raised 12
+unwarranted escalations and 2 of them surfaced. Quoting 43% precision and
+stopping there describes a console nobody has.
+
+**Read every figure with the resolution.** Two runs of the identical corpus at
+temperature 0 returned 50% and 60%: llama.cpp on CPU reduces across threads in
+a non-deterministic order and a near-tie flips. A difference smaller than
+twice the resolution is noise.
+
+**The replay cache** stores the raw reply keyed on the model *and the prompt
+text*. Keying on the prompt is what makes it safe — `ai.utils` has a
+production cache keyed on the log alone, which the harness deliberately never
+uses, because a reply from an older prompt would make a rewritten one look
+identical to the one it replaced. What is cached is the reply before
+`criteria.apply` and before the gate, so criterion and gating changes are
+scored fresh: re-scoring drops from ~20 minutes to ~2 seconds. A fully cached
+run says so instead of passing as a fresh measurement; `--no-cache` asks the
+model again.
+
+**Real positives** need telemetry a machine produced.
+`scripts/generate_telemetry.py` performs the harmless action that emits the
+same event as a technique — `vssadmin list shadows` rather than deleting them,
+a scheduled task created and removed, a real `-EncodedCommand` whose payload
+prints the date. It marks which entries exercise a rule end to end and which
+only exercise collection, and refuses the ones with no harmless version (an
+actual LSASS dump, actually clearing the Security log), naming them as the gap
+rather than omitting them. Collect the results with
+`build_eval_corpus.py` + `label_eval_corpus.py`; the labelled rows carry
+`constructed=false`.
 
 With the stack up, `scripts/api_smoke_test.py` enumerates every route from
 `app.py` via AST — so the list cannot drift from the code — and exercises it

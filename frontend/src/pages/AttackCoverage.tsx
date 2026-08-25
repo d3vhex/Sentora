@@ -17,9 +17,13 @@ import { agentService } from '../services/api';
  * percentage hides - a heatmap showing "62% covered" reads as reassurance
  * while saying nothing about which 38%.
  *
- * Techniques come from the installed Sigma rules' own `tags`, so this is
- * derived from what is actually loaded rather than from a hand-kept table
- * that can claim coverage the platform does not have.
+ * Techniques come from the installed Sigma rules' own `tags` and from the
+ * correlation rules, so this is derived from what is actually loaded rather
+ * than from a hand-kept table that can claim coverage the platform does not
+ * have. Correlation is counted here because it is real coverage an operator
+ * has: leaving it out would draw T1110.003 as a blind spot on an estate that
+ * detects it, and telling "quiet" from "blind" is the whole point of the
+ * page.
  */
 
 type Coverage = {
@@ -129,9 +133,10 @@ const AttackCoverage: React.FC = () => {
           <Grid3x3 color="var(--accent-secondary)" /> ATT&amp;CK Coverage
         </h2>
         <p style={{ color: 'var(--text-secondary)', maxWidth: '70ch' }}>
-          Which techniques the installed Sigma rules can detect, and which have
-          actually fired here. Read from the rules&rsquo; own tags, so nothing
-          here claims coverage the platform does not have.
+          Which techniques this deployment can detect, and which have actually
+          fired here. Read from the installed Sigma rules&rsquo; own tags plus
+          the correlation rules, so nothing here claims coverage the platform
+          does not have &mdash; a rule that failed to compile contributes none.
         </p>
       </div>
 
@@ -150,7 +155,7 @@ const AttackCoverage: React.FC = () => {
       <div className="responsive-grid" style={{ marginBottom: '28px' }}>
         <StatCard
           label="Techniques covered" value={data?.covered_count ?? '—'}
-          sub="an installed Sigma rule addresses these"
+          sub="a Sigma or correlation rule addresses these"
           color="#6ee7b7" icon={<ShieldCheck size={16} />}
         />
         <StatCard
@@ -160,7 +165,7 @@ const AttackCoverage: React.FC = () => {
         />
         <StatCard
           label="Seen with no rule" value={data?.uncovered_but_seen.length ?? '—'}
-          sub="surfaced by the AI or the regex list, not by Sigma"
+          sub="surfaced by the AI or the regex list, with no rule behind it"
           color="#fbbf24" icon={<EyeOff size={16} />}
         />
       </div>
@@ -171,7 +176,7 @@ const AttackCoverage: React.FC = () => {
           backgroundColor: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)',
           color: '#fbbf24', lineHeight: 1.6,
         }}>
-          <strong style={{ display: 'block', marginBottom: '4px' }}>No Sigma rules installed.</strong>
+          <strong style={{ display: 'block', marginBottom: '4px' }}>No detection rules loaded.</strong>
           Nothing on this page is covered, so an empty grid below is a statement
           about the rules, not about the estate. Install rules into{' '}
           <code>conf/sigma/</code> &mdash; see the README there.

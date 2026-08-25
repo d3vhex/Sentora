@@ -5,6 +5,134 @@ made to the Sentora platform, newest first.
 
 ---
 
+## 2026-08 — Correlation, an evidence-based gate, and a backup that was needed the day it was written
+
+### The gate stopped asking the model how sure it was
+
+Two rounds of measurement took the confidence threshold apart. Six CRITICAL
+verdicts were held at 0.50 — an LSASS dump, a SAM hive export, shadow copies
+being deleted — while every benign case also came back at 0.50. Moving the
+threshold changes nothing between 0.60 and 0.90, because the model emits 0.50
+or 0.90 and almost nothing in between.
+
+Then, over 29 cases including ten real events: **every attack that surfaced
+already had a verified criterion**, so the confidence path caught nothing
+evidence had not — while admitting both false alarms that reached an analyst.
+Those two were this platform's own Docker containers restarting, at
+SUSPICIOUS / CRITICAL / 0.80.
+
+The gate now asks one question: does the log contain the evidence?
+`AI_CRIT_CONF` and `AI_SUS_CONF` are read only to warn that they no longer do
+anything, because silently ignoring configuration somebody deliberately set is
+its own bug class.
+
+Replaying the saved run through the new gate: **9/10 attacks kept, false
+alarms 2/19 → 0/19.** The live re-run agrees — 90% reaching an analyst, 0 of 9
+benign events shown, with the model over-escalating six and the gate stopping
+all six.
+
+On SUSPICIOUS specifically: the model's own SUSPICIOUS label scored precision
+0.00 and recall 0.00. It can use the top of the scale and not the middle. The
+middle is real and now comes from layers that can be checked — a Sigma rule at
+MEDIUM, or a correlation window — rather than from asking a 3B model to feel
+uncertain.
+
+### A whole class of detection was invisible
+
+Sigma matches a rule against one event. It cannot express "count distinct
+users where the source is the same, within a window", so password spray,
+brute force and a guess landing after repeated failures were not missed by a
+rule — there was no rule that could exist.
+
+`core/correlation.py` covers those shapes. Three things it gets right on
+purpose:
+
+- **Fires once per window.** A sustained spray produces one detection. This is
+  the bug class that had the defensive sweep re-queueing 4,919 duplicates.
+- **Bounded memory.** Group keys are attacker-supplied usernames and source
+  addresses; an unbounded counter on those is a memory exhaustion primitive.
+- **A window becomes its own event**, rather than relabelling the event that
+  completed it. The fifth failed logon is no more interesting than the first.
+
+The corpus case Sigma skips is now covered, and the skip says where to look
+instead of standing as a permanent documented hole.
+
+### The Linux text path was weaker than it needed to be
+
+`text_event_fields` returned `Message` and nothing else. Parsing every log
+format is not worth it; parsing the handful that carry authentication and
+command execution is, and it is the difference between a host on rsyslog
+getting field rules and correlation, or neither.
+
+sshd, sudo, PAM, cron and auditd now yield `TargetUserName`, `IpAddress`,
+`CommandLine`, `Image` and a synthesised `AuthResult` — Linux has no
+equivalent of EventID 4624/4625, and correlation needs something stabler than
+"does this text contain the word failed". Fields the line does not contain
+stay absent: a wrong `Image` matches rules the event has nothing to do with.
+
+### A first-time install had never worked
+
+`db/init.sql` was mounted into `docker-entrypoint-initdb.d` beside
+`init_userdb.sql`. It is not a server-init script — it is the per-agent schema
+template, applied after connecting to that agent's own database, which is why
+it contains no `CREATE DATABASE` or `USE`.
+
+Each file in that directory runs in its own mysql session, so the `USE userdb`
+at the end of the first does not carry over. On a first boot the second failed
+at line 5 with "No database selected", MySQL aborted initialisation and the
+container came up unhealthy. Nobody had hit it because the volume already
+existed on every machine that had ever run this — it only breaks for someone
+setting the project up for the first time, which is everyone who clones it.
+
+### Docker Desktop was reset and there was no backup
+
+Every named volume went: `mysql_data` — all telemetry, every agent database,
+users and sessions — plus `opensearch_data` and `sentora_data`. Nothing had
+asked for them to be removed and nothing warned.
+
+`scripts/backup_state.py` now takes both a logical dump and a tar of every
+volume compose declares, and its restore path was verified the only way that
+counts: back up, `docker compose down -v`, restore, read the data back.
+
+Two bugs surfaced in that verification, both from running it rather than
+reading it. `docker -v` reads a **relative** path as a named volume rather
+than a host directory, and reports the drive letter as an invalid character —
+which looks like a quoting bug. And the restore printed `[+] Restored` on a
+run where every archive had failed. The second is the dangerous one: a restore
+that reports success it did not have is noticed the next time somebody needs
+the data.
+
+It also clarified something the deployment doc said but was easy to read past.
+**There are two Fernet keys.** The server key is `FERNET_KEY` in `.env`, on
+the host filesystem, and it survived. The agent key is `data/fernet.key`
+inside `sentora_data`, and it did not — regenerated on the next boot, which
+permanently orphans telemetry encrypted under the old one. Backing up `.env`
+and not the volume protects the half that was never at risk.
+
+### Twenty minutes to score a one-line change
+
+Every gating and criterion change was measured by paying for 29 model calls
+twice, the second time to get an identical set of replies. The harness now
+caches the raw reply keyed on **the model and the prompt text** — which is
+what makes it safe, since `ai.utils`' production cache is keyed on the log
+alone and would make a rewritten prompt look identical to the one it replaced.
+
+Criteria and gating are scored fresh on every run because what is cached is
+the reply, before either. Re-scoring went from twenty minutes to 2.3 seconds,
+and a fully cached run says so rather than passing as a fresh measurement.
+
+### Telemetry that a machine actually produced
+
+`scripts/generate_telemetry.py` performs the harmless action that produces the
+same event as a technique — `vssadmin list shadows` rather than deleting them,
+a scheduled task created and removed, a real `-EncodedCommand` whose payload
+prints the date. Each entry says whether it exercises a rule end to end or
+only the collection path, and techniques with no harmless version — an actual
+LSASS dump, actually clearing the Security log — are listed, refused, and
+documented as the gap they are rather than quietly omitted.
+
+---
+
 ## 2026-08 — Sigma detection, ATT&CK coverage, and a corpus that says what it is
 
 ### Detection did not depend on the model, and now it does not have to

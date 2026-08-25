@@ -43,7 +43,12 @@ Pre-flight (15 minutes):
 
 ```bash
 # 1. Fresh backup before touching anything
-/opt/sentora/backup.sh                    # production-deployment.md §4.2
+python scripts/backup_state.py            # production-deployment.md §4.2
+# or /opt/sentora/backup.sh if you run the cron variant
+#
+# Not a formality. A Docker Desktop reset on a development machine removed
+# every named volume — all telemetry, every agent database, users, sessions —
+# with no warning and nothing to restore from.
 
 # 2. Note the current version
 git -C /opt/sentora describe --tags --always

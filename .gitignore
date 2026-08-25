@@ -79,3 +79,5 @@ certs/*.key
 certs/*.crt
 certs/*.pem
 certs/*.csr
+evals/cache/
+backups/

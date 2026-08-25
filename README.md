@@ -33,6 +33,17 @@ phone-home. If you want a smarter model and have the RAM, swap it in `.env`.
   wrapper. Measured on the eval corpus: 9 of 10 attacks caught by Sigma alone,
   0 of 9 hard negatives falsely flagged. This layer is deterministic and keeps
   working when the model is unavailable.
+- **Correlates across events**, which no per-event rule can do. A single
+  failed logon is routine; five accounts failing from one source in forty
+  seconds is a password spray, and looking at any one of those five events
+  will never tell you that. Covers spray, brute force, a success arriving
+  after repeated failures, bursts of account creation and service installs —
+  on both platforms, from Windows event IDs or from parsed `auth.log` lines.
+  Adds the three T1110 brute-force techniques no per-event rule can express,
+  taking total coverage to 19. Fires once per window rather than once per
+  event, and every counter is bounded, because a counter keyed on an
+  attacker-supplied username is a memory exhaustion primitive rather than a
+  detection.
 - **Maps detections to MITRE ATT&CK, from the rules themselves.** Rules carry
   `tags: attack.t1490`, so there is no hand-kept mapping table to go stale. The
   coverage page separates three states a single "coverage %" would hide:
@@ -518,9 +529,15 @@ Operational docs:
 ## Development setup
 
 ```bash
-# 1. Database
+# 1. Database. Only init_userdb.sql — it creates and selects `userdb`.
+#
+#    db/init.sql is NOT a server-init script. It is the per-agent schema
+#    template, applied by server.create_tables_if_not_exist() after
+#    connecting to that agent's own database, which is why it contains no
+#    CREATE DATABASE or USE. Running it standalone fails at line 5 with
+#    "No database selected" — the same way it broke every first-time
+#    `docker compose up` while it was mounted into the MySQL init directory.
 mysql -u root -p < db/init_userdb.sql
-mysql -u root -p < db/init.sql
 
 # 2. Backend. requirements.lock pins every version the image is built
 #    from; requirements.txt is the loose list it was resolved from.

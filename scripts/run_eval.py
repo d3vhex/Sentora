@@ -23,6 +23,7 @@ not measured the model, and must not be reportable as a result.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
@@ -77,6 +78,71 @@ def load_corpus(path: pathlib.Path) -> tuple[list[dict], list[str]]:
     return cases, problems
 
 
+
+# ---------------------------------------------------------------------------
+# Replay cache
+# ---------------------------------------------------------------------------
+#
+# 29 cases at up to 140s each is twenty minutes, and most re-runs change
+# nothing the model sees. Every gating and criterion change in this session
+# was scored by paying for the model twice - the second time to get an
+# identical set of replies.
+#
+# The key is the model *and the prompt text*, which is what makes this safe.
+# `ai.utils` has a production response cache and the harness deliberately does
+# not use it: keyed on the log alone, a cached answer from an older prompt
+# would make a rewritten prompt look identical to the one it replaced. Keying
+# on the prompt means editing it invalidates everything, which is the
+# behaviour a prompt experiment needs.
+#
+# What is cached is the raw reply, before `criteria.apply` and before the
+# gate. Criterion and gating changes are therefore scored fresh on every run -
+# which is the common case and the whole point.
+
+CACHE_DIR = ROOT / "evals" / "cache"
+
+
+def _cache_key(model: str, prompt: str, log_text: str) -> str:
+    digest = hashlib.sha256()
+    for part in (model, prompt, log_text):
+        digest.update(part.encode("utf-8", "replace"))
+        digest.update(b"\x00")
+    return digest.hexdigest()
+
+
+def cache_read(key: str):
+    path = CACHE_DIR / f"{key}.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
+
+
+_cache_warned = False
+
+
+def cache_write(key: str, payload: dict) -> None:
+    """Best effort. A cache that cannot be written is not a failed run.
+
+    But it is not nothing either, so it is said once rather than swallowed:
+    silently failing to write means every run pays the full twenty minutes
+    and the reason is invisible - which is the exact experience the cache was
+    added to remove.
+    """
+    global _cache_warned
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        (CACHE_DIR / f"{key}.json").write_text(
+            json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")
+    except OSError as e:
+        if not _cache_warned:
+            _cache_warned = True
+            print(f"  ! replay cache is not writable ({e}); every run will "
+                  f"re-query the model")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--corpus", default=str(CORPUS))
@@ -84,6 +150,14 @@ def main() -> int:
                     help="agent whose AI config to use; defaults to env settings")
     ap.add_argument("--save", default=None, help="write this run to a JSON file")
     ap.add_argument("--compare", default=None, help="baseline run to compare against")
+    ap.add_argument(
+        "--no-cache", action="store_true",
+        help="ignore the replay cache in both directions. Use when the "
+             "question is whether the model still behaves this way, "
+             "rather than whether the scoring around it does.")
+    ap.add_argument(
+        "--refresh", action="store_true",
+        help="re-query the model and overwrite the cached replies")
     ap.add_argument("--limit", type=int, default=0, help="stop after N cases")
     ap.add_argument("--endpoint", default=None,
                     help="Ollama base URL (default: OLLAMA_BASE_URL, with "
@@ -115,18 +189,34 @@ def main() -> int:
     print(f"    endpoint: {endpoint or '(ai.utils default)'}\n")
 
     results: list[Case] = []
+    cache_hits = 0
     for i, row in enumerate(cases, 1):
         log_text = json.dumps(row["event"], indent=2, default=str)
         started = time.monotonic()
+        key = _cache_key(os.getenv("OLLAMA_MODEL", "default"),
+                         PROMPTS["automation"], log_text)
+        cached = None if (args.no_cache or args.refresh) else cache_read(key)
         try:
-            verdict, _raw, error = analyze_structured(
-                PROMPTS["automation"], log_text, TriageVerdict,
-                # agent=None: never read or write the response cache during an
-                # eval. A cached answer from a previous prompt would make the
-                # new one look identical to it.
-                agent=None,
-                endpoint=endpoint or None,
-            )
+            if cached is not None:
+                cache_hits += 1
+                error = cached.get("error")
+                verdict = (TriageVerdict.model_validate(cached["verdict"])
+                           if cached.get("verdict") else None)
+            else:
+                verdict, _raw, error = analyze_structured(
+                    PROMPTS["automation"], log_text, TriageVerdict,
+                    # agent=None: never touch the *production* response cache.
+                    # It is keyed on the log alone, so a reply from an older
+                    # prompt would make a rewritten one look identical to it.
+                    # The harness cache above keys on the prompt too.
+                    agent=None,
+                    endpoint=endpoint or None,
+                )
+                if not args.no_cache:
+                    cache_write(key, {
+                        "verdict": (verdict.model_dump() if verdict else None),
+                        "error": error,
+                    })
             # The same adjustment production makes, so the score describes
             # what the platform does rather than what the model said.
             if verdict is not None:
@@ -188,6 +278,15 @@ def main() -> int:
     if sr is not None and er is not None and sr < er:
         print(f"     {er:.0%} of attacks were flagged; {sr:.0%} would be seen.")
         print(f"     Gate: {describe_gate()}")
+
+    if cache_hits:
+        print()
+        print(f"  Replayed from cache ... {cache_hits}/{len(cases)} case(s)")
+        if cache_hits == len(cases):
+            print("     No model call was made. This scores the code around")
+            print("     the model - criteria, the gate, the metrics - and is")
+            print("     not evidence the model still answers this way.")
+            print("     Use --no-cache for that.")
 
     alarms = report.surfaced_false_alarms
     if alarms:
