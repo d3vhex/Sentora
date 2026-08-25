@@ -21,49 +21,63 @@ import pytest
 from ai import gating
 
 
-def v(verdict, severity="MEDIUM", confidence=0.9):
+def v(verdict, severity="MEDIUM", confidence=0.9, criterion="none"):
     return types.SimpleNamespace(verdict=verdict, severity=severity,
-                                 confidence=confidence)
+                                 confidence=confidence,
+                                 matched_criterion=criterion)
 
 
 # --------------------------------------------------------------------------
 # The case that was missed
 # --------------------------------------------------------------------------
 
-def test_suspicious_at_the_observed_confidence_does_not_surface():
-    """0.60 is what llama3.2:3b returned for every attack it noticed."""
-    assert gating.surfaces(v("SUSPICIOUS", "MEDIUM", 0.60)) is False
+def test_suspicious_does_not_surface_at_any_confidence():
+    """The model's SUSPICIOUS label scored precision 0.00 and recall 0.00 over
+    29 cases: never applied to one that deserved it, never withheld from one
+    that did not. It can use the top of the scale and not the middle.
+
+    Both false alarms that reached an analyst were SUSPICIOUS at 0.80 - this
+    platform's own Docker containers restarting.
+    """
+    for confidence in (0.0, 0.5, 0.6, 0.75, 0.8, 1.0):
+        assert gating.surfaces(v("SUSPICIOUS", "HIGH", confidence)) is False
 
 
-def test_suspicious_at_the_threshold_surfaces():
-    assert gating.surfaces(v("SUSPICIOUS", "MEDIUM", 0.75)) is True
+def test_the_middle_of_the_scale_is_not_gone_it_moved():
+    """A criterion the log supports still surfaces whatever the verdict says,
+    because that is a fact about the event. What is refused is the model
+    volunteering uncertainty with nothing behind it."""
+    assert gating.surfaces(
+        v("SUSPICIOUS", "HIGH", 0.0, criterion="C2 remote execution")) is True
 
 
 # --------------------------------------------------------------------------
 # The gate
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize("verdict,severity,confidence,expected", [
-    ("CRITICAL",     "CRITICAL", 0.9,  True),
-    ("CRITICAL",     "HIGH",     0.6,  True),
-    ("CRITICAL",     "HIGH",     0.59, False),   # below the confidence gate
-    ("CRITICAL",     "MEDIUM",   0.99, False),   # severity does not qualify
-    ("SUSPICIOUS",   "LOW",      0.8,  True),    # severity is not consulted
-    ("NOT_CRITICAL", "CRITICAL", 1.0,  False),
-    ("INSUFFICIENT_DATA", "HIGH", 1.0, False),
+@pytest.mark.parametrize("verdict,severity,criterion,expected", [
+    ("CRITICAL",     "CRITICAL", "C1",   True),
+    ("CRITICAL",     "HIGH",     "C6",   True),
+    ("CRITICAL",     "HIGH",     "none", False),  # no evidence in the log
+    ("CRITICAL",     "MEDIUM",   "C1",   False),  # severity disagrees with itself
+    ("SUSPICIOUS",   "LOW",      "C1",   False),
+    ("NOT_CRITICAL", "CRITICAL", "C1",   False),
+    ("INSUFFICIENT_DATA", "HIGH", "C1",  False),
 ])
-def test_gate(verdict, severity, confidence, expected):
-    assert gating.surfaces(v(verdict, severity, confidence)) is expected
+def test_gate(verdict, severity, criterion, expected):
+    assert gating.surfaces(v(verdict, severity, 0.9, criterion)) is expected
 
 
 def test_no_verdict_does_not_surface():
     assert gating.surfaces(None) is False
 
 
-def test_a_malformed_confidence_does_not_surface():
-    """Fail closed here: an unreadable confidence is not evidence of one."""
-    assert gating.surfaces(v("CRITICAL", "HIGH", "not a number")) is False
-    assert gating.surfaces(v("CRITICAL", "HIGH", None)) is False
+def test_confidence_is_not_consulted_at_all():
+    """Not "weighted less" - not read. A malformed one used to fail the gate
+    closed; now it cannot fail it either way, which is the point."""
+    assert gating.surfaces(v("CRITICAL", "HIGH", "not a number", "C1")) is True
+    assert gating.surfaces(v("CRITICAL", "HIGH", None, "C1")) is True
+    assert gating.surfaces(v("CRITICAL", "HIGH", 1.0, "none")) is False
 
 
 # --------------------------------------------------------------------------
@@ -123,10 +137,14 @@ def test_a_verified_criterion_surfaces_regardless_of_confidence():
     assert gating.surfaces(vc(confidence=0.0, severity="HIGH", criterion="C3"))
 
 
-def test_without_a_criterion_the_confidence_gate_still_applies():
-    """The bypass is for a fact about the log, not for CRITICAL in general."""
+def test_without_a_criterion_nothing_surfaces():
+    """Confidence used to rescue these. Measured over 29 cases, every attack
+    that surfaced already had a verified criterion, so the confidence path
+    caught nothing evidence had not - while admitting both of the false alarms
+    that reached an analyst."""
     assert not gating.surfaces(vc(confidence=0.5, criterion="none"))
-    assert gating.surfaces(vc(confidence=0.9, criterion="none"))
+    assert not gating.surfaces(vc(confidence=0.9, criterion="none"))
+    assert not gating.surfaces(vc(confidence=1.0, criterion="none"))
 
 
 def test_severity_is_still_required():
@@ -135,28 +153,36 @@ def test_severity_is_still_required():
     assert not gating.surfaces(vc(severity="MEDIUM", confidence=0.9, criterion="C1"))
 
 
-def test_suspicious_gets_no_bypass():
-    """`criteria.apply` clears the criterion when it is not supported, so a
-    SUSPICIOUS verdict never carries a verified one - but if one ever appeared
-    there it must not be enough on its own."""
+def test_suspicious_still_needs_a_qualifying_severity():
+    """`criteria.apply` promotes a supported criterion to CRITICAL, so a
+    SUSPICIOUS verdict carrying one at MEDIUM means something overrode the
+    promotion and the verdict disagrees with itself."""
     assert not gating.surfaces(
         vc(verdict="SUSPICIOUS", severity="MEDIUM", confidence=0.5, criterion="C1"))
 
 
-def test_lowering_the_threshold_was_measured_and_rejected():
-    """Between 0.60 and 0.90 the model's output is identical - it returns 0.50
-    or 0.90 and nothing between - so moving the gate there changes nothing.
-    Dropping to 0.50 gains one attack and admits six false alarms.
-
-    Pinned so the next person to reach for the threshold sees that it was
-    tried.
-    """
+def test_the_threshold_history_is_recorded_where_the_next_person_looks():
+    """Two rounds of measurement took the confidence gate apart. Both are
+    written down in the module, so the next person to reach for a threshold
+    sees that it was tried before reaching."""
     import inspect
     source = inspect.getsource(gating)
-    assert "0.60 and 0.90 the output is identical" in source
+    assert "0.60 and 0.90" in source
+    assert "Docker container lifecycle" in source
+
+
+def test_configured_thresholds_that_no_longer_apply_are_not_silently_ignored():
+    """Someone has AI_SUS_CONF in a .env. Reading it and doing nothing is the
+    kind of quiet no-op that costs an afternoon."""
+    import inspect
+    source = inspect.getsource(gating)
+    assert "AI_CRIT_CONF" in source
+    assert "warning" in source
 
 
 def test_the_description_matches_the_rule():
     """It is printed in the eval report, so a stale description would
     misdescribe every run."""
-    assert "verified criterion" in gating.describe()
+    described = gating.describe()
+    assert "criterion" in described
+    assert "confidence is not consulted" in described

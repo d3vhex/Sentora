@@ -29,8 +29,21 @@ services:
     ports:
       - "${BIND_ADDR:-127.0.0.1}:3307:3306"
     volumes:
+      # Only init_userdb.sql belongs here. It creates and selects `userdb`.
+      #
+      # db/init.sql used to be mounted beside it and it is not a server-init
+      # script at all - it is the per-agent schema template, applied by
+      # server.create_tables_if_not_exist() *after* connecting to that agent's
+      # own database, which is why it contains no CREATE DATABASE or USE.
+      #
+      # Each file in this directory runs in its own mysql session, so the
+      # `USE userdb` at the end of the first one does not carry over. On a
+      # first boot the second file therefore failed at line 5 with "No
+      # database selected", MySQL aborted initialisation, and the container
+      # came up unhealthy. Nobody hit it because the volume already existed on
+      # every machine that had ever run this - it only breaks for someone
+      # setting the project up for the first time.
       - ./db/init_userdb.sql:/docker-entrypoint-initdb.d/1-init_userdb.sql
-      - ./db/init.sql:/docker-entrypoint-initdb.d/2-init.sql
       - mysql_data:/var/lib/mysql
     healthcheck:
       # Expanded by the shell *inside* the db container, so it has to name a
