@@ -243,6 +243,36 @@ some historical rows to be undecryptable — the UI marks them
 
 ### 4.2 Backup script
 
+`scripts/backup_state.py` does all of this, cross-platform, and its restore
+path is exercised by tests:
+
+```bash
+python scripts/backup_state.py                       # dated backup
+python scripts/backup_state.py --list
+docker compose down                                  # required before restore
+python scripts/backup_state.py --restore backups/2026-08-25T1401
+```
+
+It takes both a `mysqldump --all-databases` and a tar of every volume compose
+declares — read from `docker-compose.yaml`, so a volume added later is not
+silently missing from every backup after. It deliberately does **not** copy
+`.env`; that belongs in a secret store, not in a directory people tar up and
+move around, and the script says so at the end of every run.
+
+Two things this got wrong before they were tested, both worth knowing if you
+write your own:
+
+- `docker -v` reads a **relative** path as a named volume rather than a host
+  directory, and the error names the drive letter as an invalid character,
+  which looks like a quoting bug.
+- the restore printed success on a run where every archive had failed. A
+  restore that reports success it did not have is worse than one that fails —
+  the failure is noticed now, the false success the next time you need the
+  data.
+
+The hand-written equivalent, if you would rather run it from cron on a Linux
+host:
+
 ```bash
 #!/usr/bin/env bash
 # /opt/sentora/backup.sh
@@ -279,6 +309,20 @@ Quarterly:
    that historical alerts decrypt** — that last one is what proves the key
    restore worked.
 4. Document any deviation.
+
+Not optional, and not theoretical. On the development machine Docker Desktop
+was reset and every named volume went with it: `mysql_data` — all telemetry,
+every agent database, users, sessions — plus `opensearch_data` and
+`sentora_data`. Nothing had asked for them to be removed and nothing warned.
+There was no backup, so there was no recovery.
+
+What that clarified, and what the table above already said but is easy to read
+past: **there are two Fernet keys.** The server key is `FERNET_KEY` in `.env`,
+on the host filesystem, and it survived. The agent key is `data/fernet.key`
+inside the `sentora_data` volume, and it did not — it was regenerated on the
+next boot, which permanently orphans any agent telemetry encrypted under the
+old one. Backing up `.env` and not the volume protects the half that was never
+at risk.
 
 ---
 

