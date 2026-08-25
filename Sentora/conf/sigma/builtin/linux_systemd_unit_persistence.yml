@@ -1,0 +1,48 @@
+title: Systemd Unit Written Or Enabled Outside A Package Manager
+id: 3b8e6d14-2f57-4a92-8c03-7d1b4f9a5e28
+status: experimental
+description: >
+    A systemd unit is the Linux equivalent of a Windows service: it starts at
+    boot, usually as root, and nothing about it looks unusual afterwards.
+    Units arrive legitimately through packages; this matches a unit file being
+    written by hand and then enabled, which is the sequence a package install
+    does not perform.
+references:
+    - https://attack.mitre.org/techniques/T1543/002/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: linux
+detection:
+    cmd_unit_path:
+        CommandLine|contains:
+            - '/etc/systemd/system/'
+            - '/lib/systemd/system/'
+            - '/run/systemd/system/'
+            - '.service'
+    cmd_writing:
+        CommandLine|contains:
+            - 'tee'
+            - '>>'
+            - 'cat >'
+            - 'systemctl enable'
+            - 'daemon-reload'
+    msg_unit_path:
+        Message|contains:
+            - '/etc/systemd/system/'
+            - 'systemctl enable'
+    msg_writing:
+        Message|contains:
+            - 'tee'
+            - '>>'
+            - 'echo'
+            - 'daemon-reload'
+    condition: (cmd_unit_path and cmd_writing) or (msg_unit_path and msg_writing)
+falsepositives:
+    - An installer that drops a unit file and enables it, which is exactly
+      this shape - the account and the path are what distinguish them
+level: high
+tags:
+    - attack.persistence
+    - attack.privilege_escalation
+    - attack.t1543.002

@@ -154,6 +154,120 @@ def fill_params(path: str, agent: str) -> str:
     return re.sub(r"<([^>]+)>", repl, path)
 
 
+
+def probe_unprivileged(args, routes, agent, unprobed):
+    """Pass 3: a logged-in session with no permissions at all.
+
+    This closes the safe half of the write-verb gap. Pass 1 proves a route
+    refuses an anonymous caller, which does not prove the permission it
+    demands is the *right* one - a SOAR dispatch route gated on
+    `read_telemetry` passes pass 1 exactly like one gated on `manage_soar`.
+    That is privilege escalation between roles, and nothing was testing for
+    it.
+
+    Why this is safe to run where pass 2 is not: a 403 is returned by the
+    permission middleware **before the handler executes**, so nothing is
+    dispatched, deleted or truncated. The session used holds a role with an
+    empty permission set, so any route that answers 2xx has skipped its check
+    entirely - and that is the finding.
+
+    Two further guards, because "should refuse" is a hypothesis and not a
+    guarantee:
+
+      - the payloads reference names and ids that do not exist, so a route
+        that wrongly runs acts on nothing;
+      - anything answering 2xx is reported as a bypass and fails the run.
+
+    What it still does not cover: whether a *correctly* gated handler does the
+    right thing when a properly privileged user calls it. That needs a
+    disposable database and an agent endpoint that absorbs SOAR calls, and is
+    the part that remains open.
+    """
+    import uuid
+
+    admin = requests.Session()
+    r = admin.post(f"{args.base}/login",
+                   json={"username": args.user, "password": args.password},
+                   timeout=args.timeout)
+    if r.status_code != 200:
+        print("[!] Pass 3 skipped: could not log in to create the test role.")
+        return [], []
+    admin.headers["X-User-ID"] = str(r.json()["user"]["id"])
+
+    suffix = uuid.uuid4().hex[:8]
+    role_name = f"smoketest_norights_{suffix}"
+    username = f"smoketest_{suffix}"
+    password = f"Pw!{uuid.uuid4().hex}"
+    created_role = created_user = None
+
+    try:
+        rr = admin.post(f"{args.base}/roles",
+                        json={"role_name": role_name, "permissions": []},
+                        timeout=args.timeout)
+        if rr.status_code not in (200, 201):
+            print(f"[!] Pass 3 skipped: could not create a role ({rr.status_code}).")
+            return [], []
+        created_role = (rr.json() or {}).get("id") or (rr.json() or {}).get("role_id")
+
+        ur = admin.post(f"{args.base}/users",
+                        json={"username": username, "password": password,
+                              "email": f"{username}@example.invalid",
+                              "role_id": created_role, "role": role_name},
+                        timeout=args.timeout)
+        if ur.status_code not in (200, 201):
+            print(f"[!] Pass 3 skipped: could not create a user ({ur.status_code}).")
+            return [], []
+        created_user = (ur.json() or {}).get("id") or (ur.json() or {}).get("user_id")
+
+        weak = requests.Session()
+        lr = weak.post(f"{args.base}/login",
+                       json={"username": username, "password": password},
+                       timeout=args.timeout)
+        if lr.status_code != 200:
+            # A fresh account may be required to change its password before
+            # anything else, which is correct behaviour and not a failure here.
+            print(f"[!] Pass 3 skipped: the unprivileged account cannot log in "
+                  f"({lr.status_code}) - likely must_change_password.")
+            return [], []
+        weak.headers["X-User-ID"] = str(lr.json()["user"]["id"])
+
+        print("\n=== Pass 3: authenticated with NO permissions ===")
+        print("    A 403 here is the permission layer refusing before the handler runs.\n")
+
+        escalations, checked = [], []
+        for entry in unprobed:
+            method, path = entry.split(" ", 1)
+            if path in SKIP:
+                continue
+            url = args.base + fill_params(path, f"nonexistent-{suffix}")
+            try:
+                resp = weak.request(method, url, json={}, timeout=args.timeout,
+                                    allow_redirects=False)
+            except requests.RequestException:
+                continue
+            checked.append(entry)
+            if resp.status_code in (401, 403):
+                if args.verbose:
+                    print(f"  ok  {method:6} {path}  -> {resp.status_code}")
+            elif 200 <= resp.status_code < 300:
+                escalations.append(f"{method} {path} -> {resp.status_code}")
+                print(f"  !!  {method:6} {path}  -> {resp.status_code}  "
+                      f"NO PERMISSION REQUIRED")
+            elif args.verbose:
+                # 404 and 400 also mean the handler was reached, but on a
+                # target that does not exist. Not a bypass, and not a clean
+                # refusal either.
+                print(f"  ..  {method:6} {path}  -> {resp.status_code}")
+        return escalations, checked
+    finally:
+        # Always, including on an early return: a smoke test that leaves an
+        # account behind has added a user nobody created deliberately.
+        if created_user:
+            admin.delete(f"{args.base}/users/{created_user}", timeout=args.timeout)
+        if created_role:
+            admin.delete(f"{args.base}/roles/{created_role}", timeout=args.timeout)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--base", default="http://127.0.0.1:8000")
@@ -162,6 +276,10 @@ def main() -> int:
     ap.add_argument("--agent", help="Agent name for <agent> routes (default: first from /devices)")
     ap.add_argument("--timeout", type=float, default=20.0)
     ap.add_argument("--verbose", action="store_true", help="List every route, not just problems")
+    ap.add_argument("--skip-unprivileged", action="store_true",
+                    help="Skip pass 3, which creates and deletes a temporary "
+                         "no-permission account to check that write routes "
+                         "demand the right permission and not merely a login")
     ap.add_argument("--list-unprobed", action="store_true",
                     help="List the routes that were checked anonymously but not with a session")
     args = ap.parse_args()
@@ -309,19 +427,36 @@ def main() -> int:
         for e in errors:
             print(f"  {e}")
 
+    escalations: list[str] = []
+    if not args.skip_unprivileged:
+        escalations, checked = probe_unprivileged(args, routes, agent, unprobed)
+        if escalations:
+            print(f"\n  {len(escalations)} route(s) ran for a session with no "
+                  f"permissions at all.")
+        elif checked:
+            print(f"\n  All {len(checked)} write route(s) refused an "
+                  f"unprivileged session.")
+        unprobed = [u for u in unprobed if u not in set(checked)]
+
     if args.list_unprobed and unprobed:
         print("\nSession-unchecked routes:")
         for u in sorted(unprobed):
             print(f"  {u}")
 
     print(
-        "\nNote on coverage: every route the server answered was called\n"
-        "anonymously and had to refuse. The 'session-unchecked' ones are write\n"
-        "verbs that were not also called WITH a session, because doing so would\n"
-        "dispatch real SOAR actions, drop databases or delete users. Closing\n"
-        "that gap needs an isolated agent and a disposable database, not a wider\n"
-        "allow list here. Run with --list-unprobed to see exactly which routes\n"
-        "those are."
+        "\nNote on coverage. Every route the server answered was called\n"
+        "anonymously and had to refuse (pass 1), and every write verb was also\n"
+        "called by a logged-in session holding no permissions at all (pass 3),\n"
+        "which is refused by the middleware before the handler runs. Together\n"
+        "those show a route demands the RIGHT permission rather than merely a\n"
+        "login - a SOAR dispatch gated on `read_telemetry` passes pass 1 and\n"
+        "fails pass 3.\n"
+        "\n"
+        "What remains open: no write handler is executed by a properly\n"
+        "privileged session, because doing so would dispatch real SOAR\n"
+        "actions, drop databases or delete users. That needs a disposable\n"
+        "database and an agent endpoint that absorbs SOAR calls, not a wider\n"
+        "allow list here. Run with --list-unprobed to see what is left."
     )
 
     if unreachable:
@@ -332,7 +467,7 @@ def main() -> int:
     # Unreachable routes fail the run. A smoke test that cannot reach the
     # server has not produced a green result, and saying otherwise is worse
     # than saying nothing.
-    return 1 if (bypasses or errors or unreachable) else 0
+    return 1 if (bypasses or escalations or errors or unreachable) else 0
 
 
 if __name__ == "__main__":

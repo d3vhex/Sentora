@@ -1,0 +1,37 @@
+title: LD_PRELOAD Or ld.so.preload Used To Hijack A Library
+id: 6c2f9a45-8e13-4d76-b520-9a4c7e1f3b80
+status: experimental
+description: >
+    LD_PRELOAD loads an attacker's shared object into every process that
+    starts afterwards, ahead of libc. Writing /etc/ld.so.preload does the same
+    thing system-wide and persistently. It is the standard way a userland
+    rootkit hides files and processes from ls and ps - which means the tools
+    an operator would use to look are the ones being lied to.
+
+    Almost nothing legitimate writes ld.so.preload. LD_PRELOAD on a single
+    command line is more common - debuggers, sanitisers, some vendor agents -
+    which is why this is high rather than critical.
+references:
+    - https://attack.mitre.org/techniques/T1574/006/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: linux
+detection:
+    cmd_preload_file:
+        CommandLine|contains: 'ld.so.preload'
+    cmd_preload_env:
+        CommandLine|contains: 'LD_PRELOAD'
+    msg_preload_file:
+        Message|contains: 'ld.so.preload'
+    msg_preload_env:
+        Message|contains: 'LD_PRELOAD'
+    condition: 1 of them
+falsepositives:
+    - A debugger, sanitiser or vendor agent that preloads its own library
+level: high
+tags:
+    - attack.persistence
+    - attack.privilege_escalation
+    - attack.defense_evasion
+    - attack.t1574.006

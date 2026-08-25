@@ -1,0 +1,51 @@
+title: Cron Job Installed Outside A Package Manager
+id: 9f4a2c81-6d35-4e70-b189-3c7a5e0d2b46
+status: experimental
+description: >
+    A cron entry runs on a schedule forever, as whoever owns it, and survives
+    reboots and password changes. Writing one directly into /etc/cron.d or a
+    user crontab is both how software schedules itself and how an intruder
+    keeps a foothold - so the location alone is not the signal, and this
+    matches the write rather than the file.
+references:
+    - https://attack.mitre.org/techniques/T1053/003/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: linux
+detection:
+    cmd_cron_path:
+        CommandLine|contains:
+            - '/etc/cron.d/'
+            - '/etc/crontab'
+            - '/var/spool/cron/'
+            - 'crontab -'
+    cmd_writing:
+        CommandLine|contains:
+            - 'echo'
+            - 'tee'
+            - '>>'
+            - 'cp '
+            - 'curl'
+            - 'wget'
+    msg_cron_path:
+        Message|contains:
+            - '/etc/cron.d/'
+            - '/etc/crontab'
+            - '/var/spool/cron/'
+    msg_writing:
+        Message|contains:
+            - 'echo'
+            - 'tee'
+            - '>>'
+            - 'curl'
+            - 'wget'
+    condition: (cmd_cron_path and cmd_writing) or (msg_cron_path and msg_writing)
+falsepositives:
+    - Configuration management writing a cron drop-in on every run
+    - A package install that ships its own cron entry
+level: high
+tags:
+    - attack.persistence
+    - attack.execution
+    - attack.t1053.003

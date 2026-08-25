@@ -10,7 +10,7 @@ addresses.
 
 ## What ships in `builtin/`
 
-A baseline of 15 rules covering 16 ATT&CK techniques. It exists because the
+A baseline of 23 rules covering 23 ATT&CK techniques. It exists because the
 alternative was worse: this directory was empty by design, on the argument
 that a detection nobody reviewed is not an improvement — which is true, and
 which produced zero ATT&CK coverage on every install and a coverage page with
@@ -20,15 +20,22 @@ whose job is detection.
 The baseline is scoped to what the agent actually collects, so every rule can
 fire on a stock install rather than waiting for telemetry nobody enabled:
 
-| Area | Rules |
-| --- | --- |
-| Credential access | LSASS dump, registry hive export |
-| Impact | Shadow copy deletion |
-| Execution | Encoded PowerShell, remote script piped to a shell |
-| Persistence | Scheduled task, service install, local account, Run key, SSH keys |
-| Lateral movement | Service installed from ADMIN$ |
-| Defense evasion | Defender exclusion, audit log cleared, shell history cleared |
-| Privilege escalation | Sudoers modified outside visudo |
+| Area | Windows | Linux |
+| --- | --- | --- |
+| Credential access | LSASS dump, registry hive export | — |
+| Impact | Shadow copy deletion | — |
+| Execution | Encoded PowerShell | Script piped to a shell, reverse shell |
+| Persistence | Scheduled task, service install, local account, Run key | cron, systemd unit, SSH keys, LD_PRELOAD, kernel module |
+| Lateral movement | Service installed from ADMIN$ | — |
+| Defense evasion | Defender exclusion, audit log cleared | Shell history cleared, auditd/SELinux disabled |
+| Privilege escalation | — | Sudoers outside visudo, SUID shell, container escape |
+
+Linux started at four rules against Windows' twelve, which left cron
+persistence, systemd units, LD_PRELOAD, kernel modules and container escape
+entirely blind. Each Linux rule carries **both** a `CommandLine` and a
+`Message` selection: the journal supplies the first, a plain syslog line
+supplies only the second, and a rule written for one path is dead on the
+other.
 
 Measured against the eval corpus in `tests/test_sigma_builtin_rules.py`: **9 of
 10 attacks caught by Sigma alone, 0 of 9 hard negatives falsely flagged.** The
@@ -100,7 +107,15 @@ Both Linux collection paths run Sigma, and they are not equally capable:
 - **systemd journal** carries the process, its command line and the unit as
   real fields, so a rule matching `Image|endswith` behaves as it does on
   Windows. `JOURNAL_FIELDS` maps them.
-- **plain log files** are text. Only `Message`, plus whatever the enricher
-  pulled out (`SourceIp`, `User`), exists — so a rule matching `CommandLine`
-  will not fire there. That is a property of text logs, not a broken rule, and
-  it is pinned by a test so the distinction cannot quietly reverse.
+- **plain log files** are text, but not arbitrary text. sshd, sudo, PAM, cron
+  and auditd each write in a fixed shape, so `SYSLOG_PATTERNS` pulls
+  `TargetUserName`, `IpAddress`, `CommandLine` and `Image` back out of them,
+  plus a synthesised `AuthResult` — Linux has no equivalent of EventID
+  4624/4625, and the correlation rules need something stabler to key on than
+  "does this text contain the word failed".
+
+  Fields the line does not contain stay absent rather than being guessed at. A
+  wrong `Image` is worse than a missing one: it matches rules the event has
+  nothing to do with. The Windows rules, which match named fields only, still
+  cannot fire on a syslog line, and a test pins that so the distinction cannot
+  quietly reverse.

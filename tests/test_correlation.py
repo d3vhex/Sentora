@@ -404,3 +404,190 @@ def test_no_correlator_is_not_an_error():
     module = _extractor()
     assert module.correlated_events(None, {"EventID": "4625"},
                                     module.EventEnricher(), "Security") == []
+
+
+# --------------------------------------------------------------------------
+# Across hosts, which no agent can see
+# --------------------------------------------------------------------------
+
+from core.correlation import FLEET_RULES, fleet_engine  # noqa: E402
+
+
+def agent_4625(user: str, ip: str, host: str) -> dict:
+    """A failed logon as the *server* receives it: one flattened string."""
+    from core.sigma_loader import agent_event_fields
+
+    inserts = ["S-1-0-0", "-", "-", "0x0", "S-1-0-0", user, "CORP",
+               "0xc000006a", "%%2313", "0xc0000064", "3", "NtLmSsp", "NTLM",
+               "WKSTN", "-", "-", "0", "0x0", "-", ip, "51234"]
+    fields = agent_event_fields(
+        "[Microsoft-Windows-Security-Auditing] EID=4625, Cat=12544 | "
+        "Failed Logon | " + " | ".join(inserts))
+    fields["agent"] = host
+    return fields
+
+
+def test_a_spray_walked_across_the_estate_is_caught():
+    """One account, one failure per host, fifty hosts. Nothing on any single
+    machine sees more than one event, so the per-host engine is silent by
+    construction - and this is the more competent attack, because spraying
+    wide and shallow stays under both per-account lockout and per-host
+    thresholds."""
+    engine = fleet_engine()
+    found = []
+    for i in range(6):
+        found += engine.observe(agent_4625("svc_backup", "10.9.9.9", f"host-{i}"),
+                                now=1000.0 + i * 120)
+    # Both fleet rules fire, and both are true: one source touched many hosts,
+    # and one account failed on many hosts. They are the same events read two
+    # ways, and an analyst wants whichever framing matches what they are
+    # already looking at - so neither is suppressed in favour of the other.
+    fired = {d.rule for d in found}
+    assert "fleet_spray" in fired
+    assert "fleet_account_spray" in fired
+    assert next(d for d in found if d.rule == "fleet_spray").severity == "CRITICAL"
+
+
+def test_the_per_host_engine_is_blind_to_it():
+    """The gap that justifies a second engine, demonstrated rather than
+    asserted."""
+    engine = default_engine()
+    found = []
+    for i in range(6):
+        found += engine.observe(agent_4625("svc_backup", "10.9.9.9", f"host-{i}"),
+                                now=1000.0 + i * 120)
+    assert found == []
+
+
+def test_one_account_failing_estate_wide_is_reported_separately():
+    """Grouped by account rather than source. A stale credential pushed to
+    many machines fails from many addresses, and that is a different
+    investigation from one address touching many machines."""
+    engine = CorrelationEngine([r for r in FLEET_RULES
+                                if r.name == "fleet_account_spray"])
+    found = []
+    for i in range(6):
+        found += engine.observe(agent_4625("jdoe", f"10.0.0.{i}", f"host-{i}"),
+                                now=1000.0 + i * 60)
+    assert [d.rule for d in found] == ["fleet_account_spray"]
+
+
+def test_repeated_failures_on_one_host_are_not_a_fleet_event():
+    """Counting attempts instead of hosts would make every local brute force
+    look estate-wide."""
+    engine = fleet_engine()
+    found = []
+    for i in range(40):
+        found += engine.observe(agent_4625(f"u{i}", "10.9.9.9", "host-1"),
+                                now=1000.0 + i)
+    assert found == []
+
+
+def test_the_same_service_installed_estate_wide_is_lateral_movement():
+    from core.sigma_loader import agent_event_fields
+
+    engine = CorrelationEngine([r for r in FLEET_RULES
+                                if r.name == "fleet_service_install"])
+    found = []
+    for i in range(4):
+        fields = agent_event_fields(
+            "[Service Control Manager] EID=7045, Cat=0 | "
+            r"mtHKzQrx | \\10.20.30.41\ADMIN$\x.exe | user mode service | demand start")
+        fields["agent"] = f"host-{i}"
+        found += engine.observe(fields, now=1000.0 + i * 200)
+    assert [d.rule for d in found] == ["fleet_service_install"]
+
+
+def test_the_server_can_rebuild_the_fields_the_agent_had():
+    """The whole approach rests on this. The agent joins StringInserts with
+    ' | '; the server splits them back. It is reversible because it is our own
+    format on both ends - not a guess at somebody else's."""
+    fields = agent_4625("jdoe", "10.20.30.41", "host-1")
+    assert fields["TargetUserName"] == "jdoe"
+    assert fields["IpAddress"] == "10.20.30.41"
+    assert fields["EventID"] == "4625"
+
+
+def test_a_syslog_sourced_event_still_parses_server_side():
+    """Not everything arriving has the Windows envelope."""
+    from core.sigma_loader import agent_event_fields
+
+    fields = agent_event_fields(
+        "Aug 25 03:14:07 web-01 sshd[1]: Failed password for admin "
+        "from 1.2.3.4 port 22 ssh2")
+    assert fields["TargetUserName"] == "admin"
+    assert fields["AuthResult"] == "failure"
+
+
+@pytest.mark.parametrize("rule", FLEET_RULES, ids=lambda r: r.name)
+def test_every_fleet_rule_is_documented_and_tagged(rule):
+    assert rule.techniques, rule.name
+    assert rule.falsepositives, rule.name
+    assert rule.distinct_by is not None, \
+        f"{rule.name} counts events, not hosts - that is the per-host engine's job"
+
+
+def test_the_ingest_path_actually_calls_it():
+    """A rule set nothing feeds is a rule set that never fires."""
+    import pathlib
+    server = (pathlib.Path(__file__).resolve().parent.parent
+              / "server.py").read_text(encoding="utf-8")
+    assert "correlate_across_hosts(agent, table, item, cursor)" in server
+    assert "fleet_engine()" in server
+
+
+def test_correlation_failure_does_not_stop_ingestion():
+    """It runs inside the ingest transaction. Losing correlation costs
+    detections; refusing telemetry costs all of them."""
+    import pathlib
+    server = (pathlib.Path(__file__).resolve().parent.parent
+              / "server.py").read_text(encoding="utf-8")
+    block = server[server.index("def correlate_across_hosts"):]
+    block = block[:block.index("\ndef ")]
+    assert "except Exception" in block
+
+
+# --------------------------------------------------------------------------
+# It has to reach an analyst, not just the database
+# --------------------------------------------------------------------------
+
+def test_correlation_findings_are_published_to_the_ai_queue():
+    """`events_alert` rows normally reach the workers because the ingest loop
+    publishes what it inserts. A row written from *inside* that loop is not an
+    item the loop iterates over, so without an explicit publish a correlation
+    finding lands in the database, shows in the alerts view, and never becomes
+    an AI insight."""
+    import pathlib
+    server = (pathlib.Path(__file__).resolve().parent.parent
+              / "server.py").read_text(encoding="utf-8")
+    assert "for _alert in correlate_across_hosts(" in server
+    assert 'publish_to_ai_queue(agent, "events_alert", _alert)' in server
+
+
+def test_a_correlation_finding_surfaces_without_the_model_agreeing():
+    """The gate asks whether the log contains a criterion's markers. The
+    summary of a fired window - "5 distinct accounts failed from 10.9.9.9" -
+    contains none by construction, so a correlated finding could never pass
+    it.
+
+    Deterministic evidence does not need the model's agreement, the same way a
+    threat-intel match does not. Without this the platform detected a password
+    spray and filed the insight quietly, which reads from the console exactly
+    like not detecting it.
+    """
+    import pathlib
+    worker = (pathlib.Path(__file__).resolve().parent.parent
+              / "ai_worker.py").read_text(encoding="utf-8")
+    assert 'startswith("Correlation/")' in worker
+    assert "surfaces(verdict) or intel_match or correlated" in worker
+
+
+def test_the_source_prefix_the_worker_looks_for_is_the_one_the_server_writes():
+    """Two files, one string. A rename in either would silently stop every
+    correlation finding surfacing, and nothing would fail."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parent.parent
+    server = (root / "server.py").read_text(encoding="utf-8")
+    worker = (root / "ai_worker.py").read_text(encoding="utf-8")
+    assert 'f"Correlation/{found.rule}"' in server
+    assert 'startswith("Correlation/")' in worker

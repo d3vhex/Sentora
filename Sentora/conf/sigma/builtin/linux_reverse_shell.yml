@@ -1,0 +1,46 @@
+title: Reverse Shell Over /dev/tcp Or A Scripted Socket
+id: 4e9c2b71-3a58-4f60-8d14-6b0a7e5c3f92
+status: experimental
+description: >
+    A shell connected back to an attacker-controlled address. The bash
+    /dev/tcp form needs no tools installed at all, which is why it survives on
+    hardened hosts where netcat and python have been removed.
+
+    There is essentially no benign reason for a shell to redirect its own
+    stdin and stdout to a network socket. This is one of the few Linux
+    detections that is genuinely close to unambiguous.
+references:
+    - https://attack.mitre.org/techniques/T1059/004/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: linux
+detection:
+    cmd_devtcp:
+        CommandLine|contains: '/dev/tcp/'
+    cmd_bash_i:
+        CommandLine|contains|all:
+            - 'bash -i'
+            - '>&'
+    cmd_nc_shell:
+        CommandLine|contains|all:
+            - 'nc '
+            - '-e'
+    cmd_python_socket:
+        CommandLine|contains|all:
+            - 'socket'
+            - 'pty.spawn'
+    msg_devtcp:
+        Message|contains: '/dev/tcp/'
+    msg_bash_i:
+        Message|contains|all:
+            - 'bash -i'
+            - '>&'
+    condition: 1 of them
+falsepositives:
+    - A health check written with bash's /dev/tcp, which does happen
+level: critical
+tags:
+    - attack.execution
+    - attack.command_and_control
+    - attack.t1059.004

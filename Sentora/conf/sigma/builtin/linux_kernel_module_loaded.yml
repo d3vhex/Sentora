@@ -1,0 +1,43 @@
+title: Kernel Module Loaded From An Unusual Path
+id: 1a7d3e58-4b96-42c1-9f07-5e8b2c6a4d13
+status: experimental
+description: >
+    A loadable kernel module runs in ring 0. Once one is in, nothing in
+    userland can be trusted to report honestly about the machine - which puts
+    it beyond what this agent can detect afterwards, and is why the load
+    itself is the moment worth catching.
+
+    Modules load constantly on boot and on hardware changes, so the path is
+    what carries the signal: a module from /tmp or a home directory did not
+    come from the distribution.
+references:
+    - https://attack.mitre.org/techniques/T1547/006/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: linux
+detection:
+    cmd_insmod:
+        CommandLine|contains:
+            - 'insmod'
+            - 'modprobe'
+    cmd_odd_path:
+        CommandLine|contains:
+            - '/tmp/'
+            - '/home/'
+            - '/dev/shm/'
+            - '/var/tmp/'
+    msg_insmod:
+        Message|contains: 'insmod'
+    msg_odd_path:
+        Message|contains:
+            - '/tmp/'
+            - '/dev/shm/'
+    condition: (cmd_insmod and cmd_odd_path) or (msg_insmod and msg_odd_path)
+falsepositives:
+    - A driver being built and tested from a working directory
+level: critical
+tags:
+    - attack.persistence
+    - attack.privilege_escalation
+    - attack.t1547.006
