@@ -1,0 +1,52 @@
+title: Audit Or Security Enforcement Disabled
+id: 2f6a8d93-5e14-4b72-9c08-3d7b1a5e6f04
+status: experimental
+description: >
+    Stopping auditd, flushing its rules or putting SELinux into permissive
+    mode all have the same effect: what happens next is not recorded, or not
+    prevented. Like a cleared Windows event log, the reason to alert is less
+    the act than what it implies about the quiet that follows.
+references:
+    - https://attack.mitre.org/techniques/T1562/001/
+    - https://attack.mitre.org/techniques/T1562/006/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: linux
+detection:
+    cmd_auditd:
+        CommandLine|contains|all:
+            - 'auditd'
+            - 'stop'
+    cmd_auditctl:
+        CommandLine|contains|all:
+            - 'auditctl'
+            - '-D'
+    cmd_selinux:
+        CommandLine|contains:
+            - 'setenforce 0'
+            - 'SELINUX=disabled'
+    cmd_apparmor:
+        CommandLine|contains|all:
+            - 'aa-disable'
+            - 'apparmor'
+    cmd_firewall:
+        CommandLine|contains:
+            - 'ufw disable'
+            - 'systemctl stop firewalld'
+            - 'iptables -F'
+    msg_selinux:
+        Message|contains: 'setenforce 0'
+    msg_auditctl:
+        Message|contains|all:
+            - 'auditctl'
+            - '-D'
+    condition: 1 of them
+falsepositives:
+    - Troubleshooting, which is when these are legitimately run and also when
+      an intruder is least likely to be noticed
+level: high
+tags:
+    - attack.defense_evasion
+    - attack.t1562.001
+    - attack.t1562.006

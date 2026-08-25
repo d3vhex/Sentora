@@ -135,13 +135,29 @@ async def handle_automation(agent, table, data, api_key, endpoint, model=None):
 
     intel_match = await asyncio.to_thread(get_threat_intel_summary, log_text)
 
+    # A correlation window that fired is deterministic evidence, the same kind
+    # threat intel is, and neither needs the model's agreement to be worth an
+    # analyst's attention.
+    #
+    # It also cannot get it. The gate asks whether the log contains a
+    # criterion's markers, and the summary of a fired window - "5 distinct
+    # accounts failed from 10.9.9.9" - contains none by construction. Without
+    # this, the platform detected a password spray and filed the insight
+    # quietly, which reads from the console exactly like not detecting it.
+    correlated = str(data.get("source") or "").startswith("Correlation/")
+
     # ai/gating.surfaces, not a copy of the rule: the eval harness scores the
     # same gate, and while they were separate the harness reported 40%
     # escalation recall on runs where production surfaced nothing at all.
-    if surfaces(verdict) or intel_match:
+    if surfaces(verdict) or intel_match or correlated:
         summary_line = render_summary(verdict, "AUTO")
         if intel_match:
             summary_line = f"{summary_line}\n[!!] GLOBAL THREAT INTEL MATCH: {intel_match}"
+        if correlated:
+            # Said explicitly, because the model's own summary describes one
+            # alert row and the finding is about a pattern across the estate.
+            summary_line = (f"{summary_line}\n[!!] CORRELATION: "
+                            f"{data.get('message') or data.get('source')}")
         source_file = f"Realtime_{table}"
         logger.info(f"[!] {verdict.verdict} (Automation) {agent}: {summary_line[:120]}")
     else:

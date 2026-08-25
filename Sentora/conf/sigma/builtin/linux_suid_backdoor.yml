@@ -1,0 +1,44 @@
+title: SUID Bit Set On A Shell Or Interpreter
+id: 7b3e5c28-1d94-4a06-8f57-2c9a6b4d1e73
+status: experimental
+description: >
+    A SUID root shell is the simplest persistent privilege escalation there
+    is: any user who can execute it becomes root, and it survives reboots
+    because it is just a file mode.
+
+    Packages set SUID on a small, well-known set of binaries - passwd, sudo,
+    ping. Setting it on bash, on a copy of bash, or on an interpreter is not
+    something a package does.
+references:
+    - https://attack.mitre.org/techniques/T1548/001/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: linux
+detection:
+    cmd_chmod_suid:
+        CommandLine|contains:
+            - 'chmod u+s'
+            - 'chmod +s'
+            - 'chmod 4755'
+            - 'chmod 4777'
+    cmd_interpreter:
+        CommandLine|contains:
+            - 'bash'
+            - '/bin/sh'
+            - 'python'
+            - 'perl'
+            - 'find'
+            - '/tmp/'
+    msg_chmod_suid:
+        Message|contains:
+            - 'chmod u+s'
+            - 'chmod 4755'
+    condition: (cmd_chmod_suid and cmd_interpreter) or msg_chmod_suid
+falsepositives:
+    - A packaging script setting SUID on its own helper binary
+level: critical
+tags:
+    - attack.privilege_escalation
+    - attack.persistence
+    - attack.t1548.001

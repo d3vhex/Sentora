@@ -58,6 +58,7 @@ const TECHNIQUE_TACTIC: Record<string, string> = {
   T1543: 'persistence', T1112: 'defense-evasion', T1140: 'defense-evasion',
   T1548: 'privilege-escalation', T1098: 'persistence', T1569: 'execution',
   T1497: 'defense-evasion', T1218: 'defense-evasion', T1027: 'defense-evasion',
+  T1574: 'persistence', T1611: 'privilege-escalation',
 };
 
 const tacticOf = (technique: string): string =>

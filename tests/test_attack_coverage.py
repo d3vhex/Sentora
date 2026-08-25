@@ -298,9 +298,16 @@ def test_the_documented_rule_and_technique_counts_are_current():
             assert int(found.group(1)) == sigma_rules, name
             assert int(found.group(2)) == sigma_techniques, name
 
+    # Match the number rather than one phrasing of the sentence around it.
+    # Pinning the exact wording made this fail on a rewrite that had kept the
+    # number correct, which trains people to edit the test instead of reading
+    # it.
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert f"coverage to {total}" in readme, \
-        f"README's total coverage claim is stale; it is now {total}"
+    claimed = {int(n) for n in
+               re.findall(r"(?:total )?coverage[^.\n]*?(\d+)", readme, re.I)}
+    assert claimed, "README makes no total coverage claim at all"
+    assert total in claimed, \
+        f"README's coverage claim {sorted(claimed)} is stale; it is now {total}"
 
 
 def test_correlation_adds_coverage_sigma_cannot_reach():

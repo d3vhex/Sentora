@@ -1,0 +1,49 @@
+title: Container Escape Primitive Used
+id: 8d5b1f36-9c47-4e28-a613-2f7d4a0e9c51
+status: experimental
+description: >
+    Three ways out of a container, all of which look like ordinary
+    administration from inside one:
+
+    Mounting /var/run/docker.sock gives control of the daemon, and the daemon
+    runs as root on the host. `--privileged` and `--pid=host` remove the
+    boundary outright. `nsenter` into PID 1's namespaces is the manual version
+    of the same thing.
+
+    Legitimate uses exist - CI runners, monitoring agents - and they are
+    exactly the shapes an intruder reaches for, which is why this reports
+    rather than assumes.
+references:
+    - https://attack.mitre.org/techniques/T1611/
+author: Sentora
+date: 2026/08/25
+logsource:
+    product: linux
+detection:
+    cmd_socket:
+        CommandLine|contains: 'docker.sock'
+    cmd_privileged:
+        CommandLine|contains|all:
+            - 'docker'
+            - '--privileged'
+    cmd_hostns:
+        CommandLine|contains:
+            - '--pid=host'
+            - '--net=host --privileged'
+    cmd_nsenter:
+        CommandLine|contains|all:
+            - 'nsenter'
+            - '--target 1'
+    msg_socket:
+        Message|contains: 'docker.sock'
+    msg_nsenter:
+        Message|contains|all:
+            - 'nsenter'
+            - '--target 1'
+    condition: 1 of them
+falsepositives:
+    - A CI runner or monitoring agent that legitimately mounts the socket
+level: high
+tags:
+    - attack.privilege_escalation
+    - attack.t1611

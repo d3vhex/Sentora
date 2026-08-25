@@ -394,3 +394,61 @@ def text_event_fields(line: str, source: str = "", ip: str = "",
     elif _AUTH_SUCCESS.search(text):
         fields["AuthResult"] = "success"
     return fields
+
+
+# The agent flattens a Windows event to
+#
+#     [Provider] EID=4625, Cat=12544 | Failed Logon | insert0 | insert1 | ...
+#
+# where the inserts are `' | '.join(StringInserts)` and the human label exists
+# only for the handful of event IDs the agent captions. Everything needed to
+# put the named fields back is therefore present - it is the same positional
+# array, joined.
+_AGENT_ENVELOPE = re.compile(
+    r"^\[(?P<provider>[^\]]*)\]\s*EID=(?P<eid>\d+)(?:,\s*Cat=(?P<cat>\d+))?\s*(?P<rest>.*)$",
+    re.S)
+
+# Captions the agent adds after the EID. They occupy a segment that is not an
+# insert, so they have to be recognised rather than counted.
+_AGENT_CAPTIONS = {
+    "Successful Logon", "Failed Logon", "Logon explicit credentials",
+    "User account created", "User account enabled", "User account disabled",
+    "New Process", "A scheduled task was created", "A service was installed",
+    "The audit log was cleared", "Registry value set",
+}
+
+
+def agent_event_fields(message: str) -> dict:
+    """Named fields from an event as the *server* receives it.
+
+    The agent has the StringInserts and maps them; the server gets one joined
+    string. Correlation across hosts happens here, so the mapping has to be
+    reversible - and it is, because the join is positional and this is our own
+    format on both ends rather than something being guessed at.
+
+    Falls through to the Linux text parsing when the envelope does not match,
+    which is what a syslog-sourced event looks like by the time it arrives.
+    """
+    text = str(message or "")
+    found = _AGENT_ENVELOPE.match(text.strip())
+    if not found:
+        return text_event_fields(text)
+
+    eid = int(found.group("eid"))
+    # Split on the bare pipe and strip, rather than on " | ". The envelope's
+    # first separator loses its leading space to the regex, so splitting on
+    # the padded form left `"| Failed Logon"` as segment zero - the caption
+    # then failed to match, nothing was dropped, and every field landed one
+    # position late. `TargetUserName` came back as a SID.
+    segments = [s.strip() for s in (found.group("rest") or "").split("|")]
+    while segments and (not segments[0] or segments[0] in _AGENT_CAPTIONS):
+        segments.pop(0)
+
+    fields = windows_event_fields(eid, segments, message=text,
+                                  provider=found.group("provider") or "")
+    # A Sysmon event arrives with the provider naming it, not a channel.
+    if SYSMON_CHANNEL in (found.group("provider") or "").lower():
+        fields = windows_event_fields(eid, segments, message=text,
+                                      channel="sysmon",
+                                      provider=found.group("provider") or "")
+    return fields

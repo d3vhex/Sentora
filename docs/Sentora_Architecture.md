@@ -617,9 +617,40 @@ the event that completed it — the fifth failed logon is no more interesting
 than the first, and marking it CRITICAL would show an analyst a routine 4625
 with nothing explaining why.
 
-**It runs on the agent, so correlation is per host.** Five accounts sprayed
-against one machine is caught; one account sprayed across fifty machines,
-once each, is not — nothing on any single host sees more than one event.
+**Two engines, because two vantage points see different attacks.**
+
+`default_engine()` runs on the agent, where an attack against one machine is
+visible in full. It is per host, and that leaves a gap: one account sprayed
+across fifty machines, once each, is invisible to every agent, because none of
+them sees more than one event. That is the *more* competent attack — wide and
+shallow stays under both per-account lockout and per-host thresholds.
+
+`fleet_engine()` runs in `server.py`'s ingest path, where every agent's events
+pass through one process, and counts distinct **hosts** instead of distinct
+accounts. Its windows are wider (30 minutes rather than 5): walking an estate
+takes longer than walking a user list, and being slow is the point of the
+technique.
+
+The server only has the agent's flattened message, so
+`sigma_loader.agent_event_fields` puts the named fields back. That is
+reversible because the flattening is a positional join in our own format on
+both ends — `' | '.join(StringInserts)` — rather than a guess at somebody
+else's.
+
+A fired fleet window is written as an `events_alert` row **and explicitly
+published to the AI queue**. Rows written from inside the ingest loop are not
+items that loop iterates, so without that publish a correlation finding landed
+in the database, appeared in the alerts view, and never became an AI insight.
+
+`ai_worker` surfaces a correlated finding regardless of the model's verdict,
+the same way a threat-intel match does — and it has to, because the gate asks
+whether the log contains a criterion's markers and the summary of a fired
+window contains none by construction.
+
+**Known wart:** a cross-host finding is stored in the database of whichever
+agent's event completed the window, which is arbitrary. It is the right
+finding filed in a slightly wrong place; an analyst looking at a different
+host in that same spray will not see it there.
 
 ### 4.2 Tables Synced From Agent to Server
 
@@ -792,13 +823,29 @@ twice:
 The write list is an allow list on purpose: with a deny list, one missing
 entry is `DELETE /databases/userdb`.
 
+**Pass 3: authenticated with no permissions.** A temporary account holding a
+role with an empty permission set calls every write route and must be refused.
+This closes the half of the gap that can be closed safely: pass 1 proves a
+route refuses an anonymous caller, which does **not** prove the permission it
+demands is the right one — a SOAR dispatch gated on `read_telemetry` passes
+pass 1 exactly like one gated on `manage_soar`. That is privilege escalation
+between roles, and nothing was testing for it.
+
+Safe to run where pass 2 is not, because a 403 comes from the permission
+middleware *before the handler executes* — nothing is dispatched, deleted or
+truncated. Two further guards: the payloads name agents and ids that do not
+exist, so a wrongly-permissive route acts on nothing; and anything answering
+2xx is reported as a bypass and fails the run. The account and role are
+removed in a `finally`, including on early return.
+
 **Known gap.** Roughly 60 write-verb routes — SOAR dispatch, playbook
 execution, agent restart, user deletion, table truncation — are checked
-anonymously but never with a session. Widening the allow list is not the fix.
-Closing it properly needs a disposable database and a fake agent endpoint
-that absorbs SOAR calls, so `block_ip` can be exercised for real without
-touching a machine. The summary output names this gap rather than folding it
-into a count.
+anonymously and, since pass 3, with an unprivileged session — but never with a
+session that *should* succeed. Widening the allow list is not the fix. Closing
+it properly needs a disposable database and a fake agent endpoint that absorbs
+SOAR calls, so `block_ip` can be exercised for real without touching a
+machine. The summary output names what remains rather than folding it into a
+count.
 
 ---
 
