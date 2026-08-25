@@ -168,6 +168,76 @@ def _migrate_automation_status(cursor, db_name: str) -> None:
               f"will retry on the next start")
 
 
+# One engine for the whole fleet, built once. The per-host engine lives in the
+# agent (core.correlation.default_engine); this one only sees shapes that
+# span machines, which no agent can.
+#
+# Optional on purpose: a broken import here must not stop ingestion. Losing
+# correlation costs detections, and refusing to accept telemetry costs all of
+# them.
+try:
+    from core.correlation import fleet_engine
+    from core.sigma_loader import agent_event_fields
+    _FLEET = fleet_engine()
+except Exception as _corr_err:                        # pragma: no cover
+    print(f"[Correlation] disabled: {_corr_err}", flush=True)
+    _FLEET = None
+    agent_event_fields = None
+
+
+def correlate_across_hosts(agent, table, item, cursor):
+    """Feed one stored event to the fleet engine; store whatever fired.
+
+    A fired window becomes an `events_alert` row rather than a label on the
+    event that completed it. It is a finding about the estate, and the fifth
+    failed logon is no more interesting than the first.
+
+    Returns the rows it wrote so the caller can put them through the AI queue.
+    They have to go: `events_alert` normally reaches the workers because the
+    ingest loop publishes what it inserts, and rows written from inside that
+    loop are not items the loop iterates. Without this a correlation finding
+    lands in the database, appears in the alerts view, and never becomes an AI
+    insight - which was the state that made the model look blind to password
+    spray when the platform had in fact detected it.
+
+    Failures are contained: this runs inside the ingest transaction, and a
+    correlation bug must cost a detection rather than the telemetry.
+    """
+    if _FLEET is None or table != "siem_events":
+        return []
+
+    written = []
+    try:
+        fields = agent_event_fields(item.get("message") or "")
+        fields["agent"] = agent
+        for found in _FLEET.observe(fields):
+            # `dup_fp` comes from the detection's own sequence, not a hash of
+            # the text. Two firings of the same window say the same words, so
+            # a content hash would let the existing dedup swallow the second
+            # as a repeat - the opposite of what a spray resuming after its
+            # cooldown should do.
+            row = {
+                "source": f"Correlation/{found.rule}",
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "severity": found.severity,
+                "categories": ",".join(found.techniques),
+                "message": found.summary(),
+                "dup_fp": hashlib.sha256(
+                    f"{found.rule}|{found.group}|{found.seq}".encode()
+                ).hexdigest(),
+            }
+            cursor.execute(
+                "INSERT INTO events_alert "
+                "(source, `timestamp`, severity, categories, message, dup_fp) "
+                "VALUES (%(source)s, %(timestamp)s, %(severity)s, "
+                "%(categories)s, %(message)s, %(dup_fp)s)", row)
+            written.append(row)
+            print(f"[Correlation] {found.title}: {found.detail}", flush=True)
+    except Exception as e:
+        print(f"[Correlation] failed for {agent}/{table}: {e}", flush=True)
+    return written
+
+
 def create_tables_if_not_exist(db_name):
     conn = connect_db(db_name)
     cursor = conn.cursor()
@@ -348,6 +418,10 @@ async def insert_data(agent: str, table: str, data: list, public_ip: str = None,
             values = ', '.join(['%s'] * len(item))
             sql = f"INSERT INTO `{table}` ({keys}) VALUES ({values})"
             cursor.execute(sql, list(item.values()))
+
+            for _alert in correlate_across_hosts(agent, table, item, cursor):
+                _spawn(publish_to_ai_queue(agent, "events_alert", _alert),
+                       label=f"ai-publish {agent}/correlation")
 
             if table in {"siem_events", "events_alert"}:
                 # Gate 1 — severity floor. Cheap, and happens before anything

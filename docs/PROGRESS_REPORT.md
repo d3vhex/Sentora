@@ -5,6 +5,86 @@ made to the Sentora platform, newest first.
 
 ---
 
+## 2026-08 — Cross-host correlation, a Linux ruleset worth having, and a permission check that was never made
+
+### Correlation could not see the more competent attack
+
+The engine was per host. Five accounts sprayed against one machine is caught;
+one account sprayed across fifty machines, once each, is not — no agent sees
+more than one event. That is the *better* attack: wide and shallow stays under
+both per-account lockout and per-host thresholds.
+
+`fleet_engine()` now runs in the ingest path, where every agent's events pass
+through one process, and counts distinct **hosts**. Wider windows (30 minutes,
+not 5), because walking an estate takes longer than walking a user list.
+
+The server only has the agent's flattened message, so `agent_event_fields`
+puts the named fields back. That is reversible because the flattening is a
+positional join in our own format on both ends. It was off by one at first —
+the envelope's first separator loses its leading space to the regex, so
+splitting on `" | "` left `"| Failed Logon"` as segment zero, nothing was
+dropped, and every field landed one position late. `TargetUserName` came back
+as a SID.
+
+### The findings reached the database and stopped there
+
+`events_alert` rows normally reach the AI workers because the ingest loop
+publishes what it inserts. A row written from *inside* that loop is not an
+item the loop iterates, so a correlation finding landed in the database,
+appeared in the alerts view, and never became an AI insight — which reads from
+the console exactly like not detecting it.
+
+It also could never pass the gate: that asks whether the log contains a
+criterion's markers, and the summary of a fired window contains none by
+construction. So a correlated finding now surfaces regardless of the model's
+verdict, the same way a threat-intel match does.
+
+Verified on the live stack, over the real TCP wire: six failed logons from six
+distinct hosts produced `fleet_spray` (CRITICAL, T1110.003) and
+`fleet_account_spray`, an `events_alert` row carrying the technique, and an AI
+insight filed as `Realtime_` with `[!!] CORRELATION:` attached — while the
+model's own verdict was SUSPICIOUS and would not have surfaced.
+
+Re-running produced nothing, which was the second half of the proof: the
+window was in cooldown, firing once rather than once per event.
+
+### Linux detection was a token gesture
+
+Four rules against Windows' twelve. Cron persistence, systemd units,
+LD_PRELOAD, kernel modules, container escape, reverse shells, SUID backdoors
+and audit tampering were all blind.
+
+Twelve Linux rules now, 23 in total covering 23 techniques. Measured: 12 of 12
+attacks fire on both the journal and a plain syslog line, 0 of 12 pieces of
+ordinary administration falsely flagged — and the negatives are the ones that
+took the work, since each sits beside the attack it resembles. `docker ps`
+beside a socket mount, `find / -perm -4000` beside setting SUID, `modprobe`
+from `/lib` beside `insmod` from `/tmp`.
+
+Every Linux rule carries both a `CommandLine` and a `Message` selection. The
+journal supplies the first; a plain syslog line supplies only the second, and
+a rule written for one path is dead on the other.
+
+### Anonymous refusal is not proof of the right permission
+
+The smoke test called every route anonymously and checked it refused. That
+does not show the permission it demands is the correct one: a SOAR dispatch
+gated on `read_telemetry` passes exactly like one gated on `manage_soar`. That
+is privilege escalation between roles, and nothing tested for it.
+
+Pass 3 creates a temporary account holding a role with an empty permission set
+and calls every write route with it. Safe where a privileged probe is not,
+because a 403 comes from the middleware **before the handler executes** —
+nothing is dispatched, deleted or truncated. The payloads name agents and ids
+that do not exist, so a wrongly-permissive route acts on nothing, and anything
+answering 2xx fails the run. The account and role are removed in a `finally`.
+
+What remains open is unchanged and still stated: no write handler is executed
+by a session that should succeed. That needs a disposable database and an
+agent endpoint that absorbs SOAR calls.
+
+---
+
 ## 2026-08 — Correlation, an evidence-based gate, and a backup that was needed the day it was written
 
 ### The gate stopped asking the model how sure it was

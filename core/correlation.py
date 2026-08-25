@@ -35,16 +35,27 @@ evicted first. An unbounded counter keyed by attacker-controlled input - a
 username, a source address - is a memory exhaustion primitive, not a
 detection.
 
-Where this runs, and what it therefore cannot see
--------------------------------------------------
-On the agent, fed the same field dict Sigma gets, because that is where the
-fields are unambiguous - a server-side version would have to re-extract the
-account and the source address from flattened message text.
+Two engines, because two vantage points see different attacks
+-------------------------------------------------------------
+`default_engine()` runs **on the agent**, fed the same field dict Sigma gets.
+That is where the fields are unambiguous, and where an attack against one
+machine is visible in full.
 
-The cost is stated rather than discovered later: correlation is per host. Five
-accounts sprayed against one machine is caught. One account sprayed across
-fifty machines, once each, is not - nothing on any single host sees more than
-one event.
+It is also per host, which leaves a gap: five accounts sprayed against one
+machine is caught, one account sprayed across fifty machines once each is not,
+because no single host sees more than one event. That is the more competent
+attack - spraying wide and shallow is exactly how an intruder stays under both
+per-account lockout and per-host thresholds.
+
+`fleet_engine()` runs **in the ingest path**, where every agent's events pass
+through one process, and counts across distinct hosts instead. Its windows are
+wider: walking an estate takes longer than walking a user list, and being slow
+is the point of the technique.
+
+The server has to reconstruct the named fields from the agent's flattened
+message - `core.sigma_loader.agent_event_fields` does that, and it is
+reversible because the flattening is our own positional join on both ends
+rather than something being guessed at.
 """
 
 from __future__ import annotations
@@ -327,10 +338,110 @@ BUILTIN_RULES: list[CorrelationRule] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Shapes only the server can see
+# ---------------------------------------------------------------------------
+#
+# The rules above run on the agent and are therefore per host: five accounts
+# sprayed against one machine is caught, one account sprayed across fifty
+# machines once each is not, because no single host sees more than one event.
+#
+# That is the more competent attack. Spraying wide and shallow is precisely
+# how an intruder stays under per-account lockout *and* under per-host
+# thresholds, and it was invisible.
+#
+# These run in the ingest path, where every agent's events pass through one
+# process. `agent` is added to the event there, so the count is over distinct
+# hosts rather than distinct accounts.
+
+def _host(event: dict) -> str:
+    return str(event.get("agent") or event.get("Computer") or "")
+
+
+FLEET_RULES: list[CorrelationRule] = [
+    CorrelationRule(
+        name="fleet_spray",
+        title="Authentication Failures Across Many Hosts From One Source",
+        severity="CRITICAL",
+        techniques=("T1110.003",),
+        # Wider window than the per-host rule. Walking an estate takes longer
+        # than walking a user list on one machine, and the whole point of the
+        # technique is to be slow enough that nothing local notices.
+        window_s=1800,
+        threshold=5,
+        matches=_is_failed_logon,
+        group_by=lambda e: _get(e, "IpAddress", "SourceIp"),
+        distinct_by=_host,
+        detail="{count} distinct hosts saw failures from {group}",
+        falsepositives=(
+            "A service account with a stale password, configured on many "
+            "hosts, which fails on all of them at once after a rotation",
+        ),
+    ),
+    CorrelationRule(
+        name="fleet_account_spray",
+        title="One Account Failing Across Many Hosts",
+        severity="HIGH",
+        techniques=("T1110.003", "T1078"),
+        window_s=1800,
+        threshold=5,
+        matches=_is_failed_logon,
+        group_by=lambda e: _get(e, "TargetUserName", "User").lower(),
+        distinct_by=_host,
+        detail="{group} failed on {count} distinct hosts",
+        falsepositives=(
+            "A domain account whose password changed, retried by a client on "
+            "every machine the user is logged into",
+        ),
+    ),
+    CorrelationRule(
+        name="fleet_service_install",
+        title="The Same Service Installed Across Many Hosts",
+        severity="CRITICAL",
+        techniques=("T1021.002", "T1543.003"),
+        # Lateral movement tooling installs a service per host it reaches, so
+        # the same service name appearing across the estate in half an hour is
+        # either a deployment or somebody walking it.
+        window_s=1800,
+        threshold=3,
+        matches=lambda e: _eid(e) == "7045",
+        group_by=lambda e: _get(e, "ServiceName").lower(),
+        distinct_by=_host,
+        detail="{group} installed on {count} distinct hosts",
+        falsepositives=("A software deployment window",),
+    ),
+    CorrelationRule(
+        name="fleet_account_creation",
+        title="Accounts Created Across Many Hosts",
+        severity="HIGH",
+        techniques=("T1136.001",),
+        window_s=3600,
+        threshold=3,
+        matches=lambda e: _eid(e) == "4720",
+        group_by=lambda e: _get(e, "TargetUserName").lower(),
+        distinct_by=_host,
+        detail="{group} created on {count} distinct hosts",
+        falsepositives=("Provisioning a local service account estate-wide",),
+    ),
+]
+
+
 def default_engine(max_groups: int = 2048) -> CorrelationEngine:
+    """The per-host engine, for the agent."""
     return CorrelationEngine(BUILTIN_RULES, max_groups=max_groups)
+
+
+def fleet_engine(max_groups: int = 8192) -> CorrelationEngine:
+    """The cross-host engine, for the ingest path.
+
+    A larger group cap than the agent's: this one is keyed by source address
+    and account across the whole estate rather than one machine, so the
+    cardinality is genuinely higher. Still bounded - the key is still
+    attacker-supplied.
+    """
+    return CorrelationEngine(FLEET_RULES, max_groups=max_groups)
 
 
 def techniques_covered() -> set[str]:
     """For the ATT&CK coverage page, which reads Sigma's tags the same way."""
-    return {t for r in BUILTIN_RULES for t in r.techniques}
+    return {t for r in BUILTIN_RULES + FLEET_RULES for t in r.techniques}

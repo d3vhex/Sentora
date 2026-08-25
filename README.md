@@ -23,7 +23,7 @@ phone-home. If you want a smarter model and have the RAM, swap it in `.env`.
 - **Collects telemetry** from Windows and Linux agents over a single TCP
   channel. SIEM events, alerts, FIM, packages, network connections,
   open ports, Docker activity, screen frames.
-- **Detects with Sigma rules, on the endpoint.** 15 rules covering 16 MITRE
+- **Detects with Sigma rules, on the endpoint.** 23 rules covering 23 MITRE
   ATT&CK techniques ship in `conf/sigma/builtin/`; drop community rulesets in
   beside them. Sigma matches *named fields* rather than text, so
   `Image|endswith: '\vssadmin.exe'` cannot be defeated by the word "vssadmin"
@@ -33,17 +33,23 @@ phone-home. If you want a smarter model and have the RAM, swap it in `.env`.
   wrapper. Measured on the eval corpus: 9 of 10 attacks caught by Sigma alone,
   0 of 9 hard negatives falsely flagged. This layer is deterministic and keeps
   working when the model is unavailable.
-- **Correlates across events**, which no per-event rule can do. A single
-  failed logon is routine; five accounts failing from one source in forty
-  seconds is a password spray, and looking at any one of those five events
-  will never tell you that. Covers spray, brute force, a success arriving
-  after repeated failures, bursts of account creation and service installs —
-  on both platforms, from Windows event IDs or from parsed `auth.log` lines.
-  Adds the three T1110 brute-force techniques no per-event rule can express,
-  taking total coverage to 19. Fires once per window rather than once per
-  event, and every counter is bounded, because a counter keyed on an
-  attacker-supplied username is a memory exhaustion primitive rather than a
-  detection.
+- **Correlates across events**, which no per-event rule can do. A single failed
+  logon is routine; five accounts failing from one source in forty seconds is a
+  password spray, and looking at any one of those five events will never tell
+  you that. Covers spray, brute force, a success arriving after repeated
+  failures, and bursts of account creation or service installs — on both
+  platforms, from Windows event IDs or from parsed `auth.log` lines.
+
+  Runs at **two vantage points**, because they see different attacks. Per host
+  on the agent, where an attack against one machine is visible in full. And
+  across hosts in the ingest path, where a spray walked one failure at a time
+  over fifty machines shows up — no single agent sees more than one event, and
+  that is the more competent attack, since spraying wide and shallow stays
+  under both per-account lockout and per-host thresholds.
+
+  Total coverage with Sigma: 27 techniques. Every window fires once rather than
+  once per event, and every counter is bounded — a counter keyed on an
+  attacker-supplied username is a memory exhaustion primitive, not a detection.
 - **Maps detections to MITRE ATT&CK, from the rules themselves.** Rules carry
   `tags: attack.t1490`, so there is no hand-kept mapping table to go stale. The
   coverage page separates three states a single "coverage %" would hide:
