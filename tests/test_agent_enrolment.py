@@ -120,3 +120,48 @@ def test_the_upgrade_path_marks_the_token_used():
     upgrade = REGISTER[REGISTER.index("agent_key=%s"):]
     assert "UPDATE enrollment_tokens" in upgrade
     assert "used_by_agent" in upgrade, "column is used_by_agent, not used_by"
+
+
+# --------------------------------------------------------------------------
+# The identity that outlived the server's database
+# --------------------------------------------------------------------------
+
+def test_the_upgrade_path_uses_the_key_the_server_returns():
+    """A host can hold a valid-looking `agent_key` the server has never seen -
+    the database was restored, rebuilt, or lost.
+
+    `/api/agents/register` handles that deliberately: it does not fail, it
+    enrols the host afresh and returns a NEW key. The installer's upgrade
+    branch used to pipe that reply to Out-Null and keep downloading with the
+    credential the server had just told it was dead. The result was a bare
+    `403 Forbidden` on the binary download with nothing explaining why, on a
+    machine whose `config.json` looked perfectly healthy.
+    """
+    assert "| Out-Null" not in SCRIPT or "$UpResp = Invoke-RestMethod" in SCRIPT
+    assert "$UpResp = Invoke-RestMethod" in SCRIPT
+    assert "$UpResp.agent_key -ne $AgentKey" in SCRIPT
+    assert "$AgentKey  = $UpResp.agent_key" in SCRIPT
+
+
+def test_the_re_enrolment_is_announced():
+    """Silently swapping the identity would leave an operator reading
+    "Identity kept" while the opposite happened."""
+    assert "Server did not recognise the stored key" in SCRIPT
+
+
+def test_the_download_uses_whatever_key_the_script_ended_up_with():
+    """Both branches converge on $AgentKey, so the fix above is enough - if
+    the download hard-coded the config value instead, updating $AgentKey would
+    change nothing."""
+    download = SCRIPT[SCRIPT.index("Downloading agent binary"):]
+    download = download[:download.index("Write-Host") + 400]
+    assert '"X-Agent-Key" = $AgentKey' in download
+
+
+def test_the_server_re_enrols_rather_than_refusing_an_unknown_key():
+    """The other half. If the server rejected an unrecognised key, no
+    installer change could recover the host."""
+    import pathlib
+    app = (pathlib.Path(__file__).resolve().parent.parent
+           / "app.py").read_text(encoding="utf-8")
+    assert "fall" in app and "enrol as a new agent" in app
