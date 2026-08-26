@@ -152,6 +152,16 @@ services:
         condition: service_completed_successfully
     ports:
       - "5001:5001"
+    volumes:
+      # Read-only, and required. The agent encrypts `message` before sending;
+      # this key is what turns it back into a log. Without it the worker
+      # serialises `enc::gAAAA...` into the prompt and the model answers
+      # anyway - which is how ciphertext went to the model unnoticed.
+      #
+      # `app` owns the volume and creates the key on first boot. Mounting it
+      # read-only here means a container that starts before that cannot
+      # quietly generate a different one and decrypt nothing.
+      - sentora_data:/app/data:ro
 
   rabbitmq:
     image: rabbitmq:3-management
@@ -186,6 +196,17 @@ services:
       ollama-init:
         condition: service_completed_successfully
 
+    volumes:
+      # Read-only, and required. The agent encrypts `message` before sending;
+      # this key is what turns it back into a log. Without it the worker
+      # serialises `enc::gAAAA...` into the prompt and the model answers
+      # anyway - which is how ciphertext went to the model unnoticed.
+      #
+      # `app` owns the volume and creates the key on first boot. Mounting it
+      # read-only here means a container that starts before that cannot
+      # quietly generate a different one and decrypt nothing.
+      - sentora_data:/app/data:ro
+
   ai-worker-manual:
     build: .
     container_name: sentora-ai-worker-manual
@@ -207,6 +228,17 @@ services:
         condition: service_started
       ollama-init:
         condition: service_completed_successfully
+
+    volumes:
+      # Read-only, and required. The agent encrypts `message` before sending;
+      # this key is what turns it back into a log. Without it the worker
+      # serialises `enc::gAAAA...` into the prompt and the model answers
+      # anyway - which is how ciphertext went to the model unnoticed.
+      #
+      # `app` owns the volume and creates the key on first boot. Mounting it
+      # read-only here means a container that starts before that cannot
+      # quietly generate a different one and decrypt nothing.
+      - sentora_data:/app/data:ro
 
   ai-worker-defensive:
     build: .
@@ -234,6 +266,17 @@ services:
         condition: service_started
       ollama-init:
         condition: service_completed_successfully
+
+    volumes:
+      # Read-only, and required. The agent encrypts `message` before sending;
+      # this key is what turns it back into a log. Without it the worker
+      # serialises `enc::gAAAA...` into the prompt and the model answers
+      # anyway - which is how ciphertext went to the model unnoticed.
+      #
+      # `app` owns the volume and creates the key on first boot. Mounting it
+      # read-only here means a container that starts before that cannot
+      # quietly generate a different one and decrypt nothing.
+      - sentora_data:/app/data:ro
 
   opensearch:
     image: opensearchproject/opensearch:2.12.0
