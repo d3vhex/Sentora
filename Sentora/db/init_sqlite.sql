@@ -77,7 +77,7 @@ CREATE INDEX IF NOT EXISTS idx_pk_dup  ON packages (dup_fp);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_pk_dup_not_null
   ON packages (dup_fp) WHERE dup_fp IS NOT NULL;
 
--- ========== vulnerabilities_report (PG sürüm) ==========
+-- ========== vulnerabilities_report (PostgreSQL variant) ==========
 CREATE TABLE IF NOT EXISTS vulnerabilities_report (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     package_name     TEXT,
@@ -177,7 +177,7 @@ CREATE TABLE IF NOT EXISTS automations (
 );
 
 -- =============================================================================
--- YENİ EDR & ENVANTER TABLOLARI
+-- EDR AND INVENTORY TABLES
 -- =============================================================================
 
 -- FIM Baselines & Changes

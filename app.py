@@ -261,10 +261,7 @@ def _is_valid_username(u: str) -> bool:
 async def _insert_soar_action_row(agent: str, *, event_id: int, action: str,
                                   target: str, comment: str, status: str,
                                   expires_at: str | None):
-    """
-    sofar_actions tablosuna doğrudan insert (agent DB).
-    Kolonlar: id, timestamp, event_id, action, target, comment, status, resolved_at, expires_at, sent?
-    """
+    """Insert straight into the agent database's soar_actions table."""
     cnx = await connect_db_for_agent(agent)
     cur = await cnx.cursor()
     await cur.execute(
@@ -300,11 +297,11 @@ async def _execute_automation_record(agent: str, rec: dict) -> dict:
     Execute an automation record: send the SOAR request to the agent.
     
     Args:
-        agent: Agent adı
-        rec: automations tablosundan gelen kayıt (dict)
+        agent: the agent's name
+        rec: one row from the automations table
         
     Returns:
-        Execution sonucu detayları
+        What the execution produced.
     """
     action = rec["action"].strip()
     target = rec["target"].strip()
@@ -2397,9 +2394,10 @@ async def stream_from_db_dec(table: str, agent: str,
                              encrypted_fields: list = None,
                              limit: int = 1000,
                              rename_map: dict = None):
-    """
-    - connect_db_for_agent: senin mevcut helper'ını kullanır (aynı imza).
-    - encrypted_fields: o tablonun şifrelenen sütunlarının isim listesi, örn: ["message","path"]
+    """Stream a table out of an agent database, decrypting as it goes.
+
+    `encrypted_fields` names that table's encrypted columns, e.g.
+    `["message", "path"]`.
     """
     try:
         key_b64 = getattr(app.ctx, "fernet_key", None)
@@ -7282,11 +7280,11 @@ def _try_agent_request(method: str, url: str, keys: list, json_body=None, timeou
 
 
 async def _get_agent_http_base(agent: str) -> str:
-    """
-    Return the agent's HTTP base URL.
-    - resolve the IP from that agent's kendi DB'sindeki agent_info tablosundan çeker.
-    - IP yoksa veya bozuksa 127.0.0.1'e düşer.
-    - Port env'den AGENT_PORT ile override edilebilir (default 9099).
+    """The agent's HTTP base URL.
+
+    The address comes from that agent's own `agent_info` row. A missing or
+    malformed one falls back to 127.0.0.1, and AGENT_PORT overrides the port
+    (default 9099).
     """
     host = "127.0.0.1"
 
@@ -7376,9 +7374,12 @@ async def call_agent_soar(
     ttl: int | None = None,
     background_queue: bool = True
 ) -> dict:
-    """
-    Server → Agent /soar/execute çağrısı.
-    background_queue=True (default) ise, ajan direkt push'u kaçırsa bile polling ile alsın diye DB'ye yazar.
+    """Call the agent's /soar/execute.
+
+    With `background_queue` (the default) the action is also written to the
+    database, so an agent that missed the direct push still picks it up when
+    it next polls - which is what makes this survive a restart or a dropped
+    connection.
     """
     target = _shape_soar_target(action, target)
 
@@ -7494,7 +7495,11 @@ async def ensure_playbooks_table(agent: str):
 
 
 def _parse_json_field(val):
-    """DB'den gelen nodes/connections alanını dict/list'e çevir (string ise)."""
+    """Turn a nodes/connections column back into a dict or list.
+
+    Stored as JSON text, and returned as text by some drivers and already
+    parsed by others.
+    """
     if isinstance(val, (dict, list)):
         return val
     try:
@@ -7508,7 +7513,8 @@ def _parse_json_field(val):
 async def list_playbooks(request, agent):
     """
     Frontend: to populate the list. 
-    Nodes and connections are now da dönüyor ki edit açıldığında kaybolmasın.
+    Nodes and connections are returned too, so opening the editor does not
+    lose them.
     """
     try:
         await ensure_playbooks_table(agent)
@@ -7727,7 +7733,7 @@ async def get_node_palette(request):
 
 @app.get("/playbooks/examples")
 async def get_playbook_examples(request):
-    """UI'ya birkaç hazır örnek verelim."""
+    """A few ready-made playbooks, so the editor is not empty on first use."""
     examples = [
         {
             "name": "Critical Alert → Block IP → Email",
@@ -8243,7 +8249,7 @@ async def delete_playbook_run(request, agent, run_id):
 @app.get("/<agent>/playbooks/runs/<run_id:int>/download")
 async def download_playbook_run(request, agent, run_id):
     """
-    Run detayını JSON dosyası olarak indir.
+    Download one run's detail as a JSON file.
     """
     await _ensure_playbook_runs_table(agent)
     cnx = await connect_db_for_agent(agent)

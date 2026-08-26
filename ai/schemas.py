@@ -91,27 +91,19 @@ class TriageVerdict(_Base):
 
     # `observed` before `summary`, and both before the verdict.
     #
-    # "Describe before judging" was not enough on its own. The model dutifully
-    # filled `summary` first and filled it with the prompt's own criterion
-    # text - "LSASS memory read, mimikatz, SAM/SYSTEM/NTDS hive copied or
-    # exported" - on an EID 4672 SYSTEM logon, then rated it CRITICAL at
-    # confidence 1.00 and recommended isolating the host.
+    # "Describe before judging" was not enough alone: the model filled
+    # `summary` with the prompt's own criterion text on an EID 4672 SYSTEM
+    # logon, then rated it CRITICAL at 1.00. `observed` is constrained to
+    # values copied out of the log, so the field it fills first cannot be a
+    # technique it recognised in the prompt.
     #
-    # It had described something. It had not described the event. `observed`
-    # is constrained to values copied out of the log, so the field it fills
-    # first cannot be a technique it has recognised in the prompt.
+    # That left a calibration problem. On "vssadmin.exe delete shadows /all
+    # /quiet" it still answered SUSPICIOUS / MEDIUM / 0.5 - not failing to
+    # understand, declining to use the top of the scale.
     #
-    # That fixed the wrong-content problem and left a calibration one. Given
-    # an event it had summarised correctly as "vssadmin.exe delete shadows
-    # /all /quiet", the model still answered SUSPICIOUS / MEDIUM / 0.5, and a
-    # cleared audit log came back SUSPICIOUS / INFO. It was not failing to
-    # understand; it was declining to use the top of a three-point scale,
-    # which is what a 3B model does when asked to choose a label.
-    #
-    # `matched_criterion` turns that judgement into a lookup: name the
-    # criterion the observed text matches, or "none". Naming one determines
-    # the verdict, so the model is not being asked how bad something is - it
-    # is being asked whether a string is in a list.
+    # `matched_criterion` turns the judgement into a lookup: name the
+    # criterion the observed text matches, or "none". The model is not asked
+    # how bad something is, but whether a string is in a list.
     observed: str = Field(default="", description=(
         "The ACTION the log records, copied from it: the full command line if "
         "there is one, otherwise the object acted on. Not the event ID alone, "
@@ -217,19 +209,15 @@ SCHEMAS: dict[str, type[_Base]] = {
 #    "severity": "CRITICAL", "indicator": "NOT_INDOMINANT",
 #    "confidence": 0.0, "recommended_action": "NOT_RECOMMENDED"}
 #
-# The model pattern-matched "answer NOT_something" into every field, coining
-# "NOT_INDOMINANT" on the way. Every value is schema-valid. The verdict is
-# still nonsense, and because `severity` happened to land on CRITICAL it
-# surfaced anywhere the console filters on severity.
+# Every value is schema-valid, and because `severity` landed on CRITICAL it
+# surfaced wherever the console filters on severity.
 #
-# Rewriting severity to agree with the verdict would be worse: that invents an
-# answer the model did not give, which is the habit `_lazy()` was removed for.
-# Instead this reports the contradiction, and the caller records an honest
-# INSUFFICIENT_DATA row.
+# Rewriting severity to agree would invent an answer the model did not give -
+# the habit `_lazy()` was removed for - so this reports the contradiction and
+# the caller records an INSUFFICIENT_DATA row.
 #
-# Deliberately narrow. Only a flat contradiction between two fields counts.
-# Low confidence on its own is a weak verdict, not an incoherent one, and
-# discarding those would throw away the model's genuine uncertainty.
+# Narrow on purpose: only a flat contradiction between two fields counts. Low
+# confidence is a weak verdict, not an incoherent one.
 
 _ESCALATED = ("CRITICAL", "HIGH")
 

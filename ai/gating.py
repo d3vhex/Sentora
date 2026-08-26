@@ -14,42 +14,26 @@ it.
 
 Confidence is not consulted, and that is the whole design
 ---------------------------------------------------------
-The gate used to be a confidence threshold. Two rounds of measurement took it
-apart:
+Measured twice. Six CRITICAL verdicts were held at 0.50 - an LSASS dump, a SAM
+hive export, shadow copies deleted - while every benign case also came back at
+0.50. Moving the threshold changes nothing between 0.60 and 0.90, because the
+model emits 0.50 or 0.90 and almost nothing between.
 
-    Six CRITICAL verdicts were held at 0.50 - an LSASS dump, a SAM hive
-    export, shadow copies being deleted - and a seventh at 0.00. Every benign
-    case also came back at 0.50.
+Then over 29 cases: every attack that surfaced already had a verified
+criterion, and both false alarms that reached an analyst got there on
+confidence alone - SUSPICIOUS / CRITICAL / 0.80 on two
+Docker container lifecycle events, this platform restarting its own
+containers.
 
-    Moving the threshold changes nothing between 0.60 and 0.90, because the
-    model emits 0.50 or 0.90 and almost nothing in between.
+So the gate asks one question: does the log contain the evidence?
+`AI_CRIT_CONF` / `AI_SUS_CONF` are read only to warn that they no longer
+apply.
 
-Then, over 29 cases including ten real events:
-
-    Every one of the nine attacks that surfaced had a verified criterion.
-    The confidence path contributed no detection that evidence did not
-    already carry.
-
-    Both false alarms that reached an analyst got there on confidence alone -
-    SUSPICIOUS / CRITICAL / 0.80 on two Docker container lifecycle events,
-    this platform restarting its own containers.
-
-So the number was admitting noise and catching nothing. The gate now asks one
-question: does the log contain the evidence? `ai/criteria` answers it by
-looking, not by judging, and `AI_CRIT_CONF` / `AI_SUS_CONF` are read only to
-warn that they no longer do anything.
-
-On SUSPICIOUS
--------------
-The model's SUSPICIOUS label scored precision 0.00 and recall 0.00 on that
-corpus - it never applied it to a case that deserved it, and never withheld it
-from one that did not. It can use the top of the scale and not the middle.
-
-`criteria.apply` promotes a supported criterion to CRITICAL, so in practice a
-SUSPICIOUS verdict never carries verified evidence and never surfaces. That is
-deliberate rather than incidental: the middle of the scale is real, and it
-comes from the layers that can be checked - a Sigma rule at MEDIUM, or a
-correlation window - not from asking a 3B model to feel uncertain.
+On SUSPICIOUS: the model's label scored precision 0.00 and recall 0.00 on that
+corpus. It uses the top of the scale and not the middle. Since `criteria.apply`
+promotes a supported criterion to CRITICAL, a SUSPICIOUS verdict never carries
+verified evidence and never surfaces - the middle of the scale comes from
+layers that can be checked, not from asking a 3B model to feel uncertain.
 """
 
 from __future__ import annotations
@@ -59,9 +43,8 @@ import os
 
 ESCALATING_SEVERITIES = ("CRITICAL", "HIGH")
 
-# Read, compared, and otherwise unused. Silently ignoring configuration
-# somebody deliberately set is its own bug class, so a non-default value says
-# so once at import rather than behaving as though it had been applied.
+# Read and otherwise unused. Silently ignoring configuration somebody set is
+# its own bug class, so a non-default value says so once at import.
 CRITICAL_CONFIDENCE = float(os.getenv("AI_CRIT_CONF", "0.6"))
 SUSPICIOUS_CONFIDENCE = float(os.getenv("AI_SUS_CONF", "0.75"))
 
@@ -89,8 +72,7 @@ def surfaces(verdict) -> bool:
         return False
     if severity not in ESCALATING_SEVERITIES:
         # A criterion match raises severity to at least HIGH, so anything
-        # lower means something overrode it and the verdict disagrees with
-        # itself.
+        # lower means the verdict disagrees with itself.
         return False
     return criterion_verified(verdict)
 
