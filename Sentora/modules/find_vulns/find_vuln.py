@@ -35,9 +35,9 @@ def is_duplicate(pkg_name: str, pkg_version: str, vuln_id: str) -> bool:
     return bool(rows)
 
 def normalize_debianish_version(ver: str) -> Tuple[str, str]:
-    """
-    Ubuntu/Debian türevi sürümleri OSV-Debian ile uyumlu hale getir.
-    Dönen: (normalized, upstream_only)
+    """Reshape an Ubuntu/Debian version into what OSV-Debian expects.
+
+    Returns `(normalized, upstream_only)`.
     """
     if not ver:
         return ver, ver
@@ -86,7 +86,7 @@ def _chunked(seq, size):
 def osv_query_batch(queries: List[dict]) -> List[dict]:
     """
     queries: [{"package":{"name":..., "ecosystem":...}, "version":"..."}]
-    return:  [{"vulns":[...]} ...] (giriş sırasına hizalı)
+    return:  [{"vulns":[...]} ...], aligned with the input order
     """
     results: List[dict] = []
     for chunk in _chunked(queries, BATCH_SIZE):
@@ -108,7 +108,7 @@ def osv_query_batch(queries: List[dict]) -> List[dict]:
 def build_dpkg_source_map() -> Dict[str, Tuple[str, str]]:
     """
     binary -> (source_or_binary, version)
-    ${source:Package} boş ise binary ile aynı olur.
+    An empty ${source:Package} means the source name equals the binary one.
     """
     fmt = "${Package}\t${source:Package}\t${Version}\n"
     try:
@@ -130,8 +130,7 @@ def build_dpkg_source_map() -> Dict[str, Tuple[str, str]]:
         return {}
 
 def to_query_triplets(pkg_rows: List[dict], ecosystem: str, src_map: Dict[str, Tuple[str, str]]) -> List[Tuple[str, str, str, str, str]]:
-    """
-    Her paket için üçlüler oluştur:
+    """One tuple per package:
     (bin_name, installed_ver, query_name, norm_ver, upstream_ver)
     """
     triples = []
@@ -149,12 +148,13 @@ def to_query_triplets(pkg_rows: List[dict], ecosystem: str, src_map: Dict[str, T
     return triples
 
 def batch_lookup_with_fallback(triples: List[Tuple[str, str, str, str, str]], ecosystem: str) -> Dict[Tuple[str, str], List[dict]]:
-    """
-    3 aşamalı toplu tarama:
-      1) source+normalized
-      2) source+upstream-only (norm != upstream ise)
-      3) binary+normalized (source=binary olasılığı)
-    Dönen: {(bin_name, installed_ver): [vuln_dict, ...]}
+    """Batch lookup in three passes, each catching what the last missed:
+
+      1) source + normalized
+      2) source + upstream-only, when those differ
+      3) binary + normalized, for packages whose source name is the binary
+
+    Returns `{(bin_name, installed_ver): [vuln_dict, ...]}`.
     """
     result_map: Dict[Tuple[str, str], List[dict]] = { (b,v): [] for (b,v,_,_,_) in triples }
 

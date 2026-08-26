@@ -1,61 +1,30 @@
 """Detections that are a shape across events rather than a property of one.
 
-A single failed logon is routine. Five accounts failing against one source in
-forty seconds is a password spray, and no amount of looking at any one of
-those five events will tell you that. Sigma matches a rule against an event
-dict, `conf/rules.yaml` matches a regex against a line, and neither can express
-"count distinct users where the source is the same, within a window".
+Sigma matches a rule against one event dict and `conf/rules.yaml` matches a
+regex against one line. Neither can express "count distinct users where the
+source is the same, within a window" - so password spray, brute force and
+beaconing were not missed by a rule, they had no rule that could exist.
 
-That is not a gap in one rule. It is a whole class the platform could not see:
-password spray, brute force, beaconing, and volume-based exfiltration are all
-shapes over time.
+Not Sigma's own `correlation:` spec: it needs a stateful engine buffering
+events per rule and resolving references between them, which is a lot of
+machinery on something running on every endpoint, for a handful of shapes.
 
-Why not Sigma correlation rules
--------------------------------
-The 2024 Sigma spec added `correlation:` with `event_count` and `value_count`.
-Supporting it would mean a rule engine that holds state, buffers events per
-rule, and resolves references between rules - a large amount of machinery for
-the four shapes actually needed here, on a component that runs on every
-endpoint. The shapes are few and specific, so they are written directly.
+Three properties are load-bearing:
 
-Firing once, not once per event
--------------------------------
-The failure mode that matters is not missing a spray, it is reporting it
-sixty times. Once a window has fired, the same group is silent for
-`cooldown_s`, and this is the same bug class that had the defensive sweep
-re-queueing 4,919 duplicate alerts: a condition that stays true keeps
-producing work unless something says "already told you".
+**Fires once per window.** A condition that stays true keeps producing work
+unless something says "already told you" - the bug class that had the
+defensive sweep re-queueing 4,919 duplicate alerts.
 
-Bounded memory
---------------
-This runs in the agent, for as long as the agent runs. Every structure here is
-capped: timestamps older than the window are dropped on each observation, and
-the number of tracked groups has a hard ceiling with the least recently seen
-evicted first. An unbounded counter keyed by attacker-controlled input - a
-username, a source address - is a memory exhaustion primitive, not a
-detection.
+**Bounded memory.** Group keys are attacker-supplied usernames and source
+addresses; an unbounded counter on those is a memory exhaustion primitive.
 
-Two engines, because two vantage points see different attacks
--------------------------------------------------------------
-`default_engine()` runs **on the agent**, fed the same field dict Sigma gets.
-That is where the fields are unambiguous, and where an attack against one
-machine is visible in full.
-
-It is also per host, which leaves a gap: five accounts sprayed against one
-machine is caught, one account sprayed across fifty machines once each is not,
-because no single host sees more than one event. That is the more competent
-attack - spraying wide and shallow is exactly how an intruder stays under both
-per-account lockout and per-host thresholds.
-
-`fleet_engine()` runs **in the ingest path**, where every agent's events pass
-through one process, and counts across distinct hosts instead. Its windows are
-wider: walking an estate takes longer than walking a user list, and being slow
-is the point of the technique.
-
-The server has to reconstruct the named fields from the agent's flattened
-message - `core.sigma_loader.agent_event_fields` does that, and it is
-reversible because the flattening is our own positional join on both ends
-rather than something being guessed at.
+**Two engines, because two vantage points see different attacks.**
+`default_engine()` runs on the agent, where an attack against one machine is
+visible in full - and is per host, so one account sprayed across fifty
+machines once each is invisible to all of them. That is the more competent
+attack. `fleet_engine()` runs in the ingest path and counts distinct hosts,
+with wider windows because walking an estate is slower than walking a user
+list. It reconstructs named fields via `sigma_loader.agent_event_fields`.
 """
 
 from __future__ import annotations
@@ -80,10 +49,9 @@ class Detection:
     detail: str = ""
     fired_at: float = 0.0
     # Distinguishes two firings of the same window, which say the same words.
-    # A wall-clock timestamp is not enough: it is written at second
-    # resolution downstream, and two detections inside one second then look
-    # identical to a dedup filter that keys on text - so the second is
-    # silently dropped as a repeat of the first.
+    # A timestamp cannot: it is written at second resolution downstream, so
+    # two detections inside one second look identical to a dedup filter that
+    # keys on text.
     seq: int = 0
 
     def summary(self) -> str:
@@ -95,14 +63,12 @@ class Detection:
 class CorrelationRule:
     """One shape.
 
-    `group_by` picks what the count is per - a source address, an account.
-    Events with no value for it are ignored rather than lumped into a shared
-    empty-string bucket, which would count unrelated events together and is
-    how this kind of rule produces its most confusing false positives.
+    `group_by` is what the count is per. Events with no value for it are
+    ignored rather than bucketed under the empty string, which would count
+    unrelated events as one attacker.
 
-    `distinct_by` is what makes spray different from brute force. Both are
-    "many failures", but a spray is many *accounts* from one source, while
-    brute force is many attempts against one account. Counting the wrong one
+    `distinct_by` separates spray from brute force: many *accounts* from one
+    source, versus many attempts against one account. Counting the wrong one
     turns each into the other.
     """
 
@@ -131,9 +97,8 @@ class _Window:
 class CorrelationEngine:
     """Feed it events; it returns the windows that fired.
 
-    Deliberately synchronous and allocation-light: it runs on the hot path for
-    every event the agent collects, so a detection that costs more than the
-    collection does is not worth having.
+    Synchronous and allocation-light on purpose: it runs on the hot path for
+    every event collected.
     """
 
     def __init__(self, rules: Iterable[CorrelationRule], max_groups: int = 2048):
@@ -154,8 +119,7 @@ class CorrelationEngine:
                     continue
                 group = str(rule.group_by(event) or "").strip()
             except Exception:
-                # A malformed event must not stop collection on the host. It
-                # is one event; the alternative is a dead thread.
+                # One malformed event must not kill the collection thread.
                 continue
             if not group:
                 continue
@@ -232,14 +196,10 @@ def _eid(event: dict) -> str:
 def _is_failed_logon(event: dict) -> bool:
     """A failed authentication, on either platform.
 
-    Windows says EventID 4625. Linux has no equivalent identifier, so
-    `core.sigma_loader.text_event_fields` synthesises `AuthResult` from the
-    shapes sshd, PAM and su actually write.
-
-    Deliberately one predicate rather than two rule sets. A password spray is
-    the same shape wherever it happens, and duplicating the rules per platform
-    is how they drift - the Linux copy gets the threshold tuned and the
-    Windows one does not.
+    Windows says EventID 4625; Linux has no equivalent, so
+    `sigma_loader.text_event_fields` synthesises `AuthResult`. One predicate
+    rather than two rule sets, because duplicating them per platform is how
+    the thresholds drift apart.
     """
     return _eid(event) == "4625" or str(event.get("AuthResult", "")).lower() == "failure"
 
@@ -254,9 +214,8 @@ BUILTIN_RULES: list[CorrelationRule] = [
         title="Password Spray",
         severity="HIGH",
         techniques=("T1110.003",),
-        # Deliberately short. A spray is fast by design - the attacker is
-        # trying one password against many accounts precisely to stay under
-        # per-account lockout, so the accounts are hit close together.
+        # Short on purpose: a spray hits many accounts close together to
+        # stay under per-account lockout.
         window_s=300,
         threshold=5,
         matches=_is_failed_logon,
@@ -289,10 +248,9 @@ BUILTIN_RULES: list[CorrelationRule] = [
         title="Successful Logon After Repeated Failures",
         severity="CRITICAL",
         techniques=("T1110",),
-        # The one that matters. Failures alone are noise; failures followed by
-        # a success on the same account is the guess landing. Kept separate
-        # from brute_force so the severity can differ - this is an incident,
-        # the other is a symptom.
+        # Failures alone are a symptom; failures then a success on the same
+        # account is the guess landing. Separate from brute_force so the
+        # severity can differ.
         window_s=600,
         threshold=2,
         matches=lambda e: _is_failed_logon(e) or _is_successful_logon(e),
@@ -324,9 +282,7 @@ BUILTIN_RULES: list[CorrelationRule] = [
         title="Several Services Installed In Quick Succession",
         severity="HIGH",
         techniques=("T1543.003",),
-        # Lateral movement tooling installs and removes a service per host, so
-        # a burst on one machine is either a deployment or somebody walking
-        # the estate.
+        # Lateral movement tooling installs a service per host it reaches.
         window_s=600,
         threshold=3,
         matches=lambda e: _eid(e) == "7045",
@@ -342,17 +298,12 @@ BUILTIN_RULES: list[CorrelationRule] = [
 # Shapes only the server can see
 # ---------------------------------------------------------------------------
 #
-# The rules above run on the agent and are therefore per host: five accounts
-# sprayed against one machine is caught, one account sprayed across fifty
-# machines once each is not, because no single host sees more than one event.
+# The rules above are per host, so one account sprayed across fifty machines
+# once each is invisible to every agent - and that is the more competent
+# attack, staying under per-account lockout *and* per-host thresholds.
 #
-# That is the more competent attack. Spraying wide and shallow is precisely
-# how an intruder stays under per-account lockout *and* under per-host
-# thresholds, and it was invisible.
-#
-# These run in the ingest path, where every agent's events pass through one
-# process. `agent` is added to the event there, so the count is over distinct
-# hosts rather than distinct accounts.
+# These run in the ingest path, where `agent` is on the event, so the count is
+# over distinct hosts rather than distinct accounts.
 
 def _host(event: dict) -> str:
     return str(event.get("agent") or event.get("Computer") or "")
@@ -364,9 +315,8 @@ FLEET_RULES: list[CorrelationRule] = [
         title="Authentication Failures Across Many Hosts From One Source",
         severity="CRITICAL",
         techniques=("T1110.003",),
-        # Wider window than the per-host rule. Walking an estate takes longer
-        # than walking a user list on one machine, and the whole point of the
-        # technique is to be slow enough that nothing local notices.
+        # Wider than the per-host rule: walking an estate is slower than
+        # walking a user list, and being slow is the point of the technique.
         window_s=1800,
         threshold=5,
         matches=_is_failed_logon,
@@ -399,9 +349,8 @@ FLEET_RULES: list[CorrelationRule] = [
         title="The Same Service Installed Across Many Hosts",
         severity="CRITICAL",
         techniques=("T1021.002", "T1543.003"),
-        # Lateral movement tooling installs a service per host it reaches, so
-        # the same service name appearing across the estate in half an hour is
-        # either a deployment or somebody walking it.
+        # The same service name across the estate in half an hour is either
+        # a deployment or somebody walking it.
         window_s=1800,
         threshold=3,
         matches=lambda e: _eid(e) == "7045",
@@ -434,10 +383,8 @@ def default_engine(max_groups: int = 2048) -> CorrelationEngine:
 def fleet_engine(max_groups: int = 8192) -> CorrelationEngine:
     """The cross-host engine, for the ingest path.
 
-    A larger group cap than the agent's: this one is keyed by source address
-    and account across the whole estate rather than one machine, so the
-    cardinality is genuinely higher. Still bounded - the key is still
-    attacker-supplied.
+    A larger group cap than the agent's - estate-wide cardinality is higher -
+    but still bounded, because the key is still attacker-supplied.
     """
     return CorrelationEngine(FLEET_RULES, max_groups=max_groups)
 

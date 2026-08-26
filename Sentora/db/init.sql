@@ -113,7 +113,7 @@ CREATE INDEX IF NOT EXISTS idx_pk_dup  ON packages (dup_fp);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_pk_dup_not_null
   ON packages (dup_fp) WHERE dup_fp IS NOT NULL;
 
--- ========== vulnerabilities_report (PG sürüm) ==========
+-- ========== vulnerabilities_report (PostgreSQL variant) ==========
 CREATE TABLE IF NOT EXISTS vulnerabilities_report (
     id               SERIAL PRIMARY KEY,
     package_name     TEXT,
@@ -254,7 +254,7 @@ ALTER TABLE automations ADD CONSTRAINT automations_status_check
   CHECK (status IN ('pending','active','paused','completed','failed','cancelled'));
 
 -- =============================================================================
--- YENİ EDR & ENVANTER TABLOLARI
+-- EDR AND INVENTORY TABLES
 -- =============================================================================
 
 -- FIM Baselines & Changes

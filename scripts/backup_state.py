@@ -7,47 +7,34 @@
 
 Why this exists
 ---------------
-Docker Desktop was reset on the development machine and every named volume
-went with it: `mysql_data`, `opensearch_data`, `sentora_data`. Nothing had
-asked for them to be removed and nothing warned that they were about to be.
+Docker Desktop was reset and every named volume went with it. `mysql_data`
+held every SIEM event, every agent database, users and sessions, and nothing
+else had a copy. `opensearch_data` is derived from MySQL and would rebuild.
 
-What that cost, precisely, because the difference matters:
+`sentora_data` held `data/fernet.key`, the **agent** telemetry key, which was
+regenerated on the next boot - so telemetry encrypted under the old one is
+unreadable for good. There is no rotation path.
 
-- **MySQL** held every SIEM event, every agent database, users and sessions.
-  Gone, and nothing else on the machine had a copy.
-- **OpenSearch** held indices, which are derived from MySQL and would have
-  been rebuilt.
-- **`sentora_data`** held `data/fernet.key`, the **agent** telemetry key. Gone
-  and regenerated on the next boot, which means any agent telemetry encrypted
-  under the old one is unreadable for good - there is no rotation path.
+There are two Fernet keys and they are not interchangeable:
 
-There are two Fernet keys and they are not interchangeable, which is worth
-stating because getting it wrong once already made this look better than it
-was:
-
-    .env FERNET_KEY          the *server* key. On the host filesystem, so it
-                             survived, and `app.py` reads the environment
-                             before any file.
+    .env FERNET_KEY          the *server* key, on the host filesystem, so it
+                             survived
     data/fernet.key          the *agent* key, inside the volume. Did not.
 
-A backup covering only the first protects the half that was never at risk.
-Both are needed, and only one of them belongs in a `backups/` directory - see
-the note at the end of `backup()`.
+A backup covering only the first protects the half that was never at risk, and
+only one of them belongs in a `backups/` directory - see the end of
+`backup()`.
 
 What is backed up
 -----------------
-Both a logical dump and the raw volumes:
+Both, because they fail differently: `mysqldump --all-databases` survives a
+MySQL version change and can be read by a human, and a tar of each volume
+restores byte-for-byte including OpenSearch's on-disk format.
 
-- `mysqldump --all-databases`, which survives a MySQL version change and can
-  be read, diffed and partially restored by a human.
-- a tar of each named volume, which restores byte-for-byte including
-  OpenSearch's on-disk format, and which a logical dump cannot express.
-
-`.env` is **not** copied here. It holds `FERNET_KEY`, `DB_PASSWORD` and the
-agent shared secret, and writing those into a `backups/` directory that people
-tar up and move around is how secrets end up somewhere nobody is tracking.
-The script checks it exists and tells you to back it up separately, because
-without it a restored database is undecryptable.
+`.env` is **not** copied. It holds `FERNET_KEY`, `DB_PASSWORD` and the agent
+shared secret, and writing those into a directory people tar up and move
+around is how secrets end up somewhere nobody tracks. The script checks it
+exists and tells you to back it up separately.
 """
 
 from __future__ import annotations
@@ -154,10 +141,9 @@ def backup(destination: pathlib.Path) -> int:
 
 
 def restore(source: pathlib.Path) -> int:
-    # Absolute, because `docker -v` reads a relative path as a *named volume*
-    # rather than a host directory - and does not say so usefully. On Windows
-    # it reports the drive letter as an invalid character in a volume name,
-    # which reads like a quoting bug and is not one.
+    # Absolute: `docker -v` reads a relative path as a *named volume*, and
+    # reports the drive letter as an invalid character - which looks like a
+    # quoting bug and is not one.
     source = source.expanduser().resolve()
     if not source.is_dir():
         print(f"[!] {source} is not a directory")
@@ -200,10 +186,9 @@ def restore(source: pathlib.Path) -> int:
 
     print()
     if problems:
-        # This printed "[+] Restored" unconditionally, including the run where
-        # every archive had failed. A restore that reports success it did not
-        # have is worse than one that fails: the failure gets noticed now, the
-        # false success gets noticed the next time somebody needs the data.
+        # This printed "[+] Restored" even on a run where every archive
+        # failed. A restore reporting success it did not have is noticed the
+        # next time somebody needs the data.
         print(f"[!] {problems} of {len(archives)} archive(s) FAILED to restore.")
         print("    Do not bring the stack up expecting this data to be there.")
         return 1

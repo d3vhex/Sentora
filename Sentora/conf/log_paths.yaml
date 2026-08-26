@@ -1,6 +1,6 @@
 log_paths:
   debian:
-    # Web sunucuları (Apache / Nginx)
+    # Web servers (Apache / Nginx)
     - /var/log/apache2/error.log
     - /var/log/apache2/access.log
     - /var/log/apache2/other_vhosts_access.log
@@ -26,12 +26,12 @@ log_paths:
     - /var/log/faillog
     - /var/log/sudo.log
 
-    # Paket yönetimi / update
+    # Package management / updates
     - /var/log/dpkg.log
     - /var/log/apt/history.log
     - /var/log/apt/term.log
 
-    # Cron / zamanlanmış işler
+    # Cron / scheduled jobs
     - /var/log/cron.log
     - /var/log/atop/atop.log
 
@@ -43,7 +43,7 @@ log_paths:
     - /var/log/postfix/mail.log
     - /var/log/postfix/smtp.log
 
-    # Güvenlik / firewall / IDS
+    # Security / firewall / IDS
     - /var/log/audit/audit.log
     - /var/log/fail2ban.log
     - /var/log/ufw.log
@@ -72,7 +72,7 @@ log_paths:
     # Docker / container runtime vs.
     - /var/log/docker.log
 
-    # Samba / NFS / diğer servisler
+    # Samba / NFS / other services
     - /var/log/samba/log.smbd
     - /var/log/samba/log.nmbd
     - /var/log/redis/redis-server.log
@@ -80,7 +80,7 @@ log_paths:
     - /var/log/openvpn/status.log
 
   rhel:
-    # Web sunucuları
+    # Web servers
     - /var/log/httpd/access_log
     - /var/log/httpd/error_log
     - /var/log/httpd/ssl_access_log
@@ -172,7 +172,7 @@ log_paths:
     - /var/log/mysqld.log
     - /var/log/postgresql/postgresql.log
 
-    # Güvenlik / IDS
+    # Security / IDS
     - /var/log/fail2ban.log
     - /var/log/ufw.log
     - /var/log/snort/alert
@@ -189,7 +189,7 @@ log_paths:
     - /var/log/strongswan.log
     - /var/log/charon.log
 
-    # Diğer yaygın servisler
+    # Other common services
     - /var/log/samba/log.smbd
     - /var/log/samba/log.nmbd
     - /var/log/redis/redis-server.log
@@ -234,7 +234,7 @@ windows_log_types:
   - Microsoft-Windows-AppLocker/Packaged app-Deployment
   - Microsoft-Windows-AppLocker/Packaged app-Execution
 
-  # DNS / DHCP (DC ise)
+  # DNS / DHCP (domain controllers)
   - Microsoft-Windows-DNS-Server/Operational
   - Microsoft-Windows-DHCP-Server/Operational
 
@@ -244,5 +244,5 @@ windows_log_types:
   # BitLocker
   - Microsoft-Windows-BitLocker/BitLocker Management
 
-  # Kerberos / Auth (çoğu Security altında ama bazıları ayrı kanal)
+  # Kerberos / Auth (mostly under Security, a few on their own channel)
   - Microsoft-Windows-Kerberos-Key-Distribution-Center/Operational
