@@ -69,18 +69,26 @@ def _split_fingerprint(data):
     return {k: v for k, v in data.items() if k != "_ai_fingerprint"}, fp
 
 
-def _parse_failure_entry(source_file: str, log_text: str, error: str, model: str) -> dict:
-    """The row written when the model could not produce a usable verdict.
+def _parse_failure_entry(source_file: str, log_text: str, error: str, model: str,
+                        headline: str = "[PARSE FAILED] The model did not "
+                                        "return a usable verdict.") -> dict:
+    """The row written when no verdict could be produced.
 
     This replaces `_lazy()`, which fabricated a narrative from the log fields
     and wrote it into the audit trail as though the model had produced it. An
-    honest INSUFFICIENT_DATA row says the model failed, which is a fact worth
+    honest INSUFFICIENT_DATA row says what went wrong, which is a fact worth
     acting on.
+
+    `headline` exists because there are two different failures and only one of
+    them is the model's. An event that will not decrypt never reaches the
+    model at all, and telling an operator "the model did not return a usable
+    verdict" sends them to read prompts and inference logs when the cause is a
+    key on an endpoint.
     """
     return {
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'source_file': source_file,
-        'critical_summary': f"[PARSE FAILED] The model did not return a usable verdict. {error}",
+        'critical_summary': f"{headline} {error}",
         'source_data': log_text,
         'verdict': 'INSUFFICIENT_DATA',
         'severity': 'INFO',
@@ -97,9 +105,38 @@ async def handle_automation(agent, table, data, api_key, endpoint, model=None):
     # the prompt fed the model `enc::gAAAA...`, and it answered anyway -
     # "Procdump executed against lsass" on an alert categorised
     # LateralMovement, at 0.50. Every insight looked like an insight.
-    data = telemetry_crypto.decrypt_item(table, data)
+    data, unreadable = telemetry_crypto.readable(table, data)
     log_text = json.dumps(data, indent=2)
     model_name = model or os.getenv("OLLAMA_MODEL", "")
+
+    if unreadable:
+        # No content, so no verdict. Asking the model about a Fernet blob
+        # produces an answer with nothing behind it, which is exactly how
+        # ciphertext reached the model unnoticed before - it always replies.
+        #
+        # Usually means the agent holds a key this server does not: it was
+        # enrolled against an older one, or the key was regenerated after the
+        # agent fetched it. Restarting the agent makes it fetch the current
+        # key; events already stored under the old one stay unreadable.
+        logger.error(
+            f"[!] {agent}/{table}: {', '.join(unreadable)} will not decrypt "
+            f"with this server's key. Not sending it to the model. Restart "
+            f"the agent so it re-fetches the key from /api/agents/bootstrap.")
+        entry = _parse_failure_entry(
+            f"Reviewed_{table}", log_text,
+            f"Field(s) {', '.join(unreadable)} are encrypted with a key this "
+            f"server does not hold, so the event has no readable content. "
+            f"The agent fetches its key once at startup: restart it so it "
+            f"re-fetches from /api/agents/bootstrap. Events already stored "
+            f"under the old key stay unreadable - there is no rotation path.",
+            model_name,
+            headline="[NOT ANALYSED] The event could not be decrypted, so it "
+                     "was never sent to the model.")
+        try:
+            await asyncio.to_thread(save_ai_results, agent, [entry])
+        except Exception:
+            logger.exception(f"[!] Save FAILED agent={agent}")
+        return
 
     verdict, _, error = await asyncio.to_thread(
         analyze_structured, PROMPTS["automation"], log_text, TriageVerdict,
@@ -173,6 +210,13 @@ async def handle_automation(agent, table, data, api_key, endpoint, model=None):
 
 async def handle_manual(agent, table, data, api_key, endpoint, model=None):
     batch_size = len(data) if isinstance(data, list) else 1
+    # A batch, so every row. An operator asked for this scan and gets an
+    # answer either way, which is exactly why the input has to be readable -
+    # a deep analysis of ciphertext reads like a deep analysis.
+    if isinstance(data, list):
+        data = [telemetry_crypto.decrypt_item(table, row) for row in data]
+    else:
+        data = telemetry_crypto.decrypt_item(table, data)
     log_text = json.dumps(data, indent=2, default=str)
     model_name = model or os.getenv("OLLAMA_MODEL", "")
     logger.info(f"[*] Manual analysis START agent={agent} table={table} batch={batch_size}")
@@ -256,8 +300,21 @@ SHADOW_MODE = os.getenv("AI_SHADOW_MODE", "0").lower() in ("1", "true", "yes", "
 
 async def handle_defensive(agent, table, data, api_key, endpoint, model=None):
     data, fingerprint = _split_fingerprint(data)
+    data, unreadable = telemetry_crypto.readable(table, data)
     log_text = json.dumps(data, indent=2)
     model_name = model or os.getenv("OLLAMA_MODEL", "")
+
+    if unreadable:
+        # This worker dispatches BLOCK_IP and ISOLATE_HOST. Deciding either
+        # from a Fernet blob is the worst version of the bug, so it refuses
+        # outright rather than returning a cautious verdict - a "monitor"
+        # recommendation about an unreadable event still asserts that
+        # something was read.
+        logger.error(
+            f"[!] {agent}/{table}: {', '.join(unreadable)} will not decrypt. "
+            f"No defensive action considered. Restart the agent so it "
+            f"re-fetches the key from /api/agents/bootstrap.")
+        return
 
     decision, _, error = await asyncio.to_thread(
         analyze_structured, PROMPTS["defensive"], log_text, DefensiveDecision,
