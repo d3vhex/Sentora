@@ -18,6 +18,7 @@ from ai.utils import (
 )
 from ai import criteria
 from ai.gating import surfaces
+from core import telemetry_crypto
 from ai.schemas import (
     TriageVerdict, DeepAnalysis, DefensiveDecision, coherence_problem, render_summary,
 )
@@ -102,6 +103,13 @@ def _parse_failure_entry(source_file: str, log_text: str, error: str, model: str
 
 async def handle_automation(agent, table, data, api_key, endpoint, model=None):
     data, fingerprint = _split_fingerprint(data)
+    # The agent encrypts `message` (and `source` on alerts) before sending, and
+    # it stays encrypted through the database and the queue. Serialising the
+    # row straight into the prompt fed the model `enc::gAAAA...` and it
+    # answered anyway - "Procdump executed against lsass" on an alert
+    # categorised LateralMovement, at the 0.50 confidence ai/gating measured as
+    # the model's "I have nothing" output. Every insight looked like an insight.
+    data = telemetry_crypto.decrypt_item(table, data)
     log_text = json.dumps(data, indent=2)
     model_name = model or os.getenv("OLLAMA_MODEL", "")
 

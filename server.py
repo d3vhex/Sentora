@@ -176,6 +176,7 @@ def _migrate_automation_status(cursor, db_name: str) -> None:
 # correlation costs detections, and refusing to accept telemetry costs all of
 # them.
 try:
+    from core import telemetry_crypto
     from core.correlation import fleet_engine
     from core.sigma_loader import agent_event_fields
     _FLEET = fleet_engine()
@@ -208,7 +209,12 @@ def correlate_across_hosts(agent, table, item, cursor):
 
     written = []
     try:
-        fields = agent_event_fields(item.get("message") or "")
+        # Decrypted here and nowhere else: the row written to the database
+        # and the message published to the broker both stay encrypted. A
+        # correlation window counting ciphertext counts nothing, because
+        # Fernet's random IV makes every encryption of the same text different.
+        plain = telemetry_crypto.decrypt_item(table, item)
+        fields = agent_event_fields(plain.get("message") or "")
         fields["agent"] = agent
         for found in _FLEET.observe(fields):
             # `dup_fp` comes from the detection's own sequence, not a hash of
