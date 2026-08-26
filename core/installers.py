@@ -182,17 +182,15 @@ def _render_windows_install(server_url: str, server_ip: str, token: str) -> str:
                     Write-Host "[+] Upgrading existing agent: $AgentName" -ForegroundColor Green
                     Write-Host "    Identity kept. Set SENTORA_REENROLL=1 to force a new one." -ForegroundColor DarkGray
 
-                    # Close out the token anyway. Skipping the call left it
-                    # unused forever, so the Deploy page kept reporting
-                    # "waiting" after a deployment that had already succeeded.
+                    # Close out the token anyway: skipping this left it
+                    # unused forever and the Deploy page reporting "waiting".
                     #
-                    # The reply is used, not discarded. If the server does not
-                    # recognise the key it holds - a machine whose identity
-                    # outlived the server's database - it enrols this host
-                    # afresh and returns a NEW key. Throwing that away left the
+                    # The reply is used, not discarded. A machine whose
+                    # identity outlived the server's database gets enrolled
+                    # afresh with a NEW key, and throwing that away left the
                     # installer downloading with a credential the server had
-                    # just told it was dead, which fails as 403 Forbidden with
-                    # nothing explaining why.
+                    # just declared dead - a bare 403 with nothing explaining
+                    # why.
                     $UpBody = @{{ token = $Token; agent_name = $AgentName; agent_key = $AgentKey; hostname = $Hostname; os_type = $OsType }} | ConvertTo-Json -Compress
                     try {{
                         $UpResp = Invoke-RestMethod -Method Post -Uri "$ServerUrl/api/agents/register" -ContentType "application/json" -Body $UpBody

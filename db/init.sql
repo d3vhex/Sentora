@@ -1,7 +1,7 @@
 SET NAMES utf8mb4;
 SET time_zone = '+00:00';
 
--- Ortak yardımcı tablolar
+-- Shared helper tables
 CREATE TABLE IF NOT EXISTS agent_info (
   id INT AUTO_INCREMENT PRIMARY KEY,
   agent_name  VARCHAR(255) NOT NULL,
@@ -146,7 +146,7 @@ ALTER TABLE siem_events ADD KEY idx_siem_sev (severity);
 ALTER TABLE siem_events ADD COLUMN techniques VARCHAR(255) NULL;
 ALTER TABLE siem_events ADD KEY idx_siem_tech (techniques);
 
--- ================== ai_log_checker_results (opsiyonel AI) ==================
+-- ================== ai_log_checker_results (optional AI) ==================
 CREATE TABLE IF NOT EXISTS ai_log_checker_results (
   id INT AUTO_INCREMENT PRIMARY KEY,
   `timestamp` VARCHAR(50) NOT NULL,
@@ -172,7 +172,8 @@ CREATE TABLE IF NOT EXISTS events_alert (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ================== soar_actions ==================
--- TIMESTAMP şart: expires filtreleri tarih karşılaştırması yapıyor
+-- TIMESTAMP is required: the expiry filters compare dates, and a TEXT
+-- column compares lexically, which silently matches the wrong rows
 CREATE TABLE IF NOT EXISTS soar_actions (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
   event_id    BIGINT NULL,
@@ -190,7 +191,7 @@ CREATE TABLE IF NOT EXISTS soar_actions (
   KEY idx_soar_dup (dup_fp)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- tip düzelt (idempotent)
+-- Correct the column type. Idempotent.
 ALTER TABLE soar_actions
   MODIFY COLUMN expires_at  TIMESTAMP NULL,
   MODIFY COLUMN resolved_at TIMESTAMP NULL;
@@ -230,7 +231,7 @@ CREATE TABLE IF NOT EXISTS automations (
 -- readers that arrive after it. Agents polling /automations/pending stopped
 -- getting answers and saw 500s at the response timeout instead.
 
--- ================== playbooks (merkezi tanım) ==================
+-- ================== playbooks (central definitions) ==================
 CREATE TABLE IF NOT EXISTS playbooks (
   id INT AUTO_INCREMENT PRIMARY KEY,
   agent_name   VARCHAR(255) NOT NULL,
@@ -249,7 +250,7 @@ CREATE TABLE IF NOT EXISTS playbooks (
 
 CREATE TABLE IF NOT EXISTS soar_playbooks (
   id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  agent_name       VARCHAR(255) NOT NULL,      -- UI'deki `device` paramı
+  agent_name       VARCHAR(255) NOT NULL,      -- the `device` param in the UI
   name             VARCHAR(255) NOT NULL,
   description      TEXT NULL,
   nodes_json       JSON NOT NULL,
@@ -265,7 +266,7 @@ CREATE TABLE IF NOT EXISTS soar_playbooks (
 
 CREATE TABLE IF NOT EXISTS soar_notification_templates (
   id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  agent_name  VARCHAR(255) NULL,         -- null ise global, doluysa belirli device'a özel
+  agent_name  VARCHAR(255) NULL,         -- NULL means global; a value scopes the row to one device
   name        VARCHAR(150) NOT NULL,
   type        VARCHAR(32) NOT NULL DEFAULT 'email',  -- email/sms/slack/teams vs
   subject     VARCHAR(255) NOT NULL,
@@ -275,7 +276,7 @@ CREATE TABLE IF NOT EXISTS soar_notification_templates (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 
--- ================== playbook_runs (çalıştırma günlükleri) ==================
+-- ================== playbook_runs (execution history) ==================
 CREATE TABLE IF NOT EXISTS playbook_runs (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
   agent_name    VARCHAR(255) NOT NULL,

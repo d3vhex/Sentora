@@ -318,9 +318,9 @@ def load_paths_from_yaml(path: str):
     return cfg
 
 def load_rules_from_yaml(path: str):
-    """
-    rules.yaml dosyasını okur ve regex'leri derler.
-    Dönen yapı: List[{'regex': Pattern, 'category': str, 'severity': str}]
+    """Read rules.yaml and compile its patterns.
+
+    Returns `[{'regex': Pattern, 'category': str, 'severity': str}]`.
     """
     if not yaml:
         logging.warning("YAML module not installed, rules could not be loaded!")
@@ -349,22 +349,15 @@ def load_rules_from_yaml(path: str):
 
         # `applies_to` scopes a category to the kind of data it can match.
         #
-        # 821 of the 1575 patterns in this file are web-application attacks -
-        # SQL injection, XSS, XXE, template injection, prototype pollution -
-        # and this agent collects Windows Event Log, process and network
-        # telemetry, Docker events and FIM. There is no HTTP request body
-        # anywhere in that. Those patterns could only ever produce false
-        # positives here, and they did: a single COMMAND INJECTION regex
-        # matching the agent's own ` | ` field separator flagged 89 of 100
-        # events CRITICAL.
+        # 821 of the 1575 patterns here are web-application attacks, and this
+        # agent collects event logs, process and network telemetry, Docker and
+        # FIM - no HTTP bodies anywhere. They could only produce false
+        # positives, and did: one COMMAND INJECTION regex matching the agent's
+        # own ` | ` separator flagged 89 of 100 events CRITICAL.
         #
-        # Scoped, not deleted. The moment this platform ingests web logs the
-        # rules are there, correct and unmodified. Deleting them would be
-        # throwing away real detections to fix a routing problem.
-        #
-        # Unmarked categories always load. A category nobody has classified is
-        # not evidence that it is irrelevant, and defaulting to "skip" would
-        # silently disable detections as the file grows.
+        # Scoped rather than deleted, so they work the moment web logs arrive.
+        # Unmarked categories always load: nobody having classified one is not
+        # evidence it is irrelevant.
         applies_to = cat_data.get('applies_to')
         if applies_to and scope != "all":
             allowed = {str(s).strip().lower() for s in applies_to}
@@ -449,16 +442,13 @@ class Classification:
 def classify(text, fields, sigma_rules, rules_list):
     """Sigma first, the regex list as fallback. None if neither fires.
 
-    One implementation for all three collection paths. It used to exist only
-    on the Windows path, which meant a Linux endpoint got no Sigma at all and
-    no ATT&CK technique on anything - the coverage page would have reported a
-    Windows-only estate as the whole estate.
+    One implementation for all three collection paths. It existed only on the
+    Windows path, so a Linux endpoint got no Sigma and no ATT&CK technique on
+    anything.
 
-    `fields` is what the path could supply. The journal supplies real ones; a
-    plain syslog line supplies little more than `Message`, so field-matching
-    rules will not fire there. That is a genuine limit of text logs rather
-    than a decision made here, and `core.sigma_loader.text_event_fields` says
-    so where it builds them.
+    `fields` is whatever the path could supply - the journal has real ones, a
+    syslog line little more than `Message`. That limit belongs to text logs,
+    not to this function.
     """
     if sigma_rules and fields:
         hits = sigma_match(sigma_rules, fields)
@@ -483,19 +473,14 @@ def classify(text, fields, sigma_rules, rules_list):
 def correlated_events(correlator, fields, enricher, source, when=None):
     """Any correlation windows this event closed, as events of their own.
 
-    A correlation detection is not a property of the event that happened to
+    A statement about a window, not a property of the event that happened to
     complete it - the fifth failed logon is no more interesting than the
-    first. It is a statement about a window, so it gets its own event rather
-    than relabelling one that already exists. Otherwise the console shows a
-    routine 4625 marked CRITICAL and nothing explains why.
+    first, and relabelling it would show a routine 4625 marked CRITICAL with
+    nothing explaining why.
 
-    Returns a list, usually empty. Failures here are swallowed on purpose:
-    this runs on the collection thread and a correlation bug must cost a
-    detection, not the host's telemetry.
-
-    `when` overrides the clock. Only tests pass it, and they have to: a
-    correlation bug is nearly always a timing bug, and one that needs a real
-    five-minute wait to reproduce is one nobody reproduces.
+    Failures are swallowed: this runs on the collection thread, and a
+    correlation bug must cost a detection rather than the host's telemetry.
+    `when` overrides the clock, for tests that cannot wait five minutes.
     """
     if not correlator or not fields:
         return []

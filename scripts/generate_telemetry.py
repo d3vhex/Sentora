@@ -7,17 +7,15 @@
 
 Why this exists
 ---------------
-Every positive case in `evals/corpus_attacks.jsonl` is written by hand from
-documented technique behaviour. Nobody has run mimikatz on this estate, so
-recall measured against that corpus is an **upper bound** - the constructed
-cases are the loud, textbook version of each technique and a real intrusion is
-quieter. The eval report says so on every run, and no amount of careful
-writing fixes it. The only fix is telemetry a machine actually produced.
+Every positive in `evals/corpus_attacks.jsonl` is written by hand, so recall
+measured against it is an **upper bound**: those are the loud, textbook
+versions and a real intrusion is quieter. No amount of careful writing fixes
+that - only telemetry a machine actually produced does.
 
 What this does and does not do
 ------------------------------
-Each entry below produces the *same event* a technique produces, using an
-action that is harmless. That distinction is the whole design:
+Each entry produces the *same event* a technique produces, using an action
+that is harmless:
 
     T1490 shadow copy deletion   ->  `vssadmin list shadows`
                                      Same image, same 4688, reads only.
@@ -25,14 +23,11 @@ action that is harmless. That distinction is the whole design:
     T1562.001 Defender exclusion ->  add an exclusion for a temp directory
                                      this script created, then remove it.
 
-The detection rules match on the process, its command line and the event ID.
-A read-only `vssadmin` invocation is indistinguishable from a destructive one
-at the point where `Image|endswith: '\\vssadmin.exe'` is evaluated, which is
-exactly why it is a fair test of the collection path, the field mapping and
-the console - and not a fair test of whether the *arguments* are dangerous.
-The rules that match on `delete shadows` will not fire here, and that is
-stated rather than hidden: `--list` marks which entries exercise a rule fully
-and which only exercise collection.
+A read-only `vssadmin` is indistinguishable from a destructive one where
+`Image|endswith` is evaluated, which makes this a fair test of collection,
+field mapping and the console - and not of whether the *arguments* are
+dangerous. `--list` marks which entries exercise a rule fully and which only
+exercise collection.
 
 **Nothing here destroys, exfiltrates, disables a control permanently, or
 leaves anything behind.** Techniques whose signal cannot be produced safely -

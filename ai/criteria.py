@@ -65,24 +65,16 @@ CRITERIA: dict[str, tuple[str, list[list[str]]]] = {
         ["set-mppreference", "disablerealtimemonitoring"],
     ]),
     "C4": ("persistence to a writable path", [
-        # A path is a location, not a mechanism, and this criterion used to
-        # match on location alone. `appdata` went first - Slack, Teams and
-        # Dropbox all install a Run key pointing there, so every one of them
-        # read as CRITICAL persistence.
+        # A path is a location, not a mechanism, and this used to match on
+        # location alone. `appdata` went first: Slack, Teams and Dropbox all
+        # install a Run key there. The rest were the same mistake quieter -
+        # Windows Error Reporting writes crash dumps under
+        # `C:\ProgramData\Microsoft\Windows\WER\Temp\`, so three of the ten
+        # observed events were forced to CRITICAL by a machine reporting that
+        # something had crashed.
         #
-        # The remaining three were the same mistake one step quieter. Windows
-        # Error Reporting writes its own crash dumps to
-        # `C:\ProgramData\Microsoft\Windows\WER\Temp\`, and that matched
-        # `programdata` and `\temp\` on a real, entirely uneventful desktop.
-        # Three of the ten observed events in the corpus were being forced to
-        # CRITICAL by a machine reporting that something had crashed.
-        #
-        # So each alternative now names a mechanism as well as a location.
-        # Persistence is something that will run again; a file sitting in a
-        # writable directory is not, however suspicious the directory.
-        #
-        # A Run key into AppData is still worth a look. That is what
-        # SUSPICIOUS is for, and it is a judgement, so it stays with the model.
+        # Each alternative now names a mechanism too. Persistence is something
+        # that will run again; a file in a writable directory is not.
         ["currentversion\\run", "users\\public"],
         ["currentversion\\run", "\\temp\\"],
         ["currentversion\\run", "\\appdata\\"],
@@ -95,15 +87,10 @@ CRITERIA: dict[str, tuple[str, list[list[str]]]] = {
         ["service was installed", "\\temp\\"],
     ]),
     "C5": ("obfuscated execution", [
-        # `-enc` on its own was here, and it is not an indicator. The corpus
-        # makes the point twice: a developer decoding a config string, and
-        # this estate's own management tooling running an encoded command on
-        # an ordinary afternoon. Both were forced to CRITICAL.
-        #
-        # What separates them is what the payload does, not that there is one,
-        # so the encoded flag now has to be accompanied by something. See
-        # `decoded_payload` below - the base64 is decoded and searched, which
-        # is the only place a cradle is actually visible.
+        # `-enc` alone was here and is not an indicator - the corpus makes
+        # the point twice, with a developer decoding a config string and this
+        # estate's own tooling running an encoded command. What separates them
+        # is what the payload does, which `decoded_payload` below can see.
         ["-encodedcommand", "downloadstring"],
         ["-encodedcommand", "net.webclient"],
         ["-enc ", "invoke-expression"],
@@ -171,24 +158,18 @@ _B64_RUN = re.compile(r"[A-Za-z0-9+/]{24,}={0,2}")
 def decoded_payload(text: str) -> str:
     """Whatever the base64 in this log decodes to, appended to the haystack.
 
-    The reason this exists: `-EncodedCommand` is where a payload goes to stop
-    being searchable. Matching on the flag alone treats encoding itself as the
-    indicator, which it is not - this estate's own tooling runs encoded
-    commands, and a developer decoding a config string looks identical from
-    outside. Both were being forced to CRITICAL.
+    `-EncodedCommand` is where a payload goes to stop being searchable, and
+    matching on the flag alone treats encoding as the indicator - which it is
+    not. This estate's own tooling runs encoded commands, and a developer
+    decoding a config string looks identical from outside; both were being
+    forced to CRITICAL. Decoding moves the question from "was this encoded" to
+    "what does it do".
 
-    Decoding moves the question from "was this encoded" to "what does it do",
-    which is the question worth asking and the only one the two cases answer
-    differently.
+    UTF-16LE and UTF-8 are both tried, since PowerShell uses the first and
+    everything else the second. Failures are silent: a run of base64-looking
+    characters is usually a GUID or a hash.
 
-    Cached because `resolve()` asks all six criteria about the same log, so
-    without it the same payload is decoded six times per event on the hot
-    path.
-
-    PowerShell encodes as UTF-16LE and everything else as UTF-8, so both are
-    tried. Failures are silent on purpose: a run of base64-looking characters
-    is usually a GUID, a hash or a hex dump, and none of those are worth a
-    log line.
+    Cached because `resolve()` asks all six criteria about the same log.
     """
     out = []
     for run in _B64_RUN.findall(text or "")[:20]:      # bounded: logs get long

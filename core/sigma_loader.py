@@ -11,30 +11,22 @@ The Windows event log gives `StringInserts`, a positional array whose meaning
 depends on the event ID, so the names have to be supplied. `WINDOWS_FIELDS`
 below does that for the event IDs this agent collects.
 
-An event ID with no mapping is not dropped. Its inserts are still exposed
-under generic names and the whole assembled message under `Message`, so a
-rule matching on `Message|contains` still works. That is weaker than a field
-match and it is stated rather than hidden: `unmapped_event_ids()` reports
-which IDs are arriving without one.
+An event ID with no mapping is not dropped: its inserts stay reachable under
+generic names and the assembled text under `Message`. That is weaker than a
+field match, and `unmapped_event_ids()` reports which IDs arrive that way
+rather than leaving the gap silent.
 
-Sysmon gets its own table. Its event IDs are small numbers - 1, 11, 13 - that
-mean something entirely different on the System and Application channels, so
-the table is selected by channel. Reading a System event through Sysmon's
-layout would put arbitrary text into `Image` and `CommandLine`, inventing
-evidence for whichever rule then matched it.
+Sysmon gets its own table, selected by channel. Its IDs are small numbers - 1,
+11, 13 - that mean something entirely different on System and Application, and
+reading one through Sysmon's layout would put arbitrary text into `Image`.
 
 Linux
 -----
-The two Linux paths are not equally capable, and the difference is a property
-of the logs rather than of the rules:
-
-- `journal_event_fields` maps a systemd entry, which genuinely carries the
-  process, its command line and the unit. Field-matching rules work here the
-  way they do on Windows.
-- `text_event_fields` handles a plain log line, which is text. Only `Message`
-  and whatever the enricher extracted exist, so a rule matching `CommandLine`
-  will not fire - not because the event is uninteresting, but because the
-  field is not there to match.
+The two paths are not equally capable, and the difference belongs to the logs
+rather than the rules. `journal_event_fields` maps a systemd entry, which
+carries the process, its command line and the unit. `text_event_fields`
+handles a plain line, where only `Message` and what the enricher extracted
+exist - so a rule matching `CommandLine` cannot fire there.
 """
 
 from __future__ import annotations
@@ -114,18 +106,16 @@ WINDOWS_FIELDS: dict[int, list[str]] = {
     ],
 }
 
-# Sigma names the process image `Image`; the Windows 4688 schema calls the
-# same thing `NewProcessName`, and `ParentImage` is `ParentProcessName`.
-# Aliases rather than renames, so a rule written either way matches.
+# Sigma calls the process image `Image`; the 4688 schema calls it
+# `NewProcessName`. Aliases rather than renames, so either spelling matches.
 FIELD_ALIASES = {
     "NewProcessName": "Image",
     "ParentProcessName": "ParentImage",
     "TargetUserName": "User",
     "IpAddress": "SourceIp",
-    # A 4104 script block and a 4688 command line are the same question -
-    # "what was run" - asked of two different event IDs. Aliasing them means a
-    # rule written against CommandLine still fires when the estate has script
-    # block logging on and the command never appeared as a process at all.
+    # A 4104 script block and a 4688 command line answer the same question.
+    # Aliasing them keeps CommandLine rules working on an estate that has
+    # script block logging on and never sees the process event.
     "ScriptBlockText": "CommandLine",
     "TaskContent": "TaskCommand",
 }
@@ -163,9 +153,8 @@ _unmapped: dict[int, int] = {}
 def unmapped_event_ids() -> dict[int, int]:
     """Event IDs seen without a field mapping, and how often.
 
-    A rule matching on named fields cannot fire for these - it falls back to
-    the assembled message - so this is the size of the gap rather than a
-    reassuring silence.
+    Named-field rules cannot fire for these, so this is the size of the gap
+    rather than a reassuring silence.
     """
     return dict(sorted(_unmapped.items(), key=lambda kv: -kv[1]))
 
@@ -271,10 +260,8 @@ JOURNAL_FIELDS = {
 def journal_event_fields(entry: dict) -> dict:
     """A systemd journal entry, in the names Sigma rules use.
 
-    Worth doing separately from the plain-file path: the journal carries the
-    process, its command line and the unit as real fields, so a rule matching
-    `Image|endswith` behaves here as it does on Windows. A syslog line cannot
-    offer that.
+    Separate from the plain-file path because the journal carries the process,
+    its command line and the unit as real fields.
     """
     out: dict[str, str] = {}
     for key, value in (entry or {}).items():

@@ -84,20 +84,15 @@ def load_corpus(path: pathlib.Path) -> tuple[list[dict], list[str]]:
 # ---------------------------------------------------------------------------
 #
 # 29 cases at up to 140s each is twenty minutes, and most re-runs change
-# nothing the model sees. Every gating and criterion change in this session
-# was scored by paying for the model twice - the second time to get an
-# identical set of replies.
+# nothing the model sees.
 #
-# The key is the model *and the prompt text*, which is what makes this safe.
-# `ai.utils` has a production response cache and the harness deliberately does
-# not use it: keyed on the log alone, a cached answer from an older prompt
-# would make a rewritten prompt look identical to the one it replaced. Keying
-# on the prompt means editing it invalidates everything, which is the
-# behaviour a prompt experiment needs.
+# Keyed on the model *and the prompt text*, which is what makes it safe:
+# `ai.utils`' production cache is keyed on the log alone, so a reply from an
+# older prompt would make a rewritten one look identical to it. Keying on the
+# prompt means editing it invalidates everything.
 #
-# What is cached is the raw reply, before `criteria.apply` and before the
-# gate. Criterion and gating changes are therefore scored fresh on every run -
-# which is the common case and the whole point.
+# What is cached is the raw reply, before `criteria.apply` and the gate, so
+# criterion and gating changes are scored fresh - the common case.
 
 CACHE_DIR = ROOT / "evals" / "cache"
 

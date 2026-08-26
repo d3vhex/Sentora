@@ -257,7 +257,11 @@ class ServerBootstrapClient:
 
 
 def _apply_fernet_key_to_enc_db(key: str) -> None:
-    """enc_db'ye anahtarı itilaflı API'lere rağmen takmaya çalış."""
+    """Install the Fernet key into enc_db, whichever API it exposes.
+
+    The setter has been named three ways across versions; trying each in turn
+    is what keeps an older agent working after a server upgrade.
+    """
     if hasattr(enc_db, "set_fernet_key") and callable(enc_db.set_fernet_key):
         enc_db.set_fernet_key(key)
         return
@@ -388,11 +392,15 @@ _key_refresher: FernetKeyRefresher | None = None
 
 
 def get_public_ip() -> str:
-    """
-    - HTTP ile dış servise çıkmaz.
-    - Önce SERVER_IP'ye doğru route alıp, o route üzerindeki local IP'yi döner.
-    - Bu da server'ın geri bağlanmaya çalışacağı interface'teki IP olur.
-    - Eğer SERVER_IP henüz set değilse, 8.8.8.8 fallback kullanır.
+    """The local address the server will see, without asking anyone.
+
+    Opens a UDP socket towards SERVER_IP and reads back the local address the
+    kernel chose - no packet is sent and no external service is contacted, so
+    this works air-gapped and cannot leak the host's existence.
+
+    That address is the interface the server will connect back on, which is
+    the one worth reporting. Falls back to 8.8.8.8 as the route target when
+    SERVER_IP is not set yet.
     """
     ip = None
 
@@ -831,7 +839,12 @@ def automations_loop(api: AutomationsClient, agent_name: str, interval_sec: int 
 
 
 def soar_events_loop(interval_sec: int = 30):
-    """Yerel DB'deki events_alert kayıtlarına göre otomatik aksiyon."""
+    """Take SOAR actions from the agent's own events_alert rows.
+
+    Local, and deliberately so: the agent keeps responding when the server is
+    unreachable, which is exactly when an intrusion is most likely to be
+    cutting it off.
+    """
     while True:
         try:
             stats = _soar.process_events()

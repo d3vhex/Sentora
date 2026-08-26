@@ -469,9 +469,7 @@ class SOARAutomation:
         self.logger.info(f"SOAR Automation initialized on {platform.system()} {platform.release()}")
 
     def _kill_process(self, target: str) -> Tuple[bool, str]:
-        """
-        target: PID (string/int) veya process adı.
-        """
+        """Kill a process by PID or by name."""
         if not target:
             return False, "Empty process target"
 
@@ -1214,7 +1212,7 @@ class SOARAutomation:
 
 
 def main() -> None:
-    """Yerel SIEM events_alert tablosunu tarayıp otomatik aksiyonları uygular."""
+    """Scan the local events_alert table and take the actions it calls for."""
     try:
         config = SOARConfig()
         soar = SOARAutomation(config)
@@ -1235,9 +1233,10 @@ def main() -> None:
 
 
 def get_action_catalog() -> Dict[str, Dict[str, Any]]:
-    """
-    UI / backend playbook editörü için action kataloğu.
-    HTTP, Sanic vs bilmez; sadece meta-data döner.
+    """The action catalogue the playbook editor renders from.
+
+    Returns metadata only - it knows nothing about HTTP or the web framework,
+    which is what lets the same catalogue serve the API and the agent.
     """
     return {
         ActionType.BLOCK_IP.value: {
@@ -1333,10 +1332,10 @@ def get_action_catalog() -> Dict[str, Dict[str, Any]]:
 
 
 def _normalize_run_cmd_target(raw: Any) -> List[str]:
-    """
-    RUN_CMD için target normalizasyonu.
-    - Eğer list ise: ['whoami'] gibi -> string'e cast edip filtreler.
-    - Eğer string ise: whitespace'e göre split.
+    """Normalise a RUN_CMD target into an argument list.
+
+    A list is cast to strings and emptied of blanks; a string is split on
+    whitespace.
     """
     if isinstance(raw, list):
         return [str(x) for x in raw if str(x).strip()]
@@ -1351,10 +1350,9 @@ def execute_action_from_payload(
     config: Optional[SOARConfig] = None,
     soar_obj: Optional[SOARAutomation] = None,
 ) -> Dict[str, Any]:
-    """
-    Backend / API katmanı için helper.
+    """Run one SOAR action from an API payload.
 
-    Beklenen payload şekli:
+    Expected shape:
         {
           "action": "block_ip",
           "target": "1.2.3.4",
@@ -1364,7 +1362,8 @@ def execute_action_from_payload(
           "event_id": 123      # optional
         }
 
-    Sanic / Flask vs buradan dönen dict'i JSON'a çevirip response yapar.
+    Returns a plain dict for the caller to serialise, so this stays
+    independent of the web framework in front of it.
     """
     action = str(payload.get("action", "")).strip().lower()
     if not action:

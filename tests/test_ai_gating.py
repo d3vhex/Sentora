@@ -166,7 +166,11 @@ def test_the_threshold_history_is_recorded_where_the_next_person_looks():
     written down in the module, so the next person to reach for a threshold
     sees that it was tried before reaching."""
     import inspect
-    source = inspect.getsource(gating)
+    import re
+
+    # Wrapping-insensitive: this is a claim about what the module records, not
+    # about where the line breaks fall.
+    source = re.sub(r"\s+", " ", inspect.getsource(gating))
     assert "0.60 and 0.90" in source
     assert "Docker container lifecycle" in source
 

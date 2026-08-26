@@ -5,20 +5,15 @@ lists which columns: `siem_events.message`, `events_alert.source` and
 `.message`, and others. Those arrive as `enc::gAAAA...` and are stored that
 way, which is the point.
 
-What nothing did was decrypt them again before use. `server.py` published the
-row to RabbitMQ exactly as received, and `ai_worker` serialised that straight
-into the prompt - so **the model was triaging base64 Fernet blobs**, on every
-automation verdict for an encrypted table, and had been for as long as
-encryption has been on.
+Nothing decrypted them again before use, so `ai_worker` serialised
+`enc::gAAAA...` straight into the prompt - **the model was triaging Fernet
+blobs** on every automation verdict for an encrypted table.
 
-It is invisible from the console because the model answers anyway. Shown a
-ciphertext blob it produced "Procdump executed against lsass" on an alert
-categorised LateralMovement, at confidence 0.50 - which is exactly the output
-`ai/gating` measured as the model's "I have nothing" response. Every insight
-looked like an insight.
-
-The eval never caught it because `evals/corpus_attacks.jsonl` holds plaintext
-messages. The harness measured the model on logs it could read while
+It stayed invisible because the model answers anyway. Shown a blob it produced
+"Procdump executed against lsass" on an alert categorised LateralMovement, at
+confidence 0.50 - the output `ai/gating` measured as its "I have nothing"
+response. The eval could not catch it either: the corpus holds plaintext
+messages, so the harness measured the model on logs it could read while
 production fed it blobs.
 
 Where this decrypts, and where it does not
@@ -30,15 +25,11 @@ At the point of use, in memory, on a copy:
     the prompt                gets plaintext
     correlation fields        get plaintext
 
-Decrypting once at ingest and publishing plaintext would be less code and
-would put every log line on the broker in the clear. The encryption exists so
-that a copy of the data at rest is not a copy of the telemetry; a queue is
-data at rest for as long as it is queued.
+Decrypting once at ingest would be less code and would put every log line on
+the broker in the clear. A queue is data at rest for as long as it is queued.
 
-A value that will not decrypt is left as it is rather than dropped. A row
-encrypted under a key that no longer exists is still a row that happened, and
-`undecryptable` counts them, because "no events" and "events under the wrong
-key" call for different actions.
+A value that will not decrypt is kept and counted, not dropped: "no events"
+and "events under the wrong key" call for different actions.
 """
 
 from __future__ import annotations
@@ -82,13 +73,12 @@ stats = {"decrypted": 0, "plaintext": 0, "undecryptable": 0}
 def _load():
     """The agent telemetry key. Read only - never created here.
 
-    `app.py` creates it on first boot. A worker that generated its own would
-    hold a key nothing was encrypted with and decrypt nothing, while looking
-    like it was working - so a missing key is reported, not filled in.
+    A worker that generated its own would hold a key nothing was encrypted
+    with, decrypt nothing, and look like it was working, so a missing key is
+    reported rather than filled in.
 
-    This is **not** `FERNET_KEY` from `.env`. That one protects server-side
-    secrets (SMTP, LDAP). Confusing the two is easy and the failure is silent
-    in both directions.
+    Not `FERNET_KEY` from `.env`, which protects server-side secrets. The two
+    are easy to confuse and the failure is silent in both directions.
     """
     global _fernet, _load_error
     if _fernet is not None or _load_error is not None:
@@ -133,10 +123,8 @@ def decrypt_value(value):
         stats["undecryptable"] += 1
         return value
 
-    # `enc_db._enc_value` json-encodes before encrypting, so the ciphertext
-    # holds `json.dumps(v)`. A consumer that skips this layer gets a JSON
-    # string containing JSON, and everything downstream sees escaped quotes
-    # where an event should be.
+    # `enc_db._enc_value` json-encodes before encrypting. Skipping this layer
+    # yields a JSON string containing JSON, and escaped quotes downstream.
     stats["decrypted"] += 1
     try:
         decoded = json.loads(plain)
@@ -148,10 +136,8 @@ def decrypt_value(value):
 def decrypt_item(table: str, item: dict) -> dict:
     """A plaintext **copy** of one row. The original is not modified.
 
-    Copying matters: the caller usually still needs the encrypted values, to
-    store or to forward. Decrypting in place turned the row being written to
-    the database into plaintext, which is the opposite of what the encryption
-    is for.
+    The caller still needs the ciphertext to store and forward; decrypting in
+    place would write plaintext to the database.
     """
     fields = ENCRYPTED_FIELDS.get(table)
     if not fields or not isinstance(item, dict):

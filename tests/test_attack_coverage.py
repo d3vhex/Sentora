@@ -24,6 +24,19 @@ APP = (ROOT / "app.py").read_text(encoding="utf-8")
 TREE = ast.parse(APP)
 
 
+def flowed(text: str) -> str:
+    """Source with its line wrapping flattened.
+
+    An assertion about what a comment *says* should not fail because the
+    sentence was re-wrapped. Checking the raw text made
+    `"Docker container lifecycle"` fail the moment "container" landed at the
+    end of a line - a test about formatting wearing the clothes of a test
+    about content.
+    """
+    import re
+    return re.sub(r"\s+", " ", text)
+
+
 def _handler(name):
     return next(n for n in ast.walk(TREE)
                 if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef))

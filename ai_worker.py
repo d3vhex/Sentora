@@ -41,17 +41,10 @@ SUSPICIOUS_CONFIDENCE_THRESHOLD = float(os.getenv("AI_SUS_CONF", "0.75"))
 from ai.prompts import PROMPTS  # noqa: E402
 
 
-# `_extract_json` and `_format_insight` used to live here.
-#
-# The first counted braces to pull a JSON object out of whatever prose the
-# model wrapped it in — necessary when the model was merely *asked* for JSON.
-# Ollama's `format` parameter now constrains it to the schema, so there is
-# nothing to salvage. See ai/schemas.py.
-#
-# The second flattened a verdict into one display line, which then became the
-# only stored record of it. Verdict, severity and confidence are columns now;
-# `render_summary` still produces the line, but it is derived from the data
-# rather than standing in for it.
+# `_extract_json` and `_format_insight` used to live here. The first salvaged
+# JSON from prose, which Ollama's `format` parameter makes unnecessary. The
+# second flattened a verdict into one line that then became its only stored
+# record; verdict, severity and confidence are columns now.
 
 QUEUES = {
     "automation": mq_utils.AI_AUTOMATION,
@@ -64,11 +57,9 @@ soar = SOARAutomation(SOARConfig())
 def _split_fingerprint(data):
     """Pull the triage fingerprint out of the event before it becomes a prompt.
 
-    server.py attaches `_ai_fingerprint` so the verdict can be linked back to
-    the dedup counter. It must not reach the model — a 64-character hash in
-    the log body is pure noise the model will try to interpret, and it would
-    also change the prompt for otherwise identical events, defeating the
-    response cache.
+    A 64-character hash in the log body is noise the model will try to
+    interpret, and it changes the prompt for otherwise identical events,
+    defeating the response cache.
     """
     if not isinstance(data, dict):
         return data, None
@@ -81,12 +72,10 @@ def _split_fingerprint(data):
 def _parse_failure_entry(source_file: str, log_text: str, error: str, model: str) -> dict:
     """The row written when the model could not produce a usable verdict.
 
-    This replaces `_lazy()`, which detected the model saying "insufficient
-    information" and then *fabricated* a narrative from the log fields —
-    writing invented analysis into the audit trail as though the model had
-    produced it. A security tool must not do that. An honest
-    INSUFFICIENT_DATA row is less satisfying and far more useful: it says the
-    model failed, which is a fact about the model worth acting on.
+    This replaces `_lazy()`, which fabricated a narrative from the log fields
+    and wrote it into the audit trail as though the model had produced it. An
+    honest INSUFFICIENT_DATA row says the model failed, which is a fact worth
+    acting on.
     """
     return {
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -103,12 +92,11 @@ def _parse_failure_entry(source_file: str, log_text: str, error: str, model: str
 
 async def handle_automation(agent, table, data, api_key, endpoint, model=None):
     data, fingerprint = _split_fingerprint(data)
-    # The agent encrypts `message` (and `source` on alerts) before sending, and
-    # it stays encrypted through the database and the queue. Serialising the
-    # row straight into the prompt fed the model `enc::gAAAA...` and it
-    # answered anyway - "Procdump executed against lsass" on an alert
-    # categorised LateralMovement, at the 0.50 confidence ai/gating measured as
-    # the model's "I have nothing" output. Every insight looked like an insight.
+    # The agent encrypts `message` before sending and it stays encrypted
+    # through the database and the queue. Serialising the row straight into
+    # the prompt fed the model `enc::gAAAA...`, and it answered anyway -
+    # "Procdump executed against lsass" on an alert categorised
+    # LateralMovement, at 0.50. Every insight looked like an insight.
     data = telemetry_crypto.decrypt_item(table, data)
     log_text = json.dumps(data, indent=2)
     model_name = model or os.getenv("OLLAMA_MODEL", "")
@@ -119,10 +107,7 @@ async def handle_automation(agent, table, data, api_key, endpoint, model=None):
     )
 
     if error is None and verdict is not None:
-        # The model proposes a criterion; the log decides. See ai/criteria.py -
-        # it claimed "C1 credential access - comsvcs.dll" on an EID 4672
-        # privilege list, and separately missed a service installed from
-        # ADMIN$ that the markers found.
+        # The model proposes a criterion; the log decides. See ai/criteria.py.
         criterion_note = criteria.apply(verdict, log_text)
         if criterion_note:
             logger.info(f"[criteria] {agent}/{table}: {criterion_note}")
@@ -143,15 +128,10 @@ async def handle_automation(agent, table, data, api_key, endpoint, model=None):
 
     intel_match = await asyncio.to_thread(get_threat_intel_summary, log_text)
 
-    # A correlation window that fired is deterministic evidence, the same kind
-    # threat intel is, and neither needs the model's agreement to be worth an
-    # analyst's attention.
-    #
-    # It also cannot get it. The gate asks whether the log contains a
-    # criterion's markers, and the summary of a fired window - "5 distinct
-    # accounts failed from 10.9.9.9" - contains none by construction. Without
-    # this, the platform detected a password spray and filed the insight
-    # quietly, which reads from the console exactly like not detecting it.
+    # A fired correlation window is deterministic evidence, like a threat-intel
+    # match, and needs no agreement from the model. It could not get it either:
+    # the gate looks for a criterion's markers, and a window summary contains
+    # none by construction.
     correlated = str(data.get("source") or "").startswith("Correlation/")
 
     # ai/gating.surfaces, not a copy of the rule: the eval harness scores the
