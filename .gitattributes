@@ -1,0 +1,38 @@
+# Line endings.
+#
+# This repository is developed on Windows and deployed on Linux. A shell
+# script with CRLF does not run there at all: bash reports a syntax error at
+# the first `{` and names a line that is perfectly valid, so the reader goes
+# looking at the script instead of at the bytes.
+#
+# `eol=lf` pins the working-tree form regardless of anyone's core.autocrlf, so
+# a file edited on Windows still lands on the Ubuntu box able to run.
+*.sh        text eol=lf
+*.bash      text eol=lf
+Dockerfile  text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+
+# PowerShell is the mirror image: these only ever run on Windows, and some
+# older hosts are unhappy with LF-only scripts.
+*.ps1       text eol=crlf
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+
+# Binary, so git never tries to translate anything inside them.
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.exe       binary
+*.zip       binary
+*.gz        binary
+*.tgz       binary
+*.pdf       binary
+*.woff      binary
+*.woff2     binary
+
+# The built agent binaries. No extension on Linux, so name them.
+Sentora/main    binary
+Sentora/main.exe binary

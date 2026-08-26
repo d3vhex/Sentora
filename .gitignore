@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 .venv/
+# The agent build venv. Created by Sentora/build_agent.sh so the build never
+# touches the system interpreter, which PEP 668 refuses to let it do anyway.
+Sentora/.venv-build/
 venv/
 ENV/
 

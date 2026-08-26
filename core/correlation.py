@@ -383,6 +383,10 @@ def default_engine(max_groups: int = 2048) -> CorrelationEngine:
 def fleet_engine(max_groups: int = 8192) -> CorrelationEngine:
     """The cross-host engine, for the ingest path.
 
+    A finding is written to whichever agent's database completed the window,
+    which is arbitrary - `GET /all_alerts` reads across every agent, so it is
+    still found, just not on the other hosts' own pages.
+
     A larger group cap than the agent's - estate-wide cardinality is higher -
     but still bounded, because the key is still attacker-supplied.
     """

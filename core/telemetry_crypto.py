@@ -133,6 +133,38 @@ def decrypt_value(value):
         return plain
 
 
+def undecryptable_fields(table: str, item: dict) -> list[str]:
+    """Encrypted fields this key cannot open.
+
+    Not a diagnostic nicety. An event whose `message` will not decrypt has no
+    content, and asking the model about it produces an answer with nothing
+    behind it - which is how ciphertext reached the model unnoticed in the
+    first place. The caller refuses rather than guesses.
+    """
+    fields = ENCRYPTED_FIELDS.get(table) or ()
+    if not isinstance(item, dict):
+        return []
+    out = []
+    for name in fields:
+        value = item.get(name)
+        if isinstance(value, str) and value.startswith(ENC_PREFIX):
+            if decrypt_value(value).startswith(ENC_PREFIX):
+                out.append(name)
+    return out
+
+
+def readable(table: str, item: dict) -> tuple[dict, list[str]]:
+    """`(plaintext copy, fields that would not open)`.
+
+    The decision the workers make, in one place and callable without RabbitMQ.
+    `ai_worker` cannot be imported in a test on a machine that has no broker
+    installed, which is why the checks around it were source-text assertions -
+    and a source-text assertion cannot tell you the prompt actually came out
+    readable.
+    """
+    return decrypt_item(table, item), undecryptable_fields(table, item)
+
+
 def decrypt_item(table: str, item: dict) -> dict:
     """A plaintext **copy** of one row. The original is not modified.
 

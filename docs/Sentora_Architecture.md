@@ -395,6 +395,50 @@ layers that can be checked — a Sigma rule at MEDIUM, or a correlation window
 
 Threat-intel matches surface regardless, and are handled by the caller.
 
+### 3.1.2 Telemetry Decryption (`core/telemetry_crypto.py`)
+
+The agent encrypts before sending - `siem_events.message`, `events_alert`'s
+`source` and `message`, and others in `enc_db.ENCRYPT_FIELDS_MAP`. It is
+stored and queued that way, which is the point.
+
+Nothing decrypted it again before use, so `ai_worker` serialised
+`enc::gAAAA...` straight into the prompt and **every automation verdict on an
+encrypted table was produced from a Fernet blob**. It stayed invisible because
+the model answers regardless: shown a blob it produced "Procdump executed
+against lsass" on an alert categorised LateralMovement, at confidence 0.50 -
+the value §3.1.1 identifies as its "I have nothing" output.
+
+Decryption happens at the point of use, in memory, on a copy:
+
+| | |
+| :--- | :--- |
+| the database row | stays encrypted |
+| the RabbitMQ message | stays encrypted |
+| the prompt | gets plaintext |
+| correlation fields | get plaintext |
+
+Decrypting once at ingest would be less code and would put every log line on
+the broker in the clear. A queue is data at rest for as long as it is queued.
+
+`sentora_data`, the volume holding `data/fernet.key`, was mounted only on
+`app`; `ingest` and the three workers could not reach the key at all. All four
+now mount it **read-only** - `app` creates it, and a worker that could write
+there would generate a different key, decrypt nothing, and look like it was
+working.
+
+**An event that will not decrypt is refused, not described.** `readable()`
+returns the plaintext copy *and* the fields that would not open, and all three
+workers check it before prompting. The defensive worker refuses outright
+rather than returning a cautious verdict: it dispatches `BLOCK_IP` and
+`ISOLATE_HOST`, and even a "monitor" recommendation asserts that something was
+read.
+
+This is a live condition, not a hypothesis. An agent holding a key the server
+has since replaced keeps sending, and every event it sends is unreadable. The
+log line names the fix - restart the agent so it re-fetches the key from
+`/api/agents/bootstrap` - and events already stored under the old key stay
+unreadable, because there is no rotation path.
+
 ### 3.2 Defensive Auto-Action Allow-List
 
 Only these actions are auto-dispatched without human review:
@@ -647,10 +691,14 @@ the same way a threat-intel match does — and it has to, because the gate asks
 whether the log contains a criterion's markers and the summary of a fired
 window contains none by construction.
 
-**Known wart:** a cross-host finding is stored in the database of whichever
-agent's event completed the window, which is arbitrary. It is the right
-finding filed in a slightly wrong place; an analyst looking at a different
-host in that same spray will not see it there.
+**Where a fleet finding is stored.** It goes into the database of whichever
+agent's event completed the window, which is arbitrary - but it is not lost:
+`GET /all_alerts` reads `events_alert` from every agent database and the
+dashboard renders it, which is where an estate-wide finding belongs anyway.
+
+The cost is confined to the per-agent view. An analyst opening one of the
+*other* hosts in the same spray will not see the finding on that host's page,
+because it is filed under the one that happened to complete the window.
 
 ### 4.2 Tables Synced From Agent to Server
 

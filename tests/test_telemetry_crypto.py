@@ -126,7 +126,7 @@ def test_an_unknown_table_is_returned_as_a_copy(keyed):
 
 def test_the_worker_decrypts_before_building_the_prompt():
     worker = (ROOT / "ai_worker.py").read_text(encoding="utf-8")
-    decrypt_at = worker.index("telemetry_crypto.decrypt_item(table, data)")
+    decrypt_at = worker.index("telemetry_crypto.readable(table, data)")
     prompt_at = worker.index("log_text = json.dumps(data, indent=2)")
     assert decrypt_at < prompt_at
 
@@ -171,3 +171,154 @@ def test_the_workers_mount_it_read_only():
         volumes = compose["services"][name]["volumes"]
         mount = next(v for v in volumes if "sentora_data" in str(v))
         assert str(mount).endswith(":ro"), name
+
+
+# --------------------------------------------------------------------------
+# An event that will not decrypt is not an event
+# --------------------------------------------------------------------------
+
+def test_undecryptable_fields_are_named(keyed):
+    """A field encrypted under a key this server does not hold."""
+    from cryptography.fernet import Fernet
+
+    other = Fernet(Fernet.generate_key())
+    row = {"message": tc.ENC_PREFIX + other.encrypt(b'"x"').decode(),
+           "severity": "HIGH"}
+    assert tc.undecryptable_fields("siem_events", row) == ["message"]
+
+
+def test_a_readable_event_reports_nothing(keyed):
+    row = {"message": enc(keyed, r"reg.exe save HKLM\SAM")}
+    assert tc.undecryptable_fields("siem_events", row) == []
+
+
+def test_plaintext_is_not_undecryptable(keyed):
+    """Older agents send it in the clear, and that is fine."""
+    assert tc.undecryptable_fields("siem_events", {"message": "plain"}) == []
+
+
+def test_the_worker_refuses_rather_than_asking_the_model():
+    """A Fernet blob has no content, so a verdict about it has nothing behind
+    it - and the model always replies, which is how ciphertext reached it
+    unnoticed in the first place.
+
+    This is a live condition, not a hypothetical: an agent holding a key the
+    server has replaced keeps sending, and every event it sends is unreadable.
+    """
+    worker = (ROOT / "ai_worker.py").read_text(encoding="utf-8")
+    # The *call*, not the import at the top of the file.
+    refuse_at = worker.index("telemetry_crypto.readable(table, data)")
+    prompt_at = worker.index('PROMPTS["automation"]')
+    assert refuse_at < prompt_at, "the check must come before the model call"
+    assert "Not sending it to the model" in worker
+
+
+def test_the_refusal_says_what_to_do_about_it():
+    """"undecryptable" on its own sends an operator looking at the wrong
+    thing. The cause is nearly always an agent holding a stale key."""
+    worker = (ROOT / "ai_worker.py").read_text(encoding="utf-8")
+    assert "Restart" in worker and "bootstrap" in worker
+
+
+def test_it_is_recorded_as_a_failure_not_a_verdict():
+    """An INSUFFICIENT_DATA row says the platform could not read the event,
+    which is a fact worth acting on. A fabricated verdict is not."""
+    worker = (ROOT / "ai_worker.py").read_text(encoding="utf-8")
+    block = worker[worker.index("if unreadable:"):]
+    block = block[:block.index("\n    intel_match")] if "\n    intel_match" in block else block[:2000]
+    assert "_parse_failure_entry" in block
+
+
+def test_the_defensive_worker_refuses_too():
+    """It dispatches BLOCK_IP and ISOLATE_HOST. Deciding either from a Fernet
+    blob is the worst version of this bug, and even a cautious "monitor"
+    verdict would assert that something had been read."""
+    worker = (ROOT / "ai_worker.py").read_text(encoding="utf-8")
+    block = worker[worker.index("async def handle_defensive"):]
+    block = block[:block.index("PROMPTS[\"defensive\"]")]
+    assert "telemetry_crypto.readable" in block
+    assert "No defensive action considered" in block
+
+
+def test_the_manual_worker_decrypts_its_batch():
+    """An operator gets an answer either way, which is why the input has to be
+    readable - a deep analysis of ciphertext reads like a deep analysis."""
+    worker = (ROOT / "ai_worker.py").read_text(encoding="utf-8")
+    block = worker[worker.index("async def handle_manual"):]
+    block = block[:block.index("PROMPTS[\"manual\"]")]
+    assert "decrypt_item(table, row) for row in data" in block
+
+
+# --------------------------------------------------------------------------
+# The regression the eval cannot see
+# --------------------------------------------------------------------------
+
+def test_an_encrypted_event_becomes_a_readable_log(keyed):
+    """The regression no eval run could have shown.
+
+    `run_eval.py` builds its prompt straight from the corpus, and the corpus
+    holds plaintext - so the harness measured the model on logs it could read
+    while production fed it blobs. This is the check that would have caught
+    it, and it exercises the decision rather than grepping for it.
+    """
+    row = {"message": enc(keyed, "rundll32.exe comsvcs.dll, MiniDump 704 lsass.dmp"),
+           "severity": "HIGH"}
+    plain, unreadable = tc.readable("siem_events", row)
+
+    assert unreadable == []
+    assert "comsvcs.dll" in plain["message"]
+    assert tc.ENC_PREFIX not in json.dumps(plain)
+
+
+def test_an_unreadable_event_is_reported_not_described(keyed):
+    """The other half: a blob is named, so the caller can refuse it."""
+    from cryptography.fernet import Fernet
+
+    other = Fernet(Fernet.generate_key())
+    row = {"message": tc.ENC_PREFIX + other.encrypt(b'"secret"').decode()}
+    plain, unreadable = tc.readable("siem_events", row)
+
+    assert unreadable == ["message"]
+    assert plain["message"].startswith(tc.ENC_PREFIX)
+
+
+def test_both_workers_use_the_same_decision():
+    """One function, so the automation and defensive paths cannot drift into
+    disagreeing about whether an event is readable."""
+    worker = (ROOT / "ai_worker.py").read_text(encoding="utf-8")
+    assert worker.count("telemetry_crypto.readable(table, data)") == 2
+
+
+def test_the_undecryptable_row_does_not_blame_the_model():
+    """The model is never asked about an event that will not decrypt, so a row
+    reading "the model did not return a usable verdict" sends an operator to
+    read prompts and inference logs when the cause is a key on an endpoint.
+
+    It said exactly that, and 28 of those rows accumulated in the console
+    during one stale-key episode.
+    """
+    worker = (ROOT / "ai_worker.py").read_text(encoding="utf-8")
+    block = worker[worker.index("if unreadable:"):]
+    block = block[:block.index("return") + 6]
+    assert "NOT ANALYSED" in block
+    assert "never sent to the model" in block
+    assert "did not return a usable verdict" not in block
+
+
+def test_the_row_says_what_to_do():
+    """"Undecryptable" alone is a symptom. The cause is nearly always an agent
+    holding a key fetched before the server's was replaced."""
+    worker = (ROOT / "ai_worker.py").read_text(encoding="utf-8")
+    block = worker[worker.index("if unreadable:"):]
+    block = block[:block.index("return") + 6]
+    assert "restart it" in block.lower()
+    assert "bootstrap" in block
+    assert "no rotation path" in block
+
+
+def test_a_real_model_failure_still_says_so():
+    """The two failures must stay distinguishable - the default headline is
+    what a genuine parse failure gets."""
+    worker = (ROOT / "ai_worker.py").read_text(encoding="utf-8")
+    assert "The model did not \"\n                                        \"return a usable verdict." in worker \
+        or "did not " in worker and "return a usable verdict." in worker

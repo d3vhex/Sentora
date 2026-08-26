@@ -66,19 +66,81 @@ step "Python $PY_VER detected."
 [ -f "$SCRIPT_DIR/requirements.txt" ] || fail "requirements.txt missing."
 
 # ─────────────────────── deps ───────────────────────
+#
+# A stock Ubuntu image has none of this, and the script used to assume all of
+# it. `python3 -m pip` is not present until `python3-pip` is installed - the
+# first thing a fresh EC2 box says is "No module named pip" - and on 24.04 and
+# newer, installing into the system interpreter is refused outright by PEP 668
+# even once pip exists.
+#
+# So: apt for what only apt can provide, then a build venv for the Python
+# side. The venv also keeps the build from touching the system interpreter of
+# a machine that is probably running something else.
+#
+# `cysystemd` is the reason the compiler and headers are needed. It has no
+# wheel and builds against libsystemd; without those four packages the install
+# fails several minutes in, with a compiler error that does not mention them.
+
+APT_PACKAGES="python3-venv python3-dev gcc pkg-config libsystemd-dev binutils"
+
+ensure_system_packages() {
+    command -v apt-get >/dev/null 2>&1 || return 0
+
+    local missing=""
+    dpkg -s python3-venv   >/dev/null 2>&1 || missing="$missing python3-venv"
+    dpkg -s python3-dev    >/dev/null 2>&1 || missing="$missing python3-dev"
+    dpkg -s gcc            >/dev/null 2>&1 || missing="$missing gcc"
+    dpkg -s pkg-config     >/dev/null 2>&1 || missing="$missing pkg-config"
+    dpkg -s libsystemd-dev >/dev/null 2>&1 || missing="$missing libsystemd-dev"
+    dpkg -s binutils       >/dev/null 2>&1 || missing="$missing binutils"
+    [ -n "$missing" ] || return 0
+
+    if [ "$(id -u)" != "0" ]; then
+        fail "Need to install:$missing
+    Re-run with sudo:  sudo bash $0"
+    fi
+
+    step "Installing system packages:$missing"
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    # shellcheck disable=SC2086
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $missing >/dev/null
+    ok "System packages ready."
+}
+
+VENV="$SCRIPT_DIR/.venv-build"
+PY="python3"
+
 if [ "$DO_DEPS" = "1" ]; then
+    ensure_system_packages
+
+    if [ ! -x "$VENV/bin/python" ]; then
+        step "Creating build virtualenv..."
+        python3 -m venv "$VENV" || fail "Could not create a virtualenv at $VENV.
+    Install python3-venv and re-run:  sudo apt-get install -y python3-venv"
+    fi
+    PY="$VENV/bin/python"
+
     step "Installing pip dependencies..."
-    python3 -m pip install --upgrade --quiet pip
-    python3 -m pip install --quiet -r requirements.txt
-    python3 -m pip install --quiet pyinstaller
+    "$PY" -m pip install --upgrade --quiet pip setuptools wheel
+    "$PY" -m pip install --quiet -r requirements.txt
+    "$PY" -m pip install --quiet pyinstaller
     ok "Dependencies ready."
 else
-    warn "Skipping dependency install (--skip-deps)."
+    # --skip-deps still prefers the build venv when one exists, so a rebuild
+    # does not silently fall back to a system interpreter that has none of
+    # this installed and fail on the first import.
+    [ -x "$VENV/bin/python" ] && PY="$VENV/bin/python"
+    warn "Skipping dependency install (--skip-deps). Using: $PY"
 fi
+
+"$PY" -c "import PyInstaller" 2>/dev/null || fail "PyInstaller is not installed in $PY.
+    Re-run without --skip-deps."
 
 # ─────────────────────── clean ───────────────────────
 if [ "$DO_CLEAN" = "1" ]; then
     step "Cleaning previous build artifacts..."
+    # Deliberately not .venv-build: re-resolving and recompiling cysystemd on
+    # every build turns a two-minute rebuild into a ten-minute one.
     rm -rf "$SCRIPT_DIR/build" "$SCRIPT_DIR/dist" "$SCRIPT_DIR/main.spec" "$SCRIPT_DIR/main"
 fi
 
@@ -91,7 +153,7 @@ fi
 # libs the static scanner misses), and sanic plugins.
 
 step "Running PyInstaller..."
-python3 -m PyInstaller \
+"$PY" -m PyInstaller \
     --onefile \
     --clean \
     --noconfirm \
@@ -185,6 +247,15 @@ if command -v sha256sum >/dev/null 2>&1; then
     SHA="$(sha256sum "$ARTIFACT" | cut -d' ' -f1)"
 else
     SHA="$(shasum -a 256 "$ARTIFACT" | cut -d' ' -f1)"
+fi
+
+# Built as root under sudo, which leaves an artifact its invoker cannot
+# replace on the next run - and that failure surfaces as a permission error
+# from PyInstaller rather than as anything about ownership.
+if [ -n "${SUDO_USER:-}" ] && [ "$(id -u)" = "0" ]; then
+    _grp="$(id -gn "$SUDO_USER" 2>/dev/null || echo "$SUDO_USER")"
+    chown "$SUDO_USER":"$_grp" "$ARTIFACT" 2>/dev/null || true
+    chown -R "$SUDO_USER":"$_grp" "$VENV" 2>/dev/null || true
 fi
 
 ok "Built main ($SIZE)"
