@@ -18,14 +18,17 @@ import {
   Settings,
   Save,
   RotateCcw,
-  ShieldCheck,
+  Pencil,
+  FileDown,
   Bomb,
   MonitorPlay,
   Box
 } from 'lucide-react';
 import { agentService } from '../services/api';
+import { saveBlobResponse } from '../utils/downloadBlob';
 import VncViewer from '../components/VncViewer';
 import Fuse from 'fuse.js';
+import { isUnanswered, countUnanswered } from '../lib/insightTriage';
 
 // log_extractor often stuffs the enriched event into the `message` column as a
 // JSON string. Surface the inner fields so the table shows real columns instead
@@ -50,6 +53,15 @@ function parseSiemRow(r: any) {
 
 const AgentDetail: React.FC = () => {
   const { agentName } = useParams<{ agentName: string }>();
+  // The label an operator chose. `agentName` stays the identity - the URL,
+  // the database name, and every SOAR action are keyed on it - so this only
+  // changes what the page is titled.
+  const [displayName, setDisplayName] = useState<string>('');
+  const [editingName, setEditingName] = useState(false);
+  const [draftName, setDraftName] = useState('');
+  const [savingName, setSavingName] = useState(false);
+  const [reporting, setReporting] = useState(false);
+  const [nameError, setNameError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState('overview');
   const [loading, setLoading] = useState(true);
   const [data, setData] = useState<any>({
@@ -93,6 +105,10 @@ const AgentDetail: React.FC = () => {
     try {
       const results = await Promise.all([
         agentService.getAgentInfo(agentName),
+        // From the agents list, which is the one endpoint that carries it.
+        agentService.getAgents()
+          .then((list: any[]) => list.find(a => a.name === agentName))
+          .catch(() => null),
         agentService.getAgentResources(agentName),
         agentService.getSiemEvents(agentName),
         agentService.getEventsAlert(agentName),
@@ -105,7 +121,11 @@ const AgentDetail: React.FC = () => {
         agentService.getDockerContainers(agentName),
         agentService.getAiInsights(agentName)
       ]);
-      const [info, resources, siem, alerts, vulnerabilities, soar, disks, portscans, files, pkgs, containers, aiInsightsData] = results;
+      const [info, listEntry, resources, siem, alerts, vulnerabilities, soar,
+             disks, portscans, files, pkgs, containers, aiInsightsData] = results;
+      // Only overwrite while not editing, so a background refresh does
+      // not wipe what is being typed.
+      if (!editingName) setDisplayName(listEntry?.display_name || '');
       setData({ 
         info, resources, siem, alerts, vulnerabilities, soar, disks, 
         portscans, criticalFiles: files, packages: pkgs, containers,
@@ -184,11 +204,30 @@ const AgentDetail: React.FC = () => {
     }
   };
 
-  const handleReloadLicense = async () => {
+  const downloadReport = async () => {
+    setReporting(true);
     try {
-      await agentService.reloadAgentLicense(agentName!);
-      alert("License reload command sent.");
-    } catch (err) { alert("Failed to reload license."); }
+      const res = await agentService.downloadAgentReport(agentName!);
+      saveBlobResponse(res, `${agentName}-report.pdf`);
+    } catch (err) {
+      alert('Could not generate the report.');
+    } finally {
+      setReporting(false);
+    }
+  };
+
+  const saveDisplayName = async () => {
+    setSavingName(true);
+    setNameError(null);
+    try {
+      const res = await agentService.setAgentDisplayName(agentName!, draftName.trim());
+      setDisplayName(res.display_name || '');
+      setEditingName(false);
+    } catch (err: any) {
+      setNameError(err?.response?.data?.message || 'Could not save the name.');
+    } finally {
+      setSavingName(false);
+    }
   };
 
   const handleSelfDestruct = async () => {
@@ -260,7 +299,45 @@ const AgentDetail: React.FC = () => {
         <div className="flex-responsive" style={{ justifyContent: 'space-between', alignItems: 'flex-start' }}>
           <div>
             <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '8px' }}>
-              <h2 style={{ fontSize: '2rem', fontWeight: 700 }}>{agentName}</h2>
+              {editingName ? (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <input
+                    autoFocus
+                    value={draftName}
+                    maxLength={128}
+                    placeholder={agentName}
+                    onChange={e => setDraftName(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') saveDisplayName();
+                      if (e.key === 'Escape') { setEditingName(false); setNameError(null); }
+                    }}
+                    style={{
+                      fontSize: '1.5rem', fontWeight: 700, padding: '4px 10px',
+                      borderRadius: '8px', border: '1px solid var(--border-color)',
+                      backgroundColor: 'var(--bg-color)', color: 'var(--text-primary)',
+                      minWidth: '320px',
+                    }}
+                  />
+                  <button onClick={saveDisplayName} disabled={savingName}
+                    style={{ padding: '8px 14px', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'var(--accent-success)', fontSize: '0.8125rem' }}>
+                    {savingName ? 'Saving…' : 'Save'}
+                  </button>
+                  <button onClick={() => { setEditingName(false); setNameError(null); }}
+                    style={{ padding: '8px 14px', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'var(--text-secondary)', fontSize: '0.8125rem' }}>
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                  <h2 style={{ fontSize: '2rem', fontWeight: 700 }}>{displayName || agentName}</h2>
+                  <button
+                    onClick={() => { setDraftName(displayName); setEditingName(true); }}
+                    title="Rename this device. The label only - the agent's identity does not change."
+                    style={{ padding: '6px', borderRadius: '6px', border: '1px solid var(--border-color)', color: 'var(--text-secondary)' }}>
+                    <Pencil size={14} />
+                  </button>
+                </div>
+              )}
               <div style={{ 
                 padding: '4px 12px', 
                 borderRadius: '20px', 
@@ -273,14 +350,26 @@ const AgentDetail: React.FC = () => {
                 {isOnline ? 'Online' : 'Offline'}
               </div>
             </div>
+            {nameError && (
+              <p style={{ color: 'var(--accent-color)', fontSize: '0.8125rem', marginBottom: '6px' }}>{nameError}</p>
+            )}
             <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem' }}>
+              {/* The real name stays on screen whenever a label is set. It is
+                  what the agent's database, its own config and every SOAR
+                  action are keyed on, so a renamed host still has to be
+                  recognisable in a log line. */}
+              {displayName ? <><span className="mono">{agentName}</span> | </> : null}
               {agentInfo.os_info || 'Generic Linux'} | {agentInfo.public_ip || 'No IP'} | Last seen: {agentInfo.last_seen || 'Just now'}
             </p>
           </div>
           <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
-            <button onClick={handleReloadLicense} title="Reload License" style={{ padding: '10px', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'var(--accent-success)' }}><ShieldCheck size={18} /></button>
             <button onClick={handleRestart} title="Restart Agent" style={{ padding: '10px', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'var(--accent-warning)' }}><RotateCcw size={18} /></button>
             <button onClick={handleSelfDestruct} title="Self Destruct" style={{ padding: '10px', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'var(--accent-color)' }}><Bomb size={18} /></button>
+            <button onClick={downloadReport} disabled={reporting}
+              title="Download a PDF report for this host"
+              style={{ padding: '10px 16px', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'white', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.875rem' }}>
+              <FileDown size={16} /> {reporting ? 'Building…' : 'Report'}
+            </button>
             <button onClick={() => fetchAgentData(true)} style={{ padding: '10px 16px', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'white', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.875rem' }}>
               <RefreshCw size={16} /> Refresh
             </button>
@@ -1698,10 +1787,13 @@ const InsightSection: React.FC<{ label: string, children: React.ReactNode }> = (
 const AIAnalysisTab: React.FC<{ insights: any[], agentName: string }> = ({ insights, agentName }) => {
   const [filter, setFilter] = useState('');
   const [sourceFilter, setSourceFilter] = useState('all');
+  const [showUnanswered, setShowUnanswered] = useState(false);
 
   const sources = Array.from(new Set(insights.map(i => i.source_file).filter(Boolean)));
+  const unansweredCount = countUnanswered(insights);
 
   const filtered = insights.filter(i => {
+    if (!showUnanswered && isUnanswered(i)) return false;
     const matchSource = sourceFilter === 'all' || i.source_file === sourceFilter;
     const haystack = `${i.critical_summary || ''} ${i.source_file || ''}`.toLowerCase();
     const matchText = !filter || haystack.includes(filter.toLowerCase());
@@ -1724,6 +1816,27 @@ const AIAnalysisTab: React.FC<{ insights: any[], agentName: string }> = ({ insig
         <StatPill label="Advisories" value={counts.advice} color="#60a5fa" />
         <StatPill label="Manual Scans" value={counts.manual} color="#a78bfa" />
       </div>
+
+      {unansweredCount > 0 && (
+        <div style={{
+          padding: '10px 14px', borderRadius: '8px', fontSize: '0.8125rem',
+          backgroundColor: 'rgba(148,163,184,0.08)',
+          border: '1px solid var(--border-color)', color: 'var(--text-secondary)',
+          display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap',
+        }}>
+          <span>
+            {unansweredCount} event{unansweredCount === 1 ? '' : 's'} the model
+            could not answer on — it contradicted itself, returned nothing
+            usable, or the event could not be decrypted. Not findings about
+            this host.
+          </span>
+          <button
+            onClick={() => setShowUnanswered(v => !v)}
+            style={{ padding: '4px 10px', borderRadius: '6px', border: '1px solid var(--border-color)', color: 'var(--text-primary)', fontSize: '0.75rem' }}>
+            {showUnanswered ? 'Hide them' : 'Show them'}
+          </button>
+        </div>
+      )}
 
       <div className="card" style={{ padding: '16px', display: 'flex', gap: '12px', flexWrap: 'wrap', alignItems: 'center' }}>
         <input

@@ -115,7 +115,6 @@ export const agentService = {
   
   // Agent Lifecycle
   restartAgent: (agent: string) => api.post(`/${agent}/restart`).then(res => res.data),
-  reloadAgentLicense: (agent: string) => api.post(`/${agent}/reload_license`).then(res => res.data),
   selfDestructAgent: (agent: string) => api.post(`/${agent}/self_destruct`).then(res => res.data),
   // Removes the agent from the platform: drops its telemetry database and
   // deletes its enrolment identity. Distinct from selfDestruct, which tells a
@@ -124,6 +123,20 @@ export const agentService = {
   // The name is sent in the body as well as the path. The server rejects the
   // request unless they match: the realistic mistake is picking the wrong row
   // from a list of DESKTOP-EVS8H9J, -2, -3, -4, and this is irreversible.
+  // Cosmetic only. `agent` stays the identity - its database is named after
+  // it and SOAR actions route by it - so this changes the label and nothing
+  // else. Clearing it falls back to the real name.
+  // Blob, not JSON. axios would otherwise decode the PDF bytes as text and
+  // hand back something that looks like a string and cannot be saved.
+  downloadAgentReport: (agent: string) =>
+    api.get(`/api/agents/${agent}/report.pdf`, { responseType: 'blob' }),
+  downloadFleetReport: () =>
+    api.get('/api/reports/fleet.pdf', { responseType: 'blob' }),
+
+  setAgentDisplayName: (agent: string, displayName: string) =>
+    api.patch(`/api/agents/${agent}/display-name`, { display_name: displayName })
+      .then(res => res.data),
+
   deleteAgent: (agent: string) =>
     api.delete(`/api/agents/${agent}`, { data: { confirm: agent } }).then(res => res.data),
 

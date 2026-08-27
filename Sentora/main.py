@@ -1610,8 +1610,37 @@ async def screen_stream(request, ws):
     frame_interval = 1.0 / fps
     print(f"[screen] stream start fps={fps} q={quality} w={max_width}", flush=True)
 
+    # Opening the capture is its own failure, and the common one on a server.
+    #
+    # A headless Linux host has no X display, so `mss.mss()` raises before a
+    # single frame exists. That used to fall into the generic handler below:
+    # the agent logged it, the socket closed with no explanation, and the
+    # console showed "Connected" beside a broken image - which reads as a
+    # broken feature rather than as a machine with no screen.
     try:
-        with _mss.mss() as sct:
+        capture = _mss.mss()
+    except Exception as e:
+        detail = str(e) or type(e).__name__
+        if platform.system() != "Windows" and not os.environ.get("DISPLAY"):
+            detail = ("no display on this host (DISPLAY is unset). A headless "
+                      "server has no screen to stream.")
+        print(f"[screen] cannot open a capture: {detail}", flush=True)
+        try:
+            await ws.send(json.dumps({"error": f"no screen available - {detail}"}))
+        except Exception:
+            # The socket is being closed on the next line either way, and the
+            # reason has already been logged. A browser that has gone away
+            # cannot be told anything.
+            pass
+        await ws.close(code=1011, reason="no display")
+        return
+
+    try:
+        with capture as sct:
+            if not sct.monitors:
+                await ws.send(json.dumps({"error": "no monitors detected"}))
+                await ws.close(code=1011, reason="no monitors")
+                return
             monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
             while True:
                 t0 = asyncio.get_event_loop().time()

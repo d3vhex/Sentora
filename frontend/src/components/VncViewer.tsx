@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { MonitorOff } from 'lucide-react';
 
 interface VncViewerProps {
   agentName: string;
@@ -11,6 +12,9 @@ const VncViewer: React.FC<VncViewerProps> = ({ agentName }) => {
   const [status, setStatus] = useState<string>('Connecting...');
   const [fps, setFps] = useState<number>(10);
   const [quality, setQuality] = useState<number>(60);
+  // Whether a frame has ever arrived. Drives the placeholder below, because
+  // an <img> with no src paints a broken-image icon.
+  const [hasFrame, setHasFrame] = useState<boolean>(false);
 
   useEffect(() => {
     if (!agentName) return;
@@ -19,6 +23,7 @@ const VncViewer: React.FC<VncViewerProps> = ({ agentName }) => {
     const wsUrl = `${protocol}://${host}/vnc-proxy/${agentName}?fps=${fps}&q=${quality}&w=1280`;
 
     setStatus('Connecting...');
+    setHasFrame(false);
     let frameCount = 0;
     let lastFpsCheck = Date.now();
 
@@ -47,6 +52,7 @@ const VncViewer: React.FC<VncViewerProps> = ({ agentName }) => {
       if (lastUrlRef.current) URL.revokeObjectURL(lastUrlRef.current);
       lastUrlRef.current = url;
       if (imgRef.current) imgRef.current.src = url;
+      setHasFrame(true);
 
       frameCount += 1;
       const now = Date.now();
@@ -99,8 +105,32 @@ const VncViewer: React.FC<VncViewerProps> = ({ agentName }) => {
           </span>
         </div>
       </div>
-      <div style={{ flex: 1, backgroundColor: '#000', minHeight: '600px', display: 'flex', justifyContent: 'center', alignItems: 'center', overflow: 'hidden' }}>
-        <img ref={imgRef} alt="Remote desktop" style={{ maxWidth: '100%', maxHeight: '100%', display: 'block' }} />
+      <div style={{ flex: 1, backgroundColor: '#000', minHeight: '600px', display: 'flex', justifyContent: 'center', alignItems: 'center', overflow: 'hidden', padding: '24px' }}>
+        {/* The <img> is mounted only once a frame has arrived. An <img> with
+            no src renders as a broken-image icon, which is what a headless
+            server used to show beside a green "Connected" chip - a broken
+            feature, rather than a machine with no screen. */}
+        <img
+          ref={imgRef}
+          alt=""
+          style={{
+            maxWidth: '100%', maxHeight: '100%',
+            display: hasFrame ? 'block' : 'none',
+          }}
+        />
+        {!hasFrame && (
+          <div style={{ textAlign: 'center', maxWidth: '52ch', color: 'var(--text-secondary)' }}>
+            <MonitorOff size={40} style={{ opacity: 0.5, marginBottom: '14px' }} />
+            <div style={{ fontSize: '0.9375rem', color: 'var(--text-primary)', marginBottom: '8px' }}>
+              {isErr ? 'No screen to show' : 'Waiting for the first frame…'}
+            </div>
+            <div style={{ fontSize: '0.8125rem', lineHeight: 1.6 }}>
+              {isErr
+                ? status.replace(/^Agent:\s*/, '')
+                : 'If nothing appears, the host may have no display — a headless server has no screen to stream.'}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
