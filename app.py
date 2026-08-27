@@ -8,7 +8,7 @@ import time
 from enum import Enum
 import re
 from sanic_cors import CORS
-from sanic.response import json, file, HTTPResponse
+from sanic.response import json, file, HTTPResponse, raw
 import multiprocessing
 import json as pyjson
 from mysql.connector.aio import connect 
@@ -5928,6 +5928,88 @@ async def db_status(request):
     except Exception as e:
         return sanic_json({"error": f"Database connection failed: {e}"}, status=500)
 
+
+def _agent_display_names() -> dict:
+    """agent_name -> display_name, for the agents that have one.
+
+    Missing column and missing table both come back empty. This runs on the
+    agents list, which is the first page an operator opens; failing it over a
+    cosmetic column would hide the entire estate.
+    """
+    try:
+        with sync_mysql_conn("userdb") as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    "SELECT agent_name, display_name FROM agent_identities "
+                    "WHERE display_name IS NOT NULL AND display_name <> ''")
+                return {row[0]: row[1] for row in cur.fetchall()}
+            finally:
+                cur.close()
+    except Exception as e:
+        print(f"[!] could not read agent display names: {e}", flush=True)
+        return {}
+
+
+@app.patch("/api/agents/<agent>/display-name")
+@require_permission("manage_agent")
+async def set_agent_display_name(request, agent):
+    """Rename a device for display. The agent's identity does not change.
+
+    `agent_name` is what the agent's database is named after
+    (server._sanitize_db_name), what SOAR actions route by, and what the agent
+    holds in its own config. Changing it would mean moving a database,
+    re-issuing the agent's configuration, and reconciling every stored row
+    that refers to the old name.
+
+    What an operator actually wants is to see "Web server 1" instead of
+    "ip-172-31-42-49", and that is what this does. Clearing it falls back to
+    the real name rather than leaving a device with no label at all.
+    """
+    body = request.json or {}
+    raw = body.get("display_name")
+    name = (str(raw).strip() if raw is not None else "")
+
+    if len(name) > 128:
+        return sanic_json({"status": "error",
+                           "message": "display name is limited to 128 characters"},
+                          status=400)
+    # Control characters would corrupt the console's own log lines, where
+    # agent names are interpolated into text an operator reads.
+    if any(ch in name for ch in ("\x00", "\n", "\r", "\t")):
+        return sanic_json({"status": "error",
+                           "message": "display name cannot contain control characters"},
+                          status=400)
+
+    def _write():
+        with sync_mysql_conn("userdb") as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT 1 FROM agent_identities WHERE agent_name=%s", (agent,))
+                if not cur.fetchone():
+                    return False
+                cur.execute(
+                    "UPDATE agent_identities SET display_name=%s WHERE agent_name=%s",
+                    (name or None, agent))
+                conn.commit()
+                return True
+            finally:
+                cur.close()
+
+    try:
+        found = await asyncio.to_thread(_write)
+    except Exception as e:
+        return sanic_json({"status": "error", "message": str(e)}, status=500)
+
+    if not found:
+        return sanic_json({"status": "error", "message": "unknown agent"}, status=404)
+
+    await audit_log(request, "RENAME_AGENT", agent,
+                    f"display name set to {name!r}" if name
+                    else "display name cleared")
+    return sanic_json({"status": "success", "agent": agent,
+                       "display_name": name or None})
+
 @require_permission("read_telemetry")
 @app.route("/devices")
 async def list_agents(request):
@@ -5975,7 +6057,14 @@ async def list_agents(request):
                 return {"name": name, "status": "Error", "last_seen": "DB Error", "public_ip": "-", "os_info": "Unknown"}
 
         agent_details = await asyncio.gather(*(get_agent_details(n) for n in agents_names))
-        
+
+        # One query for every agent rather than one per agent: this endpoint
+        # already fans out a connection per host, and the names live together
+        # in userdb.
+        names = await asyncio.to_thread(_agent_display_names)
+        for detail in agent_details:
+            detail["display_name"] = names.get(detail["name"]) or None
+
         return sanic_json({"agents": agent_details})
     except Exception as e:
         return sanic_json({"error": f"Database error while listing agents: {e}"}, status=500)
@@ -6698,38 +6787,8 @@ async def get_attack_coverage(request):
     """
     agent = request.args.get("agent")
 
-    def _observed():
-        seen = {}
-        with sync_mysql_conn() as conn:
-            cursor = conn.cursor()
-            try:
-                cursor.execute("SHOW DATABASES")
-                dbs = [r[0] for r in cursor.fetchall() if r[0].endswith("_db")]
-                if agent:
-                    wanted = _agent_name_forms(agent)[1] + "_db"
-                    dbs = [d for d in dbs if d == wanted]
-                for db in dbs:
-                    try:
-                        cursor.execute(
-                            f"SELECT techniques, COUNT(*) FROM {_quote_identifier(db)}"
-                            f".siem_events WHERE techniques IS NOT NULL "
-                            f"AND techniques <> '' GROUP BY techniques"
-                        )
-                    except Exception:
-                        # An agent enrolled before the column existed. Not an
-                        # error, and not a reason to fail the whole request.
-                        continue
-                    for value, count in cursor.fetchall():
-                        for tech in str(value).split(","):
-                            tech = tech.strip().upper()
-                            if tech:
-                                seen[tech] = seen.get(tech, 0) + int(count)
-            finally:
-                cursor.close()
-        return seen
-
     try:
-        observed = await asyncio.to_thread(_observed)
+        observed = await asyncio.to_thread(_observed_techniques, agent)
     except Exception as e:
         print(f"[!] attack coverage query failed: {e}", flush=True)
         observed = {}
@@ -6749,6 +6808,44 @@ async def get_attack_coverage(request):
         # list surfaced and Sigma has nothing for.
         "uncovered_but_seen": sorted(set(observed) - set(covered)),
     })
+
+
+def _observed_techniques(agent: str | None = None) -> dict:
+    """ATT&CK technique -> how many events carried it.
+
+    Lifted out of the coverage handler so the fleet report can ask the
+    same question. A second copy of this SQL would answer it differently
+    the first time either was changed, and a coverage number that
+    disagrees with itself is worse than one that is merely wrong.
+    """
+    seen = {}
+    with sync_mysql_conn() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SHOW DATABASES")
+            dbs = [r[0] for r in cursor.fetchall() if r[0].endswith("_db")]
+            if agent:
+                wanted = _agent_name_forms(agent)[1] + "_db"
+                dbs = [d for d in dbs if d == wanted]
+            for db in dbs:
+                try:
+                    cursor.execute(
+                        f"SELECT techniques, COUNT(*) FROM {_quote_identifier(db)}"
+                        f".siem_events WHERE techniques IS NOT NULL "
+                        f"AND techniques <> '' GROUP BY techniques"
+                    )
+                except Exception:
+                    # An agent enrolled before the column existed. Not an
+                    # error, and not a reason to fail the whole request.
+                    continue
+                for value, count in cursor.fetchall():
+                    for tech in str(value).split(","):
+                        tech = tech.strip().upper()
+                        if tech:
+                            seen[tech] = seen.get(tech, 0) + int(count)
+        finally:
+            cursor.close()
+    return seen
 
 
 def _sigma_technique_index() -> set:
@@ -6779,6 +6876,155 @@ def _sigma_technique_index() -> set:
 
     return techniques
 
+
+
+
+# ---------------------------------------------------------------------------
+# Reports
+# ---------------------------------------------------------------------------
+
+def _report_rows(agent: str, table: str, limit: int = 500) -> list:
+    """Rows from one agent table, decrypted, for a report.
+
+    Uses `core.telemetry_crypto` rather than a second decrypt implementation.
+    The one this file used to carry was case-sensitive about the `enc::`
+    prefix and silently returned ciphertext - which is how the vulnerability
+    scanner asked OSV about a package named `enc::gAAAA...` for a year.
+    """
+    from core import telemetry_crypto
+
+    rows = _fetch_rows_safely(
+        _agent_db_name(agent),
+        f"SELECT * FROM {_quote_identifier(table)} ORDER BY id DESC LIMIT %s",
+        (limit,), f"{table} for {agent}")
+    return [telemetry_crypto.decrypt_item(table, dict(r)) for r in (rows or [])]
+
+
+async def _gather_agent_report(agent: str) -> dict:
+    """Everything one host's report needs, and what could not be read."""
+    from core import telemetry_crypto
+
+    info_rows = _fetch_rows_safely(
+        _agent_db_name(agent),
+        "SELECT public_ip, os_info, last_seen, hostname, mac_address "
+        "FROM agent_info ORDER BY last_seen DESC LIMIT 1",
+        (), f"agent_info for {agent}")
+    info = dict(info_rows[0]) if info_rows else {}
+
+    siem = await asyncio.to_thread(_report_rows, agent, "siem_events")
+    alerts = await asyncio.to_thread(_report_rows, agent, "events_alert")
+    vulns = await asyncio.to_thread(_report_rows, agent, "vulnerabilities_report")
+    packages = await asyncio.to_thread(_report_rows, agent, "packages")
+    insights = await asyncio.to_thread(_report_rows, agent, "ai_analysis_results")
+
+    names = await asyncio.to_thread(_agent_display_names)
+
+    # An agent can look healthy and have sent nothing: the address, hostname
+    # and MAC arrive in the connection header, which needs no database on the
+    # endpoint. Saying so is the difference between "quiet host" and "broken
+    # collection", which look identical on paper.
+    no_telemetry = not any((siem, alerts, packages, insights))
+
+    note = None
+    if packages:
+        encrypted = sum(1 for p in packages
+                        if str(p.get("package", "")).lower().startswith("enc::"))
+        if encrypted == len(packages):
+            note = (f"all {len(packages)} package names are still encrypted - "
+                    f"this server's key does not match the agent's")
+
+    return {
+        "display_name": names.get(agent),
+        "info": info,
+        "siem_events": siem,
+        "alerts": alerts,
+        "vulnerabilities": vulns,
+        "package_count": len(packages),
+        "ai_insights": insights,
+        "no_telemetry": no_telemetry,
+        "vuln_scan_note": note,
+    }
+
+
+def _pdf_response(pdf: bytes, filename: str):
+    return raw(pdf, content_type="application/pdf", headers={
+        # `attachment` rather than inline: a PDF rendered in the browser from
+        # the API origin would run in that origin's context.
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control": "no-store",
+    })
+
+
+@app.get("/api/agents/<agent>/report.pdf")
+@require_permission("read_telemetry")
+async def agent_report_pdf(request, agent):
+    """One host, as a PDF."""
+    from core.reporting import build_agent_report, filename_for, render_pdf
+
+    try:
+        data = await _gather_agent_report(agent)
+        report = build_agent_report(agent, data)
+        pdf = await asyncio.to_thread(render_pdf, report)
+    except Exception as e:
+        print(f"[!] agent report failed for {agent}: {e}", flush=True)
+        return sanic_json({"status": "error", "message": str(e)}, status=500)
+
+    await audit_log(request, "EXPORT_REPORT", agent,
+                    f"agent PDF, {len(report.caveats)} caveat(s)")
+    return _pdf_response(pdf, filename_for(report))
+
+
+@app.get("/api/reports/fleet.pdf")
+@require_permission("read_telemetry")
+async def fleet_report_pdf(request):
+    """The estate, as a PDF."""
+    from core.reporting import build_fleet_report, filename_for, render_pdf
+
+    try:
+        listing = await list_agents(request)
+        agents = (listing.raw_body and pyjson.loads(listing.body).get("agents")) or []
+    except Exception as e:
+        print(f"[!] fleet report could not list agents: {e}", flush=True)
+        agents = []
+
+    silent, totals, findings = [], {}, []
+    for entry in agents:
+        name = entry.get("name")
+        if not name:
+            continue
+        try:
+            vulns = await asyncio.to_thread(_report_rows, name,
+                                            "vulnerabilities_report", 2000)
+            alerts = await asyncio.to_thread(_report_rows, name, "events_alert", 200)
+            siem = await asyncio.to_thread(_report_rows, name, "siem_events", 1)
+            totals[name] = len(vulns)
+            if not siem and not alerts:
+                silent.append(name)
+            for a in alerts:
+                if str(a.get("source", "")).startswith("Correlation/"):
+                    findings.append({**a, "agent": name})
+        except Exception as e:
+            print(f"[!] fleet report: {name} skipped ({e})", flush=True)
+
+    observed = await asyncio.to_thread(_observed_techniques)
+
+    report = build_fleet_report({
+        "agents": agents,
+        "silent_agents": silent,
+        "covered_techniques": sorted(_sigma_technique_index()),
+        "observed_techniques": sorted(observed),
+        "correlation_findings": findings,
+        "vulnerability_totals": totals,
+    })
+    try:
+        pdf = await asyncio.to_thread(render_pdf, report)
+    except Exception as e:
+        print(f"[!] fleet report render failed: {e}", flush=True)
+        return sanic_json({"status": "error", "message": str(e)}, status=500)
+
+    await audit_log(request, "EXPORT_REPORT", "fleet",
+                    f"{len(agents)} agent(s), {len(report.caveats)} caveat(s)")
+    return _pdf_response(pdf, filename_for(report))
 
 @app.get("/api/dashboard/summary")
 @require_permission("read_telemetry")

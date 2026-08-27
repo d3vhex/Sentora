@@ -17,6 +17,7 @@ Public surface:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json as _json
 import os
@@ -106,8 +107,19 @@ def _make_dup_fp(pkg_name: str, pkg_version: str, vuln_id: str) -> str:
 
 
 def _decrypt_field(val: Any, fernet: Fernet) -> Any:
-    """Best-effort decrypt: plaintext returned as-is, ENC:: tokens decrypted."""
-    if not isinstance(val, str) or not val.startswith(ENC_PREFIX):
+    """Best-effort decrypt: plaintext returned as-is, `enc::` tokens decrypted.
+
+    The prefix comparison is case-insensitive because this module spelled it
+    `ENC::` while the agent writes `enc::`
+    (`Sentora/modules/enc_db.ENC_PREFIX`). Nothing ever matched, so every
+    value was returned as ciphertext and the scanner asked OSV about a package
+    literally named `enc::gAAAAABq...`.
+
+    That returns no vulnerabilities, for every agent, forever - and looks
+    exactly like a clean estate. `packages` is encrypted on every agent, so
+    this scan has never produced a finding.
+    """
+    if not isinstance(val, str) or not val.lower().startswith(ENC_PREFIX.lower()):
         return val
     token = val[len(ENC_PREFIX):]
     try:
@@ -117,6 +129,9 @@ def _decrypt_field(val: Any, fernet: Fernet) -> Any:
         except Exception:
             return pt.decode("utf-8")
     except InvalidToken:
+        # Returned as-is on purpose - the row still happened - but the caller
+        # has to notice. A package list that is entirely ciphertext produces
+        # zero findings and reads as a clean host.
         return val
 
 
@@ -454,6 +469,49 @@ async def _insert_findings(agent: str, findings: List[dict], connect_db_for_agen
     return inserted
 
 
+
+# Tables the agent fills from its own local database. An agent whose postgres
+# is unreachable sends none of them, while still appearing online: the IP, MAC
+# and hostname on the agent page arrive in the connection header and need no
+# database at all.
+_TELEMETRY_TABLES = ("packages", "siem_events", "process_events",
+                     "network_connections", "resource_usage")
+
+
+async def _agent_has_no_telemetry(agent: str, connect_db_for_agent) -> bool:
+    """True when every telemetry table is empty.
+
+    Distinguishes "this scan found nothing" from "this agent has never sent
+    anything", which need different actions and look identical in a console
+    showing an empty table.
+    """
+    try:
+        cnx = await connect_db_for_agent(agent)
+    except Exception:
+        return False                    # cannot tell; do not claim it is empty
+    try:
+        cur = await cnx.cursor()
+        try:
+            for table in _TELEMETRY_TABLES:
+                try:
+                    await cur.execute(f"SELECT 1 FROM `{table}` LIMIT 1")
+                    if await cur.fetchone():
+                        return False
+                except Exception:
+                    # A table that does not exist yet is as empty as one that
+                    # does, for this question.
+                    continue
+            return True
+        finally:
+            await cur.close()
+    finally:
+        # Closing a connection that is already gone changes nothing, and this
+        # runs inside the answer to "why did the scan find nothing" - it must
+        # not become the reason there is no answer.
+        with contextlib.suppress(Exception):
+            await cnx.close()
+
+
 async def scan_agent(agent: str, fernet_key: str | bytes, connect_db_for_agent: Callable) -> dict:
     """Run an OSV scan for one agent and persist new findings.
 
@@ -463,7 +521,41 @@ async def scan_agent(agent: str, fernet_key: str | bytes, connect_db_for_agent: 
 
     pkgs = await _fetch_decrypted_packages(agent, fernet, connect_db_for_agent)
     if not pkgs:
-        return {"agent": agent, "ecosystem": None, "packages": 0, "hits": 0, "inserted": 0, "skipped_reason": "no_packages"}
+        # "no_packages" on its own reads as "this host has no software", which
+        # is never true. The usual cause is an agent that connects but has
+        # sent no telemetry at all: its own local postgres is unreachable, so
+        # every table stays empty while the console still shows the host
+        # ONLINE with an IP, a MAC and a hostname - those come from the
+        # connection header and need no database.
+        #
+        # Saying which is easy from here, and saves an operator going through
+        # the OSV scanner looking for a fault that is on the endpoint.
+        empty = await _agent_has_no_telemetry(agent, connect_db_for_agent)
+        reason = ("agent has sent no telemetry at all - its local database is "
+                  "probably unreachable; check `docker ps` on the host and "
+                  "`journalctl -u sentora-agent`"
+                  if empty else
+                  "no packages collected yet - the inventory runs on a timer "
+                  "after the agent starts")
+        return {"agent": agent, "ecosystem": None, "packages": 0, "hits": 0,
+                "inserted": 0, "skipped_reason": reason}
+
+    # A package list that is still ciphertext produces zero findings and reads
+    # as a clean host, which is the most dangerous way for this scan to fail.
+    # It failed exactly that way for a long time: the prefix comparison in
+    # _decrypt_field was case-sensitive and did not match what the agent
+    # writes, so every name went to OSV as `enc::gAAAAABq...`.
+    undecrypted = sum(1 for p in pkgs
+                      if str(p.get("package", "")).lower().startswith(ENC_PREFIX.lower()))
+    if undecrypted == len(pkgs):
+        return {"agent": agent, "ecosystem": None, "packages": len(pkgs),
+                "hits": 0, "inserted": 0,
+                "skipped_reason": (
+                    f"all {len(pkgs)} package names are still encrypted - this "
+                    f"server's key does not match the one the agent used. "
+                    f"Restart the agent so it re-fetches from "
+                    f"/api/agents/bootstrap; rows already stored under the old "
+                    f"key stay unreadable.")}
 
     os_info = await _fetch_agent_os(agent, connect_db_for_agent)
     ecosystem = _detect_ecosystem(os_info, pkgs)

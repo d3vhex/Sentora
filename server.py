@@ -489,6 +489,45 @@ async def recv_all(reader, length):
         data += more
     return data
 
+
+def observed_peer_ip(writer) -> str | None:
+    """The address this connection actually came from, when it tells us more
+    than the agent already did.
+
+    Returns None when the peer is loopback or link-local, because that means
+    the agent is on this host or reaching us through something local, and its
+    own idea of its address is the better one.
+
+    Private ranges are *kept*. On a flat corporate LAN 10.x is the real
+    address of the machine and there is nothing more public to have; the case
+    this exists for is a cloud VM, where the agent sees 172.31.x and the
+    server sees the elastic IP.
+    """
+    try:
+        peer = writer.get_extra_info("peername")
+    except Exception:
+        return None
+    if not peer:
+        return None
+
+    host = peer[0] if isinstance(peer, (tuple, list)) else str(peer)
+    if not host:
+        return None
+
+    # IPv4-mapped IPv6, which is what a dual-stack listener reports.
+    if host.startswith("::ffff:"):
+        host = host[len("::ffff:"):]
+
+    try:
+        import ipaddress
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    if addr.is_loopback or addr.is_link_local or addr.is_unspecified:
+        return None
+    return host
+
+
 async def handle_client(reader, writer):
     try:
         raw_len = await recv_all(reader, 4)
@@ -497,7 +536,19 @@ async def handle_client(reader, writer):
 
         raw_ip_len = await recv_all(reader, 4)
         (ip_len,) = struct.unpack('!I', raw_ip_len)
-        public_ip = (await recv_all(reader, ip_len)).decode('utf-8')
+        claimed_ip = (await recv_all(reader, ip_len)).decode('utf-8')
+
+        # What we observed beats what we were told.
+        #
+        # The agent works its own address out from a UDP route lookup, which
+        # is the right thing to do - it contacts nothing and works air-gapped.
+        # On a cloud VM behind NAT it returns the private address: an EC2 host
+        # reported 172.31.42.49 while the world saw 16.171.42.197, and the
+        # console labelled the private one "Primary IP".
+        #
+        # The peer address of an established TCP connection is the one thing
+        # here that cannot be wrong, and cannot be forged by the agent either.
+        public_ip = observed_peer_ip(writer) or claimed_ip
 
         raw_os_len = await recv_all(reader, 4)
         (os_len,) = struct.unpack('!I', raw_os_len)

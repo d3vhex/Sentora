@@ -5,11 +5,13 @@ import {
   Filter,
   Clock,
   RefreshCw,
+  FileDown,
   ChevronRight,
   Trash2,
   AlertTriangle
 } from 'lucide-react';
 import { agentService } from '../services/api';
+import { saveBlobResponse } from '../utils/downloadBlob';
 import { Link } from 'react-router-dom';
 
 const Agents: React.FC = () => {
@@ -21,6 +23,7 @@ const Agents: React.FC = () => {
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [reporting, setReporting] = useState(false);
 
   useEffect(() => {
     fetchAgents(true);
@@ -39,6 +42,19 @@ const Agents: React.FC = () => {
       console.error("Failed to fetch agents", err);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const downloadFleetReport = async () => {
+    setReporting(true);
+    try {
+      const res = await agentService.downloadFleetReport();
+      saveBlobResponse(res, 'fleet-report.pdf');
+    } catch (err) {
+      console.error('Fleet report failed', err);
+      alert('Could not generate the fleet report.');
+    } finally {
+      setReporting(false);
     }
   };
 
@@ -61,6 +77,7 @@ const Agents: React.FC = () => {
 
   const filteredAgents = agents.filter(agent => 
     agent.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+    (agent.display_name || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
     (agent.public_ip || '').includes(searchTerm) ||
     (agent.os_info || '').toLowerCase().includes(searchTerm.toLowerCase())
   );
@@ -73,6 +90,11 @@ const Agents: React.FC = () => {
           <p style={{ color: 'var(--text-secondary)' }}>Manage and monitor all endpoints connected to the Sentora network.</p>
         </div>
         <div className="flex-responsive" style={{ gap: '12px' }}>
+          <button className="btn-secondary" onClick={downloadFleetReport} disabled={reporting}
+            title="Download a PDF report covering every enrolled host"
+            style={{ padding: '8px 16px', borderRadius: '6px', display: 'flex', alignItems: 'center', gap: '8px', backgroundColor: 'var(--bg-color)' }}>
+            <FileDown size={16} /> {reporting ? 'Building…' : 'Fleet report'}
+          </button>
           <button className="btn-secondary" onClick={() => fetchAgents(true)} style={{ padding: '8px 16px', borderRadius: '6px', display: 'flex', alignItems: 'center', gap: '8px', backgroundColor: 'var(--bg-color)' }}>
             <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
           </button>
@@ -133,8 +155,17 @@ const Agents: React.FC = () => {
                           <Monitor size={16} color="var(--text-secondary)" />
                         </div>
                         <div>
-                          <div style={{ fontWeight: 700, color: 'var(--text-primary)' }}>{agent.name}</div>
-                          <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>{agent.os_info || 'Generic Linux'}</div>
+                          <div style={{ fontWeight: 700, color: 'var(--text-primary)' }}>
+                            {agent.display_name || agent.name}
+                          </div>
+                          {/* The real name stays visible when a label is set.
+                              It is what the database, the agent's own config
+                              and every SOAR action are keyed on, so hiding it
+                              would make a renamed host hard to correlate with
+                              anything else. */}
+                          <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                            {agent.display_name ? agent.name : (agent.os_info || 'Generic Linux')}
+                          </div>
                         </div>
                       </Link>
                     </td>

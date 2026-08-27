@@ -261,3 +261,22 @@ def test_no_compose_at_all_stops_the_install():
     implementation there is nothing to bring it up with."""
     block = LINUX[LINUX.index("No Docker Compose available"):]
     assert "exit 1" in block[:400]
+
+
+def test_the_agents_database_is_not_published_to_the_world():
+    """`5432:5432` binds 0.0.0.0. On a cloud VM that puts the agent's postgres
+    on the public interface behind nothing but the hardcoded credentials in
+    the same file - and it holds everything the agent has collected about the
+    host.
+
+    The agent connects to 127.0.0.1 (modules/db.py DB_HOST), so the wider bind
+    was never buying anything.
+    """
+    import pathlib
+    compose = (pathlib.Path(__file__).resolve().parent.parent
+               / "Sentora" / "docker-compose.yml").read_text(encoding="utf-8")
+    published = [l.strip() for l in compose.splitlines()
+                 if l.strip().startswith('- "') and ":5432" in l]
+    assert published, "the port mapping disappeared"
+    for line in published:
+        assert line.startswith('- "127.0.0.1:'), line
