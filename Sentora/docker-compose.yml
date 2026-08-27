@@ -11,6 +11,13 @@ services:
       - db_data:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
-      - "5432:5432"
+      # Loopback only. `5432:5432` binds 0.0.0.0, which on a cloud VM puts
+      # this database on the public interface behind nothing but the
+      # hardcoded sentorauser/sentorapass above - and it holds everything the
+      # agent has collected about the host.
+      #
+      # The agent connects to 127.0.0.1 (modules/db.py DB_HOST), so publishing
+      # it wider was never doing anything except widening the exposure.
+      - "127.0.0.1:5432:5432"
 volumes:
   db_data:

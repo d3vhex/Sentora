@@ -10,14 +10,16 @@
 # is platform-specific and a lock produced on Windows describes a build that
 # never happens.
 #
-#   docker run --rm -v "$PWD:/w" -w /w python:3.10-slim sh -c '
-#     pip install --quiet pip-tools &&
-#     pip-compile --quiet --no-header --strip-extras #       --output-file requirements.lock requirements.txt'
+#     python scripts/lock_requirements.py
+#
+# That runs pip-compile inside python:3.10-slim and restores this preamble
+# afterwards. Running pip-compile directly works too, but --no-header strips
+# these lines and the next reader is left with a wall of pins.
 #
 # To take a new version of something, change requirements.txt (add a bound if
 # the change is deliberate) and regenerate. Editing a pin here alone means the
-# next regeneration silently undoes it.
-
+# lock no longer describes what requirements.txt resolves to.
+#
 aio-pika==9.6.2
     # via -r requirements.txt
 aiofiles==25.1.0
@@ -37,7 +39,9 @@ certifi==2026.7.22
 cffi==2.1.1
     # via cryptography
 charset-normalizer==3.5.1
-    # via requests
+    # via
+    #   reportlab
+    #   requests
 cryptography==50.0.0
     # via -r requirements.txt
 dnspython==2.8.0
@@ -85,6 +89,8 @@ pandas==2.3.3
     # via -r requirements.txt
 passlib==1.7.4
     # via -r requirements.txt
+pillow==12.3.0
+    # via reportlab
 propcache==0.5.2
     # via yarl
 protobuf==7.36.0
@@ -112,6 +118,8 @@ python-dotenv==1.2.3
 pytz==2026.3.post1
     # via pandas
 pyyaml==6.0.3
+    # via -r requirements.txt
+reportlab==5.0.1
     # via -r requirements.txt
 requests==2.34.2
     # via

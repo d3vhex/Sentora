@@ -90,13 +90,18 @@ def test_coverage_is_read_from_the_rules_the_agent_loads():
 
 def test_a_database_without_the_column_is_skipped_not_fatal():
     """An agent enrolled before `techniques` existed must not fail the whole
-    request for every other agent."""
-    body = ast.unparse(_handler("get_attack_coverage"))
+    request for every other agent.
+
+    The query moved out of the handler into `_observed_techniques` so the
+    fleet report could ask the same question; a second copy of the SQL would
+    answer it differently the first time either was touched.
+    """
+    body = ast.unparse(_handler("_observed_techniques"))
     assert "continue" in body
 
 
 def test_the_query_quotes_its_identifiers():
-    body = ast.unparse(_handler("get_attack_coverage"))
+    body = ast.unparse(_handler("_observed_techniques"))
     assert "_quote_identifier" in body
 
 

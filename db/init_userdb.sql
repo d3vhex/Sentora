@@ -176,6 +176,17 @@ CREATE TABLE IF NOT EXISTS enrollment_tokens (
 CREATE TABLE IF NOT EXISTS agent_identities (
     id INT AUTO_INCREMENT PRIMARY KEY,
     agent_name VARCHAR(128) NOT NULL UNIQUE,
+    -- What an operator chose to call this host. Cosmetic on purpose.
+    --
+    -- `agent_name` is the identity: the agent's database is named after it
+    -- (server._sanitize_db_name), SOAR actions route by it, and the agent
+    -- holds it in its own config. Renaming that would mean moving a database,
+    -- re-issuing the agent's configuration, and reconciling every stored row
+    -- that references the old name - for what is, in practice, a request to
+    -- see "Web server 1" instead of "ip-172-31-42-49".
+    --
+    -- NULL means nobody has renamed it, and the UI falls back to agent_name.
+    display_name VARCHAR(128) NULL,
     agent_key CHAR(64) NOT NULL UNIQUE,
     os_type VARCHAR(32),
     hostname VARCHAR(255),

@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { BrainCircuit, Play, Clock, Search, ShieldAlert, Cpu, RefreshCw, Layers } from 'lucide-react';
 import api, { agentService } from '../services/api';
 import { InsightCard } from './AgentDetail';
+import { isUnanswered, countUnanswered } from '../lib/insightTriage';
 
 const AIAnalysis: React.FC = () => {
   const [agents, setAgents] = useState<any[]>([]);
@@ -146,6 +147,12 @@ const AIAnalysis: React.FC = () => {
   // columns exist carry NULL and are excluded once a verdict filter is on —
   // showing them would imply a verdict nobody recorded.
   const filteredInsights = insights.filter(i => {
+    // Rows the model could not answer on are not findings about a host: it
+    // contradicted itself, returned nothing parseable, or the event never
+    // reached it because it would not decrypt. They stay recorded and stay
+    // counted below, but they do not sit in the feed burying real ones.
+    // Asking for them by verdict still shows them.
+    if (verdictFilter !== 'INSUFFICIENT_DATA' && isUnanswered(i)) return false;
     if (agentFilter !== 'all' && i.agent !== agentFilter) return false;
     if (verdictFilter !== 'all' && (i.verdict || '') !== verdictFilter) return false;
     if (minConfidence > 0 && Number(i.confidence ?? 0) < minConfidence) return false;
@@ -160,6 +167,7 @@ const AIAnalysis: React.FC = () => {
   // the difference between "no CRITICAL findings" and "no CRITICAL findings
   // among the rows that carry a verdict".
   const legacyRows = insights.filter(i => i.verdict == null).length;
+  const unansweredRows = countUnanswered(insights);
 
   return (
     <div style={{ paddingBottom: '60px' }}>
@@ -287,6 +295,20 @@ const AIAnalysis: React.FC = () => {
             <p style={{ fontSize: '0.75rem', color: 'var(--accent-warning)', marginBottom: '12px', paddingLeft: '4px' }}>
               {legacyRows} older insight{legacyRows === 1 ? '' : 's'} carry no verdict column and
               are not included in this filter.
+            </p>
+          )}
+
+          {/* Hidden as rows, still visible as a number — and reachable, so
+              nobody has to guess whether the model is answering at all. */}
+          {verdictFilter !== 'INSUFFICIENT_DATA' && unansweredRows > 0 && (
+            <p style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '12px', paddingLeft: '4px' }}>
+              {unansweredRows} event{unansweredRows === 1 ? '' : 's'} produced no usable
+              verdict and {unansweredRows === 1 ? 'is' : 'are'} not shown —{' '}
+              <button
+                onClick={() => setVerdictFilter('INSUFFICIENT_DATA')}
+                style={{ background: 'none', border: 'none', padding: 0, color: 'var(--accent-secondary)', cursor: 'pointer', font: 'inherit', textDecoration: 'underline' }}>
+                show them
+              </button>.
             </p>
           )}
 

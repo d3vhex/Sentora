@@ -508,6 +508,87 @@ def correlated_events(correlator, fields, enricher, source, when=None):
     return out
 
 
+
+# ---------------------------------------------------------------------------
+# Not our own output
+# ---------------------------------------------------------------------------
+#
+# The agent logs through syslog, and it reads syslog. Its own lines look like
+#
+#     ip-172-31-42-49 main[28054]: 2026-08-27 07:34:25 [INFO] [root] [+] \
+#         resource_usage sent (1 rows)
+#
+# and `conf/rules.yaml`'s KEYWORD ACCESS rule matches `\b(?:sudo|ssh|root)\b`.
+# The logger name is `root`, so **every line the agent writes matched a
+# detection rule**.
+#
+# That is a loop, not just noise: each event the agent sends produces a "sent
+# (N rows)" line, which becomes another event, which is sent, which produces
+# another line. One host reached 60,015 rate-limited events, and every one
+# that got through cost an AI triage.
+#
+# Identity, not text
+# ------------------
+# The obvious fix is to filter on the text, and it would be a hole: anything
+# that can write to syslog could prefix a line with the agent's signature and
+# become invisible. So this matches on *process identity* where the journal
+# provides it - our own PID, our own systemd unit - which another process
+# cannot claim.
+#
+# The plain-file path has only text, and there the check is deliberately
+# narrow: the program name and PID exactly as the logging daemon wrote them,
+# for this process only. A local process using the syslog API can still forge
+# that; the journal path cannot be forged, and is the one running on any host
+# with systemd. Stated rather than hidden.
+
+_OWN_PID = os.getpid()
+_OWN_UNIT = "sentora-agent.service"
+
+
+def _journal_says(entry: dict) -> Optional[bool]:
+    """Who the journal says wrote this. `None` when it does not say.
+
+    Fields arrive as `str`, `bytes`, or `int` depending on which reader is
+    installed, so everything is normalised before comparison.
+    """
+    def field(name: str) -> str:
+        value = entry.get(name)
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", "replace")
+        return str(value).strip()
+
+    pid, unit = field("_PID"), field("_SYSTEMD_UNIT")
+    if not pid and not unit:
+        return None  # nothing authoritative here; fall back to the text
+    return pid == str(_OWN_PID) or unit == _OWN_UNIT
+
+
+def is_own_output(line: str = "", entry: dict = None) -> bool:
+    """True when this line is something this agent itself logged."""
+    if entry:
+        try:
+            verdict = _journal_says(entry)
+        except Exception:
+            verdict = None
+        # When the journal names the writer it is the answer, both ways. Not
+        # falling through to the text is the point: otherwise a line from
+        # `attacker.service` that contains our PID would be dropped as ours,
+        # and forging invisibility would cost one string.
+        if verdict is not None:
+            return verdict
+
+    if not line:
+        return False
+
+    # No identity available (plain log file). `main[28054]:` is our program
+    # name and PID as the logging daemon wrote it - narrow on purpose, and
+    # forgeable by a local process holding the syslog API. That residual hole
+    # is why the journal path above never reaches here.
+    return f"main[{_OWN_PID}]:" in line
+
+
 def make_dup_fp_for_event(message: str) -> str:
     msg = (message or "").strip()
     return hashlib.sha256(msg.encode("utf-8")).hexdigest()
@@ -551,6 +632,13 @@ def enhanced_follow_file(path: str, rules_list: List[Dict],
                                                    enricher, path):
                         event_queue.put(extra)
                         metrics.increment('events_processed')
+
+                    # Before classifying, not after: a line we wrote is not
+                    # an event whatever a rule thinks of it, and matching it
+                    # is what created the feedback loop.
+                    if is_own_output(line=line):
+                        metrics.increment('excluded_events')
+                        continue
 
                     hit = classify(line, fields, sigma_rules, rules_list)
                     if hit is None:
@@ -612,6 +700,10 @@ def enhanced_follow_journal(rules_list: List[Dict], exclude_patterns, enricher: 
 
                     if not rate_limiter.is_allowed():
                         metrics.increment('rate_limited_events')
+                        continue
+
+                    if is_own_output(line=msg, entry=entry):
+                        metrics.increment('excluded_events')
                         continue
 
                     fields = sigma_journal_fields(entry)

@@ -157,6 +157,25 @@ async def init_enrollment_tables():
                         INDEX idx_revoked (revoked_at)
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """)
+
+                # `CREATE TABLE IF NOT EXISTS` leaves an existing table alone,
+                # so without this the column only appears on installations
+                # made after today. Guarded by information_schema rather than
+                # a swallowed exception: a DDL that fails for some other
+                # reason should be visible, not indistinguishable from
+                # "already applied".
+                cur.execute("""
+                    SELECT COUNT(*) FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'agent_identities'
+                      AND COLUMN_NAME = 'display_name'
+                """)
+                if not cur.fetchone()[0]:
+                    cur.execute(
+                        "ALTER TABLE agent_identities "
+                        "ADD COLUMN display_name VARCHAR(128) NULL AFTER agent_name")
+                    print("[Enrollment] Added agent_identities.display_name.")
+
                 conn.commit()
             finally:
                 cur.close()
