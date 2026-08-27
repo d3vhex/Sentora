@@ -39,7 +39,15 @@ TREE = ast.parse(SRC)
 # The socket is closed on the next line and the reason is already in the
 # agent log, so a browser that has gone away cannot be told anything and
 # nothing is lost by the failure.
-KNOWN_SWALLOWED_MAX = 85
+# 86: `screen_capture._quietly_close`, the one place that discards Windows
+# handles. It is reached only on a path that has already succeeded or already
+# failed for another reason, and a handle that is already closed - or belongs
+# to a process that has exited - raises there and means nothing. Every other
+# failure in that module is reported, including the two that look like
+# disposal and are not: a frame pipe that cannot be put in binary mode would
+# corrupt every frame silently, and a helper that will not terminate is a
+# process screenshotting a desktop with nobody watching.
+KNOWN_SWALLOWED_MAX = 86
 
 
 def _bare_pass_handlers():
