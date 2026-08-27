@@ -8,6 +8,12 @@ CREATE TABLE IF NOT EXISTS agent_info (
   hostname    VARCHAR(255),
   mac_address VARCHAR(48),
   public_ip   VARCHAR(45),
+  -- What the agent says its own address is. Kept alongside public_ip
+  -- because neither is reliably the callable one: behind NAT the
+  -- observed address is right, but when the server runs in Docker on
+  -- the agent's own machine the observed address is the bridge
+  -- gateway and only this one has a listener on it.
+  reported_ip VARCHAR(45),
   os_info     VARCHAR(255),
   last_seen   TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   UNIQUE KEY unique_agent (agent_name)

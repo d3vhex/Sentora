@@ -328,7 +328,26 @@ def compute_fingerprint(table: str, item: dict) -> str:
 # the same value - see the note there.
 from core.triage import compute_ai_fingerprint  # noqa: E402,F401
 
-def update_agent_info(agent: str, public_ip: str, os_info: str = None, hostname: str = None, mac_address: str = None):
+def update_agent_info(agent: str, public_ip: str, os_info: str = None, hostname: str = None,
+                      mac_address: str = None, reported_ip: str = None):
+    """Record where this agent is, from both vantage points.
+
+    `public_ip` is what we observed the connection coming from; `reported_ip`
+    is what the agent worked out about itself. They are usually the same, and
+    where they differ neither one is simply right:
+
+      - Cloud VM behind NAT: the agent sees 172.31.x, we see the elastic IP.
+        Ours is the one worth showing an operator.
+      - Server in Docker on the same machine as the agent: the connection
+        arrives from the bridge gateway (172.18.0.1), which is a *router*, not
+        the agent. Calling back to it reaches nothing - the agent's own
+        address is the only usable one.
+
+    Overwriting one with the other threw away the address that worked, and
+    server->agent features (VNC, SOAR dispatch) failed with `Connection
+    refused` against an IP that never had a listener on it. Both are kept so
+    the caller can try them in order instead of us guessing here.
+    """
     db_name = create_agent_db_if_not_exists(agent)
     create_tables_if_not_exist(db_name)
     conn = connect_db(db_name)
@@ -337,21 +356,23 @@ def update_agent_info(agent: str, public_ip: str, os_info: str = None, hostname:
         for col, ddl in (
             ("hostname", "ALTER TABLE agent_info ADD COLUMN hostname VARCHAR(255) NULL"),
             ("mac_address", "ALTER TABLE agent_info ADD COLUMN mac_address VARCHAR(48) NULL"),
+            ("reported_ip", "ALTER TABLE agent_info ADD COLUMN reported_ip VARCHAR(45) NULL"),
         ):
             try:
                 cursor.execute(ddl)
             except Exception:
                 pass
         cursor.execute("""
-            INSERT INTO agent_info (agent_name, public_ip, os_info, hostname, mac_address, last_seen)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            INSERT INTO agent_info (agent_name, public_ip, reported_ip, os_info, hostname, mac_address, last_seen)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
             public_ip = VALUES(public_ip),
+            reported_ip = COALESCE(VALUES(reported_ip), reported_ip),
             os_info = VALUES(os_info),
             hostname = COALESCE(VALUES(hostname), hostname),
             mac_address = COALESCE(VALUES(mac_address), mac_address),
             last_seen = VALUES(last_seen)
-        """, (agent, public_ip, os_info, hostname, mac_address, datetime.now()))
+        """, (agent, public_ip, reported_ip, os_info, hostname, mac_address, datetime.now()))
         conn.commit()
     except Exception as e:
         print(f"! Error updating agent info: {e}")
@@ -388,13 +409,15 @@ def _parse_os_info_tail(os_info: str | None):
     return base, hostname, mac
 
 
-async def insert_data(agent: str, table: str, data: list, public_ip: str = None, os_info: str = None):
+async def insert_data(agent: str, table: str, data: list, public_ip: str = None, os_info: str = None,
+                      reported_ip: str = None):
     db_name = create_agent_db_if_not_exists(agent)
     create_tables_if_not_exist(db_name)
 
     clean_os, hostname, mac_address = _parse_os_info_tail(os_info)
     if public_ip or clean_os:
-        update_agent_info(agent, public_ip, clean_os, hostname=hostname, mac_address=mac_address)
+        update_agent_info(agent, public_ip, clean_os, hostname=hostname,
+                          mac_address=mac_address, reported_ip=reported_ip)
 
     conn = connect_db(db_name)
     cursor = conn.cursor()
@@ -569,7 +592,8 @@ async def handle_client(reader, writer):
                 print(f"[ERROR] JSON decode failed from {agent_name}@{public_ip}: {e}")
                 return
 
-        await insert_data(agent_name, fname.replace(".json", ""), data, public_ip, os_info)
+        await insert_data(agent_name, fname.replace(".json", ""), data, public_ip, os_info,
+                          reported_ip=claimed_ip)
         if debug:
             print(f"[INFO] Data received from {agent_name}@{public_ip} ({os_info}) - File: {fname}, Size: {fsize} bytes")
 

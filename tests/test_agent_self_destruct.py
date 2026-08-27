@@ -72,8 +72,75 @@ def test_case_and_trailing_separator_do_not_bypass_the_list():
 
 def test_the_handler_refuses_rather_than_guessing():
     code = _code_of("perform_destruction")
-    assert "Refusing to self-destruct" in code
+    assert "REFUSED" in code
     assert "_destruction_target" in code
+
+
+# --------------------------------------------------------------------------
+# Uninstalling means removing what starts the agent
+# --------------------------------------------------------------------------
+#
+# Self-destruct deleted the install directory and exited, and the agent came
+# back: the Windows scheduled task carries `-RestartCount 99` with a one
+# minute interval and a fifteen-minute watchdog trigger, whose entire purpose
+# is to start the agent whenever it is not running. Exiting is the condition
+# that watchdog reverses. Meanwhile the console showed the action completed.
+
+
+def test_autostart_is_removed_before_anything_is_deleted():
+    """Order is the whole fix. Deleting files while the watchdog is armed does
+    not uninstall the agent, it makes it restart from a damaged install."""
+    code = _code_of("perform_destruction")
+    disable_at = code.find("disable_autostart")
+    delete_at = code.find("Popen")
+    assert disable_at != -1, "perform_destruction no longer disables autostart"
+    assert delete_at != -1, "perform_destruction no longer deletes anything"
+    assert disable_at < delete_at, "files are deleted before autostart is removed"
+
+
+def test_a_failed_autostart_removal_deletes_nothing():
+    """A stale install that still runs is recoverable. A watchdog relaunching
+    a half-deleted binary is not."""
+    code = _code_of("perform_destruction")
+    head = code[:code.find("Popen")]
+    assert "if not removed" in head
+    assert "os._exit(1)" in head
+
+
+def test_removal_is_verified_not_assumed():
+    """`schtasks /Delete` and `systemctl disable` both report success in cases
+    where the unit survives, and the next step is irreversible."""
+    code = _code_of("disable_autostart")
+    assert "_autostart_still_present" in code
+    # The check has to gate the answer, not merely be called next to it.
+    assert "still registered" in code
+
+
+def test_the_linux_unit_file_is_removed_not_just_disabled():
+    """`disable` drops the enablement symlink and leaves the unit, so
+    `systemctl start` still works and a later `enable` brings it all back."""
+    code = _code_of("disable_autostart")
+    assert "/etc/systemd/system/" in code
+    assert "daemon-reload" in code
+
+
+def test_deletion_failures_are_not_silenced():
+    """A running executable is locked on Windows, so removal genuinely fails -
+    and it failed exactly when the watchdog had relaunched the agent, which is
+    the case an operator most needs to hear about."""
+    code = _code_of("perform_destruction")
+    assert "SilentlyContinue" not in code, "a failed uninstall reports nothing"
+    assert "FAILED to remove" in code
+
+
+def test_the_uninstall_log_lives_outside_the_deleted_directory():
+    """Everything the agent normally logs goes through the directory being
+    deleted, so a failed uninstall would explain itself into a file that no
+    longer exists."""
+    source = MAIN.read_text(encoding="utf-8")
+    assert "UNINSTALL_LOG" in source
+    for marker in ("ProgramData", "/var/log/"):
+        assert marker in source, f"{marker} missing from the uninstall log path"
 
 
 def _code_of(name: str) -> str:

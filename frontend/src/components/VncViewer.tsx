@@ -31,16 +31,38 @@ const VncViewer: React.FC<VncViewerProps> = ({ agentName }) => {
     wsRef.current = ws;
     ws.binaryType = 'blob';
 
-    ws.onopen = () => setStatus('Connected');
-    ws.onerror = () => setStatus('Error');
-    ws.onclose = (e) => setStatus(e.reason ? `Closed: ${e.reason}` : 'Closed');
+    // The agent explains itself before it hangs up — "no screen available -
+    // no display on this host", "mss_not_installed" — and the close event
+    // arrives immediately after. Without this flag `onclose` overwrote that
+    // explanation with a bare "Closed", so every distinct cause looked
+    // identical in the console and the one useful sentence was the one thrown
+    // away.
+    let explained = false;
+
+    // Opening this socket only proves the browser reached the server. The
+    // agent may be unreachable, or reachable with nothing to show, and
+    // calling that "Connected" made those look identical.
+    ws.onopen = () => setStatus('Reaching agent…');
+    ws.onerror = () => { if (!explained) setStatus('Error'); };
+    ws.onclose = (e) => {
+      if (explained) return;
+      setStatus(e.reason ? `Closed: ${e.reason}` : 'Closed');
+    };
 
     ws.onmessage = (ev) => {
       // Server can send JSON error frames as text; image frames are blobs.
       if (typeof ev.data === 'string') {
         try {
           const msg = JSON.parse(ev.data);
-          if (msg.error) setStatus(`Agent: ${msg.error}`);
+          if (msg.status === 'agent_connected') {
+            setStatus('Connected');
+            return;
+          }
+          if (msg.error) {
+            explained = true;
+            // `detail` carries the actual reason; `error` alone is a category.
+            setStatus(`Agent: ${msg.detail ? `${msg.error} — ${msg.detail}` : msg.error}`);
+          }
         } catch {
           /* ignore */
         }
