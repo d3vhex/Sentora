@@ -3824,16 +3824,9 @@ async def get_agent_config_proxy(request, agent, cfg_type):
     """Proxy request to agent to get a YAML config file"""
     if cfg_type not in ["rules", "log_paths", "file_scan"]:
         return sanic_json({"status": "error", "message": "Invalid config type"}, status=400)
-    
-    try:
-        base = await _get_agent_http_base(agent)
-        keys = await _get_agent_keys(agent)
-        url = f"{base}/config/{cfg_type}"
 
-        resp = await asyncio.to_thread(_try_agent_request, "GET", url, keys, None, 5)
-        return sanic_json(resp.json(), status=resp.status_code)
-    except Exception as e:
-        return sanic_json({"status": "error", "message": str(e)}, status=500)
+    body, status = await _agent_proxy(agent, "GET", f"/config/{cfg_type}")
+    return sanic_json(body, status=status)
 
 @require_permission("manage_agent")
 @app.post("/<agent>/config/<cfg_type>/validate")
@@ -3876,21 +3869,22 @@ async def set_agent_config_proxy(request, agent, cfg_type):
             "issues": [i.to_dict() for i in issues],
         }, status=400)
 
-    try:
-        base = await _get_agent_http_base(agent)
-        keys = await _get_agent_keys(agent)
-        url = f"{base}/config/{cfg_type}"
+    body, status = await _agent_proxy(agent, "POST", f"/config/{cfg_type}", data)
 
-        resp = await asyncio.to_thread(_try_agent_request, "POST", url, keys, data, 5)
-        await audit_log(request, "CONFIG_PUSH", f"{agent}/{cfg_type}",
-                        f"{len(content)} bytes, {len(issues)} warning(s)")
-        body = resp.json()
-        # Warnings survive a successful push so the operator still sees them.
-        if isinstance(body, dict) and issues:
-            body["issues"] = [i.to_dict() for i in issues]
-        return sanic_json(body, status=resp.status_code)
-    except Exception as e:
-        return sanic_json({"status": "error", "message": str(e)}, status=500)
+    # Audit what happened, not what was attempted: a push that never reached
+    # the agent is not a config change, and recording it as one leaves an
+    # audit trail claiming a sensor was reconfigured when it was not.
+    await audit_log(
+        request,
+        "CONFIG_PUSH" if status < 400 else "CONFIG_PUSH_FAILED",
+        f"{agent}/{cfg_type}",
+        f"{len(content)} bytes, {len(issues)} warning(s)"
+        + ("" if status < 400 else f" - {body.get('message', status)}"))
+
+    # Warnings survive a successful push so the operator still sees them.
+    if isinstance(body, dict) and issues:
+        body["issues"] = [i.to_dict() for i in issues]
+    return sanic_json(body, status=status)
 
 @require_permission("manage_system")
 @app.route("/ai-config/<agent>", methods=["POST"])
@@ -5732,15 +5726,30 @@ async def trigger_self_destruct(request, agent):
     try:
         if is_soar_enabled():
             resp = await call_agent_soar(agent, "self_destruct", "agent", comment="Self-destruct from UI", background_queue=True)
+
+            # What the agent actually reports, not that we managed to ask.
+            #
+            # This recorded SUCCESS whenever the call was delivered, and the
+            # agent answered "Destruction initiated" before doing anything -
+            # so an uninstall that was immediately undone by the scheduled
+            # task's watchdog was logged, and displayed, as completed. The
+            # agent now removes its autostart synchronously and answers with
+            # the result, which is the half of the operation that decides
+            # whether the endpoint is really being uninstalled.
+            ok = bool(resp.get("ok"))
+            detail = resp.get("message") or resp.get("error") or "no detail returned"
             cnx = await connect_db_for_agent(agent)
             cursor = await cnx.cursor()
             await cursor.execute(
                 "INSERT INTO soar_actions (action, target, status, comment) VALUES (%s, %s, %s, %s)",
-                ("self_destruct", "agent", "SUCCESS" if resp.get("ok") else "FAILED", "Self-destruct from UI")
+                ("self_destruct", "agent", "SUCCESS" if ok else "FAILED",
+                 f"Self-destruct from UI - {detail}")
             )
             await cnx.commit()
             await cursor.close(); await cnx.close()
-            return sanic_json({"status": "success", "message": resp.get("message", "Self-destruct command processed")})
+            if not ok:
+                return sanic_json({"status": "error", "message": detail}, status=502)
+            return sanic_json({"status": "success", "message": detail})
         return sanic_json({"status": "error", "message": "SOAR is disabled, cannot queue action"}, status=400)
     except Exception as e:
         return sanic_json({"status": "error", "message": str(e)}, status=500)
@@ -7525,40 +7534,143 @@ def _try_agent_request(method: str, url: str, keys: list, json_body=None, timeou
     return last_resp
 
 
-async def _get_agent_http_base(agent: str) -> str:
-    """The agent's HTTP base URL.
+def _relayed_status(upstream_status: int) -> int:
+    """Translate a status from an agent into one this API can honestly return.
 
-    The address comes from that agent's own `agent_info` row. A missing or
-    malformed one falls back to 127.0.0.1, and AGENT_PORT overrides the port
-    (default 9099).
+    401 and 403 are answers about *this API's* caller. An agent rejecting the
+    key the server presented is a different sentence entirely - the operator's
+    session is fine, and the two systems that failed to authenticate are the
+    server and the agent.
+
+    Relaying it unchanged logged the operator out. The browser's interceptor
+    treats 401 as "your session ended", clears local storage and redirects to
+    the login page, so opening the Config tab of an agent whose key had gone
+    stale threw the operator out of the console - with no message, and nothing
+    wrong with their session.
+
+    502 is what this is: a bad answer from upstream.
     """
-    host = "127.0.0.1"
+    if upstream_status in (401, 403):
+        return 502
+    return upstream_status
+
+
+async def _agent_proxy(agent: str, method: str, path: str, json_body=None,
+                       timeout: int = 5):
+    """Call one path on an agent, trying every address it might be at.
+
+    Returns `(body, status)` ready to hand to `sanic_json`. Never raises for a
+    transport failure: an agent that cannot be reached is an ordinary state of
+    the world, and the operator needs the reason rather than a stack trace
+    turned into a 500 with no body worth reading.
+    """
+    bases = await _agent_http_bases(agent)
+    keys = await _get_agent_keys(agent)
+
+    last_detail = "no address known for this agent"
+    for base in bases:
+        url = f"{base}{path}"
+        try:
+            resp = await asyncio.to_thread(
+                _try_agent_request, method, url, keys, json_body, timeout)
+        except Exception as e:
+            last_detail = f"{base}: {e}"
+            continue
+        if resp is None:
+            last_detail = f"{base}: no response"
+            continue
+
+        if resp.status_code in (401, 403):
+            # Worth trying the other address before concluding anything: a
+            # different host may be the one actually holding this identity.
+            last_detail = (
+                f"the agent rejected this server's key ({resp.status_code}). "
+                f"The agent may have been re-enrolled, or restored from a "
+                f"backup with an older key - restart it so it re-fetches from "
+                f"/api/agents/bootstrap.")
+            continue
+
+        try:
+            body = resp.json()
+        except Exception:
+            # An agent that answers with something other than JSON is still an
+            # answer, and truncating it into the message beats a 500 whose
+            # body is a stack trace.
+            text = (resp.text or "")[:500]
+            body = {"status": "error",
+                    "message": f"agent returned a non-JSON response: {text}"}
+            return body, _relayed_status(resp.status_code) or 502
+        return body, _relayed_status(resp.status_code)
+
+    return ({"status": "error",
+             "message": f"Could not reach {agent}: {last_detail}",
+             "tried": bases},
+            502)
+
+
+async def _agent_http_bases(agent: str) -> list[str]:
+    """Every address this agent might be reachable at, best guess first.
+
+    There are two, and which one works depends on what sits between us:
+
+      `public_ip`    where we saw the connection come from. Right when the
+                     agent is behind NAT - a cloud VM reports 172.31.x and we
+                     see the elastic IP.
+      `reported_ip`  what the agent worked out about itself. Right when *we*
+                     are the ones behind something: with the server in Docker
+                     on the agent's own machine, the connection arrives from
+                     the bridge gateway (172.18.0.1), which is a router with
+                     no agent on it. Calling it back gives `Connection
+                     refused` against an address that never had a listener.
+
+    Neither is reliably the callable one, and the resolver used to return only
+    the first - so a deployment where the observed address was a gateway had
+    VNC and SOAR dispatch fail with an error that named the symptom and hid
+    the cause. Returning both lets the caller find out by trying, which is the
+    only thing here that actually knows.
+    """
+    agent_port = int(os.getenv("AGENT_PORT", "9099"))
+    hosts: list[str] = []
 
     try:
         cnx = await connect_db_for_agent(agent)
         cur = await cnx.cursor()
-        await cur.execute(
-            "SELECT public_ip FROM agent_info "
-            "ORDER BY last_seen DESC LIMIT 1"
-        )
+        try:
+            await cur.execute(
+                "SELECT public_ip, reported_ip FROM agent_info "
+                "ORDER BY last_seen DESC LIMIT 1"
+            )
+        except Exception:
+            # Pre-migration row: the column arrives on this agent's next
+            # check-in. One address is still better than none.
+            await cur.execute(
+                "SELECT public_ip FROM agent_info "
+                "ORDER BY last_seen DESC LIMIT 1"
+            )
         row = await cur.fetchone()
         await cur.close()
         await cnx.close()
 
-        if row and row[0]:
-            candidate = str(row[0]).strip()
-            if _is_valid_ipv4(candidate):
-                host = candidate
-            else:
-                pass
-        else:
-            pass
-
-    except Exception as e:
+        for value in (row or ()):
+            if not value:
+                continue
+            candidate = str(value).strip()
+            if _is_valid_ipv4(candidate) and candidate not in hosts:
+                hosts.append(candidate)
+    except Exception:
         pass
 
-    agent_port = int(os.getenv("AGENT_PORT", "9099"))
-    return f"http://{host}:{agent_port}"
+    # Last resort, and the historical default: the agent may be on this host.
+    if "127.0.0.1" not in hosts:
+        hosts.append("127.0.0.1")
+
+    return [f"http://{h}:{agent_port}" for h in hosts]
+
+
+async def _get_agent_http_base(agent: str) -> str:
+    """The agent's most likely HTTP base URL. See `_agent_http_bases`."""
+    bases = await _agent_http_bases(agent)
+    return bases[0]
 
 
 def _shape_soar_target(action: str, target):
@@ -8295,8 +8407,15 @@ async def http_proxy(request):
 
     return HTTPResponse(
         body=content,
-        status=resp.status_code,
-        headers=ssrf.clean_response_headers(resp.headers),
+        # A third party's 401 is not this session's 401. Relayed unchanged it
+        # would hit the browser's interceptor and log the operator out because
+        # somebody else's API wanted credentials - so the status is mapped and
+        # the real one is handed back in a header for the playbook to read.
+        status=_relayed_status(resp.status_code),
+        headers={
+            **ssrf.clean_response_headers(resp.headers),
+            "X-Upstream-Status": str(resp.status_code),
+        },
         content_type=resp.headers.get("Content-Type", "application/octet-stream"),
     )
 
@@ -8965,23 +9084,51 @@ async def delete_agent(request, agent):
     })
 
 
+async def _relay_upstream_close(ws, upstream) -> None:
+    """Pass the agent's reason for hanging up on to the browser.
+
+    The agent closes with something specific - `no display`, `no monitors`,
+    `missing dep`, `unauthorized` - and this proxy used to drop it on the
+    floor: the browser saw a close with no reason and printed "Closed". Every
+    distinct cause looked the same in the console, so "the machine is headless"
+    was indistinguishable from "the agent is not running", and the one sentence
+    that would have said which was the one discarded.
+
+    Sent as a JSON frame rather than a close reason because close reasons are
+    capped at 123 bytes and get truncated exactly where the detail lives.
+    """
+    reason = ""
+    try:
+        reason = (getattr(upstream, "close_reason", "") or "").strip()
+    except Exception:
+        return
+    if not reason:
+        return
+    try:
+        await ws.send(pyjson.dumps({"error": "agent_closed", "detail": reason}))
+    except Exception as e:
+        # The browser was the only audience for this, so failing to deliver it
+        # changes nothing for the session - but it means an operator watched a
+        # feed die with no reason given, and that is worth a line in the log.
+        print(f"[screen-proxy] could not relay close reason {reason!r}: {e}",
+              flush=True)
+
+
 @app.websocket("/vnc-proxy/<agent>")
 @require_permission("read_telemetry")
 async def vnc_proxy(request, ws, agent):
-    """Browser ↔ agent VNC/screen relay.
+    """Browser <-> agent screen relay.
 
     Registered at module scope (was previously nested under `if __name__ ==
     "__main__":`) so it survives Sanic worker subprocesses and any embedding
     that imports app.py instead of running it as the main script.
     """
-    import websockets
-
     fps = request.args.get("fps", "10")
     q = request.args.get("q", "60")
     w = request.args.get("w", "1280")
 
     try:
-        base = await _get_agent_http_base(agent)
+        bases = await _agent_http_bases(agent)
         keys = await _get_agent_keys(agent)
     except Exception as e:
         print(f"[screen-proxy] resolve {agent} failed: {e}", flush=True)
@@ -8993,85 +9140,103 @@ async def vnc_proxy(request, ws, agent):
         return
 
     agent_key = (keys[0] if keys else "")
-    target = (base or "").replace("http://", "ws://").replace("https://", "wss://").rstrip("/")
-    if not target:
+
+    # Every known address, not just the first: `Connection refused` on one
+    # says nothing about the others. See `_agent_http_bases` for why an agent
+    # legitimately has two.
+    last_error = "no address known for this agent"
+    tried: list[str] = []
+    for base in bases:
+        target = (base or "").replace("http://", "ws://").replace("https://", "wss://").rstrip("/")
+        if not target:
+            continue
+        tried.append(base)
+        target_url = f"{target}/screen/ws?key={agent_key}&fps={fps}&q={q}&w={w}"
+        reached, last_error = await _screen_relay(ws, target_url, agent_key)
+        if reached:
+            return
+        print(f"[screen-proxy] {agent}: {base} unreachable ({last_error})", flush=True)
+
+    try:
+        await ws.send(pyjson.dumps({
+            "error": "agent_unreachable",
+            "detail": f"{last_error} - tried {', '.join(tried) or 'no address'}",
+        }))
+    except Exception:
+        pass
+    await ws.close()
+
+
+async def _screen_relay(ws, target_url: str, agent_key: str) -> tuple[bool, str]:
+    """Pump frames between the browser and one agent address.
+
+    Returns `(reached, error)`. `reached` is True once the upstream websocket
+    opened, whatever happens afterwards - a stream that connects and then ends
+    because the host is headless is not a reason to go on and try a different
+    address, and retrying against an agent that answered would double every
+    capture.
+    """
+    import websockets
+
+    headers = {"X-Agent-Key": agent_key} if agent_key else None
+    connect_kwargs = dict(
+        max_size=20 * 1024 * 1024,
+        open_timeout=10,
+        ping_interval=20,
+        ping_timeout=20,
+    )
+
+    async def pump(upstream):
+        # Say when the *agent* hop opened, not just the browser's.
+        #
+        # The browser's socket to this proxy opens immediately, and the client
+        # printed "Connected" on it - before we had tried a single agent
+        # address. So a host that was never reached, and one that was reached
+        # and had nothing to show, displayed the same word. Only this point in
+        # the code knows the difference.
         try:
-            await ws.send(pyjson.dumps({"error": "agent_unreachable", "detail": "no base url for agent"}))
+            await ws.send(pyjson.dumps({"status": "agent_connected"}))
         except Exception:
             pass
-        await ws.close()
-        return
 
-    target_url = f"{target}/screen/ws?key={agent_key}&fps={fps}&q={q}&w={w}"
-    headers = {"X-Agent-Key": agent_key} if agent_key else None
+        async def browser_to_agent():
+            try:
+                while True:
+                    data = await ws.recv()
+                    if data is None:
+                        break
+                    await upstream.send(data)
+            except Exception:
+                pass
+
+        async def agent_to_browser():
+            try:
+                async for data in upstream:
+                    await ws.send(data)
+            except Exception:
+                pass
+
+        await asyncio.gather(browser_to_agent(), agent_to_browser())
+        await _relay_upstream_close(ws, upstream)
 
     try:
         async with websockets.connect(
-            target_url,
-            max_size=20 * 1024 * 1024,
-            additional_headers=headers,
-            open_timeout=10,
-            ping_interval=20,
-            ping_timeout=20,
+            target_url, additional_headers=headers, **connect_kwargs
         ) as upstream:
-            async def browser_to_agent():
-                try:
-                    while True:
-                        data = await ws.recv()
-                        if data is None:
-                            break
-                        await upstream.send(data)
-                except Exception:
-                    pass
-
-            async def agent_to_browser():
-                try:
-                    async for data in upstream:
-                        await ws.send(data)
-                except Exception:
-                    pass
-
-            await asyncio.gather(browser_to_agent(), agent_to_browser())
+            await pump(upstream)
+            return True, ""
     except TypeError:
+        # websockets < 14 spells the argument `extra_headers`.
         try:
             async with websockets.connect(
-                target_url,
-                max_size=20 * 1024 * 1024,
-                extra_headers=headers,
-                open_timeout=10,
+                target_url, extra_headers=headers, **connect_kwargs
             ) as upstream:
-                async def b2a():
-                    try:
-                        while True:
-                            data = await ws.recv()
-                            if data is None:
-                                break
-                            await upstream.send(data)
-                    except Exception:
-                        pass
-
-                async def a2b():
-                    try:
-                        async for data in upstream:
-                            await ws.send(data)
-                    except Exception:
-                        pass
-
-                await asyncio.gather(b2a(), a2b())
+                await pump(upstream)
+                return True, ""
         except Exception as e:
-            print(f"[screen-proxy] legacy connect failed → {target_url}: {e}", flush=True)
-            try:
-                await ws.send(pyjson.dumps({"error": "agent_unreachable", "detail": str(e)}))
-            except Exception:
-                pass
-            await ws.close()
+            return False, str(e) or type(e).__name__
     except Exception as e:
-        print(f"[screen-proxy] connect failed → {target_url}: {e}", flush=True)
-        try:
-            await ws.send(pyjson.dumps({"error": "agent_unreachable", "detail": str(e)}))
-        except Exception:
-            pass
-        await ws.close()
+        return False, str(e) or type(e).__name__
 
 
 if __name__ == "__main__":

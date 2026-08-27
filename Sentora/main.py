@@ -23,6 +23,7 @@ from sanic.response import json as sanic_json, text as sanic_text
 
 from modules.db import insert_record, fetch_unsent, mark_sent, fetch_one
 import modules.enc_db as enc_db
+import modules.screen_capture as screen_capture
 
 import logging
 import builtins
@@ -910,8 +911,34 @@ async def self_destruct(request: Request):
         return sanic_json({"ok": False, "error": "unauthorized"}, status=401)
 
     print(f"[!] Self-destruct authorised, requested by {request.ip}", flush=True)
+
+    # Remove the autostart here, in the request, rather than in the background
+    # thread - because this is the half whose outcome the caller can still be
+    # told. Once the process exits there is nobody left to report anything, so
+    # the old handler answered "Destruction initiated" and the console
+    # rendered that as completed whether or not anything was uninstalled.
+    #
+    # It is also the half that decides the rest: with the watchdog still armed
+    # the agent comes back, and deleting files first would only make it come
+    # back damaged.
+    removed, detail = await asyncio.to_thread(disable_autostart)
+    if not removed:
+        _uninstall_log(f"REFUSED: could not remove autostart ({detail})")
+        return sanic_json({
+            "ok": False,
+            "status": "failed",
+            "error": f"could not remove the agent's autostart, so it would "
+                     f"restart after deletion: {detail}. Nothing was deleted "
+                     f"and this agent is still installed.",
+        }, status=500)
+
     threading.Thread(target=perform_destruction, daemon=True).start()
-    return sanic_json({"status": "Destruction initiated"})
+    return sanic_json({
+        "ok": True,
+        "status": "uninstalling",
+        "message": f"Autostart removed ({detail}); files are being deleted "
+                   f"and the agent is exiting.",
+    })
 
 
 @app.post("/restart")
@@ -994,6 +1021,115 @@ def _destruction_target() -> str | None:
     return target
 
 
+# ---------------------------------------------------------------------------
+# Uninstalling means removing what starts the agent, not just its files
+# ---------------------------------------------------------------------------
+#
+# Self-destruct deleted the install directory and exited, and the agent came
+# straight back. It was never a race it could win: the Windows scheduled task
+# it is registered under carries
+#
+#     -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1)
+#     New-ScheduledTaskTrigger -Once -RepetitionInterval (New-TimeSpan -Minutes 15)
+#
+# - a watchdog whose stated purpose is to start the agent again whenever it is
+# not running. Uninstalling by exiting is exactly the condition that watchdog
+# exists to reverse. The Linux unit is the same shape: `Restart=on-failure`
+# and enabled at boot.
+#
+# Worse on Windows, quietly: a running executable is locked, so once the
+# watchdog had relaunched `main.exe`, `Remove-Item -Recurse -Force` on the
+# install directory failed - and it was written `-ErrorAction SilentlyContinue`,
+# so the failure went nowhere. The console said the action completed.
+#
+# So the order below is deliberate: **disable autostart first, verify it is
+# gone, and only then touch any files.** If the autostart cannot be removed
+# the agent deletes nothing and says so. A stale install that still runs is
+# recoverable; a live watchdog relaunching a half-deleted binary is not, and
+# an operator who has been told the endpoint is clean when it is not has been
+# given the worst possible answer.
+
+WINDOWS_TASK_NAME = "SentoraAgent"
+LINUX_UNIT_NAME = "sentora-agent"
+UNINSTALL_LOG = (
+    os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "Sentora", "uninstall.log")
+    if platform.system().lower() == "windows"
+    else "/var/log/sentora-uninstall.log"
+)
+
+
+def _uninstall_log(message: str) -> None:
+    """Leave evidence somewhere that outlives the install directory.
+
+    Everything the agent normally logs goes through a directory this function
+    is in the business of deleting, so a failed uninstall would explain itself
+    into a file that no longer exists.
+    """
+    line = f"{datetime.now().isoformat(timespec='seconds')} {message}"
+    print(f"[uninstall] {message}", flush=True)
+    try:
+        os.makedirs(os.path.dirname(UNINSTALL_LOG), exist_ok=True)
+        with open(UNINSTALL_LOG, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception as e:
+        print(f"[uninstall] could not write {UNINSTALL_LOG}: {e}", flush=True)
+
+
+def _run(argv: list[str], timeout: int = 30) -> tuple[int, str]:
+    """Run a command and return `(returncode, combined output)`."""
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return done.returncode, ((done.stdout or "") + (done.stderr or "")).strip()
+    except Exception as e:
+        return -1, str(e)
+
+
+def _autostart_still_present() -> bool:
+    """Whether anything is still configured to start this agent."""
+    if platform.system().lower() == "windows":
+        code, _ = _run(["schtasks", "/Query", "/TN", WINDOWS_TASK_NAME])
+        return code == 0
+    code, out = _run(["systemctl", "list-unit-files", f"{LINUX_UNIT_NAME}.service",
+                      "--no-legend", "--no-pager"])
+    if code == 0 and LINUX_UNIT_NAME in out:
+        return True
+    return os.path.exists(f"/etc/systemd/system/{LINUX_UNIT_NAME}.service")
+
+
+def disable_autostart() -> tuple[bool, str]:
+    """Remove whatever relaunches this agent. Returns `(removed, detail)`.
+
+    Verified rather than assumed: both `schtasks /Delete` and `systemctl
+    disable` report success in situations where the unit survives, and the
+    whole point of this step is that the next one is irreversible.
+    """
+    system = platform.system().lower()
+
+    if system == "windows":
+        code, out = _run(["schtasks", "/Delete", "/TN", WINDOWS_TASK_NAME, "/F"])
+        detail = out or f"schtasks exited {code}"
+    else:
+        # `disable --now` stops it and removes the enablement symlink; the
+        # unit file itself has to go too, or `systemctl start` still works and
+        # a later `enable` brings the whole thing back.
+        _run(["systemctl", "disable", "--now", LINUX_UNIT_NAME])
+        unit_path = f"/etc/systemd/system/{LINUX_UNIT_NAME}.service"
+        # Already absent is the state we want, so it is not an error worth
+        # catching - and the verification below covers the case where it
+        # disappears between this check and the removal.
+        if os.path.exists(unit_path):
+            try:
+                os.remove(unit_path)
+            except Exception as e:
+                return False, f"could not remove the unit file: {e}"
+        code, out = _run(["systemctl", "daemon-reload"])
+        detail = out or "systemd reloaded"
+
+    if _autostart_still_present():
+        return False, f"autostart is still registered after removal ({detail})"
+    return True, detail or "autostart removed"
+
+
 def perform_destruction():
     """Remove the agent's own installation directory.
 
@@ -1015,39 +1151,68 @@ def perform_destruction():
     system = platform.system().lower()
     target = _destruction_target()
     if not target:
-        print(f"[!] Refusing to self-destruct: {AGENT_DIR!r} does not look "
-              f"like an agent installation directory. Nothing was deleted.",
-              flush=True)
+        _uninstall_log(f"REFUSED: {AGENT_DIR!r} does not look like an agent "
+                       f"installation directory. Nothing was deleted.")
         os._exit(1)
 
-    print(f"[*] Initiating self-destruction on {system}, removing {target}",
-          flush=True)
+    # First, and only then anything else. See the note above disable_autostart:
+    # deleting files while a watchdog is still armed does not uninstall the
+    # agent, it just makes it restart from a damaged install.
+    removed, detail = disable_autostart()
+    if not removed:
+        _uninstall_log(
+            f"REFUSED: could not remove autostart ({detail}). Nothing was "
+            f"deleted - the agent is still installed and will keep running. "
+            f"Remove it by hand: "
+            f"{'schtasks /Delete /TN ' + WINDOWS_TASK_NAME + ' /F' if system == 'windows' else 'systemctl disable --now ' + LINUX_UNIT_NAME}")
+        os._exit(1)
+    _uninstall_log(f"autostart removed ({detail})")
+
+    _uninstall_log(f"removing {target}")
 
     try:
         if system == "windows":
             # -LiteralPath so a directory containing [ ] or ` is treated as a
             # name rather than a wildcard pattern.
+            #
+            # Not SilentlyContinue. A running executable is locked on Windows,
+            # so this is a command that genuinely can fail - and it used to
+            # fail exactly when the watchdog had relaunched the agent, which
+            # is the case an operator most needs to hear about. The result is
+            # appended to the uninstall log, which lives outside the directory
+            # being removed.
+            script = (
+                f"Start-Sleep -Seconds 5; "
+                f"try {{ Remove-Item -LiteralPath '{target}' -Recurse -Force -ErrorAction Stop; "
+                f"Add-Content -LiteralPath '{UNINSTALL_LOG}' -Value 'removed {target}' }} "
+                f"catch {{ Add-Content -LiteralPath '{UNINSTALL_LOG}' "
+                f"-Value \"FAILED to remove {target}: $($_.Exception.Message)\" }}"
+            )
             subprocess.Popen(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                 f"Start-Sleep -Seconds 5; Remove-Item -LiteralPath '{target}' "
-                 f"-Recurse -Force -ErrorAction SilentlyContinue"],
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
                 close_fds=True,
             )
         else:
-            # No shell: the path is an argument, not a string the shell
-            # re-parses. `sh -c "rm -rf $(pwd)"` would split on spaces.
+            # No shell expansion of the path: it is an argument, not a string
+            # the shell re-parses. `sh -c "rm -rf $(pwd)"` would split on
+            # spaces. The outcome is recorded for the same reason as above.
             subprocess.Popen(
-                ["/bin/sh", "-c", 'sleep 5; rm -rf -- "$0"', target],
+                ["/bin/sh", "-c",
+                 'sleep 5; if rm -rf -- "$0"; then echo "removed $0" >> "$1"; '
+                 'else echo "FAILED to remove $0" >> "$1"; fi',
+                 target, UNINSTALL_LOG],
                 close_fds=True,
             )
 
-        print("[*] Self-destruction command dispatched. Agent will exit.")
+        _uninstall_log("autostart removed and deletion scheduled; agent exiting")
         if system == "windows":
             os._exit(0)
         else:
             os.kill(os.getpid(), signal.SIGKILL)
     except Exception as e:
-        print(f"[!] Error during destruction: {e}")
+        _uninstall_log(f"ERROR during destruction: {e}. Autostart was already "
+                       f"removed, so the agent will not restart, but files may "
+                       f"remain in {target}.")
         os._exit(1)
 
 
@@ -1573,25 +1738,24 @@ def _ws_authorized(request) -> bool:
 
 @app.websocket("/screen/ws")
 async def screen_stream(request, ws):
-    """Continuous JPEG screen-frame stream. Browser receives binary frames and
-    paints them onto an <img>. Stops automatically when the websocket closes.
+    """Continuous JPEG screen-frame stream.
+
+    Two ways to produce frames, and which one applies is a property of the
+    session this process is in rather than of the request:
+
+      direct   an interactive session can capture its own desktop.
+      helper   a service in session 0 cannot see any desktop, so it launches
+               a helper into the logged-in user's session and relays what
+               that captures. See modules/screen_capture.
+
+    The direct path used to be the only one, which meant the Windows agent -
+    always a service, always session 0 - connected successfully and then sent
+    nothing at all. A stream that opens and stays black is the hardest kind of
+    failure to attribute, so every branch below that cannot produce frames
+    says why before it closes.
     """
     if not _ws_authorized(request):
         await ws.close(code=1008, reason="unauthorized")
-        return
-
-    try:
-        import mss as _mss
-    except ImportError:
-        await ws.send(json.dumps({"error": "mss_not_installed"}))
-        await ws.close(code=1011, reason="missing dep")
-        return
-    try:
-        from PIL import Image
-        import io as _io
-    except ImportError:
-        await ws.send(json.dumps({"error": "pillow_not_installed"}))
-        await ws.close(code=1011, reason="missing dep")
         return
 
     try:
@@ -1606,6 +1770,82 @@ async def screen_stream(request, ws):
         max_width = max(320, min(int(request.args.get("w", 1280)), 2560))
     except Exception:
         max_width = 1280
+
+    if screen_capture.in_session_zero():
+        await _stream_via_helper(ws, fps, quality, max_width)
+    else:
+        await _stream_directly(ws, fps, quality, max_width)
+
+
+async def _stream_via_helper(ws, fps: int, quality: int, max_width: int) -> None:
+    """Relay frames captured by a helper in the interactive session."""
+    print(f"[screen] session 0 - launching helper fps={fps} q={quality} w={max_width}",
+          flush=True)
+    try:
+        stream = await asyncio.to_thread(
+            screen_capture.spawn_helper, fps, quality, max_width)
+    except screen_capture.CaptureUnavailable as e:
+        print(f"[screen] helper unavailable: {e}", flush=True)
+        try:
+            await ws.send(json.dumps({"error": f"no screen available - {e}"}))
+        except Exception:
+            pass
+        await ws.close(code=1011, reason="no display")
+        return
+    except Exception as e:
+        print(f"[screen] helper launch failed: {e}", flush=True)
+        try:
+            await ws.send(json.dumps({"error": f"capture helper failed to start - {e}"}))
+        except Exception:
+            pass
+        await ws.close(code=1011, reason="helper failed")
+        return
+
+    sent_any = False
+    try:
+        while True:
+            frame = await asyncio.to_thread(stream.read_frame)
+            if frame is None:
+                break
+            try:
+                await ws.send(frame)
+            except Exception:
+                break
+            sent_any = True
+    except Exception as e:
+        print(f"[screen] helper relay error: {e}", flush=True)
+    finally:
+        stream.close()
+        if not sent_any:
+            # The helper started and produced nothing. Most often the session
+            # ended, or the desktop in view is one a user process may not read
+            # - the lock screen and UAC prompts live on the secure desktop.
+            try:
+                await ws.send(json.dumps({
+                    "error": "the capture helper started but produced no frames - "
+                             "the session may have ended, or the desktop in view "
+                             "is the lock screen, which cannot be captured."
+                }))
+            except Exception:
+                pass
+        print(f"[screen] helper stream end (frames sent: {sent_any})", flush=True)
+
+
+async def _stream_directly(ws, fps: int, quality: int, max_width: int) -> None:
+    """Capture this process's own desktop. Valid outside session 0."""
+    try:
+        import mss as _mss
+    except ImportError:
+        await ws.send(json.dumps({"error": "mss_not_installed"}))
+        await ws.close(code=1011, reason="missing dep")
+        return
+    try:
+        from PIL import Image
+        import io as _io
+    except ImportError:
+        await ws.send(json.dumps({"error": "pillow_not_installed"}))
+        await ws.close(code=1011, reason="missing dep")
+        return
 
     frame_interval = 1.0 / fps
     print(f"[screen] stream start fps={fps} q={quality} w={max_width}", flush=True)
@@ -1622,8 +1862,7 @@ async def screen_stream(request, ws):
     except Exception as e:
         detail = str(e) or type(e).__name__
         if platform.system() != "Windows" and not os.environ.get("DISPLAY"):
-            detail = ("no display on this host (DISPLAY is unset). A headless "
-                      "server has no screen to stream.")
+            detail = screen_capture.describe_unavailable()
         print(f"[screen] cannot open a capture: {detail}", flush=True)
         try:
             await ws.send(json.dumps({"error": f"no screen available - {detail}"}))
@@ -1765,6 +2004,16 @@ async def start_agent(app, loop):
 
 
 if __name__ == "__main__":
+    # The capture helper is this same binary re-entered with a flag, so it has
+    # to branch before anything else starts: the helper must not take the
+    # single-instance lock, open a database, register threads or bring up the
+    # HTTP listener. It captures a screen and writes to a pipe, and that is
+    # the whole of its job. See modules/screen_capture.
+    if "--screen-helper" in sys.argv:
+        import multiprocessing
+        multiprocessing.freeze_support()
+        sys.exit(screen_capture.helper_main(sys.argv))
+
     app.config.AUTO_RELOAD = False
     app.config.TOUCHUP = False
     import multiprocessing
