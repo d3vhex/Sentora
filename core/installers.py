@@ -36,11 +36,49 @@ echo "[*] Server : $SERVER_URL"
 echo "[*] Host   : $HOSTNAME_VAL"
 
 # Dependencies
+#
+# Docker belongs in this list. The agent keeps its state in a local postgres
+# that ships as docker-compose.yml inside the download, and without it the
+# binary starts, fails to reach 127.0.0.1:5432, and is restarted forever by
+# systemd - while this script has already printed "installed and running".
+#
+# The Windows installer has always brought that database up. This one did not,
+# and said nothing about it, which is the whole failure: a green install and
+# an agent that never reports.
 if ! command -v curl >/dev/null 2>&1; then
   apt-get update -y && apt-get install -y curl
 fi
 if ! command -v unzip >/dev/null 2>&1; then
   apt-get update -y && apt-get install -y unzip
+fi
+if ! command -v docker >/dev/null 2>&1; then
+  echo "[*] Installing Docker (the agent's local database runs in it)..."
+  apt-get update -y
+  apt-get install -y docker.io || {{
+    echo "[!] Could not install Docker."
+    echo "    The agent needs a local postgres on 127.0.0.1:5432 and will not"
+    echo "    start without one. Install Docker and re-run this installer."
+    exit 1
+  }}
+  systemctl enable --now docker >/dev/null 2>&1 || true
+fi
+
+# `docker.io` is the daemon and nothing else. Compose v2 is a separate package
+# on Debian and Ubuntu, so installing Docker alone leaves `docker compose`
+# unavailable - and the failure arrives later, at the point the database is
+# meant to start, reported as a Docker problem.
+if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev/null 2>&1; then
+  echo "[*] Installing the Docker Compose plugin..."
+  apt-get install -y docker-compose-v2 >/dev/null 2>&1 \\
+    || apt-get install -y docker-compose-plugin >/dev/null 2>&1 \\
+    || apt-get install -y docker-compose >/dev/null 2>&1 \\
+    || true
+fi
+if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev/null 2>&1; then
+  echo "[!] No Docker Compose available, and the agent's database is defined"
+  echo "    as a compose file. Install one of docker-compose-v2 /"
+  echo "    docker-compose-plugin / docker-compose and re-run."
+  exit 1
 fi
 
 # Allow overriding token via --token (for local execution)
@@ -88,11 +126,50 @@ cat > "$INSTALL_DIR/config.json" <<EOF
 EOF
 chmod 600 "$INSTALL_DIR/config.json"
 
+# ── the agent's local database ───────────────────────────────────────────────
+# Brought up before the service, not after. Starting the agent first means it
+# crash-loops until postgres happens to be ready, filling the journal with
+# connection errors that describe a race rather than the actual state.
+if [ -f "$INSTALL_DIR/docker-compose.yml" ]; then
+  echo "[*] Starting the agent's local database (postgres on 127.0.0.1:5432)..."
+  ( cd "$INSTALL_DIR" && ( docker compose up -d || docker-compose up -d ) ) || {{
+    echo "[!] Could not start the local database."
+    echo "    Run:  cd $INSTALL_DIR && docker compose up -d"
+    exit 1
+  }}
+
+  echo "[*] Waiting for postgres..."
+  DB_READY=0
+  for _ in $(seq 1 60); do
+    if docker exec sentora-db-agent pg_isready -q -U sentorauser -d sentora >/dev/null 2>&1; then
+      DB_READY=1; break
+    fi
+    sleep 1
+  done
+  if [ "$DB_READY" != "1" ]; then
+    # Refusing here rather than starting anyway. An agent that cannot reach
+    # its database reports nothing, and an install that claims success while
+    # that is true is worse than one that stops.
+    echo "[!] Postgres did not become ready within 60s."
+    echo "    Check: docker logs sentora-db-agent"
+    exit 1
+  fi
+  echo "[+] Database ready."
+else
+  echo "[!] docker-compose.yml is missing from the download."
+  echo "    The agent has nowhere to store state and will not run."
+  exit 1
+fi
+
 SERVICE_FILE="/etc/systemd/system/sentora-agent.service"
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=Sentora Agent
-After=network.target
+# docker.service, not just the network: after a reboot the agent would
+# otherwise start before its database and spend RestartSec cycles failing.
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
 
 [Service]
 Type=simple
@@ -111,7 +188,19 @@ systemctl enable sentora-agent
 systemctl restart sentora-agent
 
 rm -f agent.zip
-echo "[+] Sentora Agent installed and running as: $AGENT_NAME"
+
+# Verified, not assumed. `systemctl restart` returns success once systemd has
+# forked the process; a binary that exits immediately still leaves this script
+# printing "installed and running".
+sleep 3
+if systemctl is-active --quiet sentora-agent; then
+  echo "[+] Sentora Agent installed and running as: $AGENT_NAME"
+else
+  echo "[!] The service was installed but is not running."
+  echo "    journalctl -u sentora-agent -n 50 --no-pager"
+  systemctl status sentora-agent --no-pager -n 20 || true
+  exit 1
+fi
 """
 
 
