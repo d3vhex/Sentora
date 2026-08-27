@@ -165,3 +165,99 @@ def test_the_server_re_enrols_rather_than_refusing_an_unknown_key():
     app = (pathlib.Path(__file__).resolve().parent.parent
            / "app.py").read_text(encoding="utf-8")
     assert "fall" in app and "enrol as a new agent" in app
+
+
+# --------------------------------------------------------------------------
+# The Linux installer left the agent without a database
+# --------------------------------------------------------------------------
+
+from core.installers import _render_linux_install  # noqa: E402
+
+LINUX = _render_linux_install("http://example:8000", "203.0.113.1", "TOKEN")
+
+
+def test_the_rendered_linux_installer_is_valid_bash():
+    import subprocess
+    result = subprocess.run(["bash", "-n"], input=LINUX.encode("utf-8"),
+                            capture_output=True)
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+
+
+def test_it_has_no_unrendered_format_braces():
+    """The template is an f-string. A single brace that should have been
+    doubled produces shell that is subtly wrong rather than obviously so."""
+    assert "{{" not in LINUX
+    assert "}}" not in LINUX
+
+
+def test_docker_is_installed_because_the_database_needs_it():
+    """The agent keeps its state in a local postgres shipped as
+    docker-compose.yml inside the download. Without Docker the binary starts,
+    cannot reach 127.0.0.1:5432, and systemd restarts it forever - while the
+    installer has already printed "installed and running".
+
+    Observed on a fresh EC2 box: green install, no agent in the console, and
+    `docker: command not found`."""
+    assert "command -v docker" in LINUX
+    assert "apt-get install -y docker.io" in LINUX
+
+
+def test_the_database_is_started_before_the_service():
+    """Starting the agent first means it crash-loops until postgres happens to
+    be ready, filling the journal with errors that describe a race rather than
+    the actual state."""
+    db_at = LINUX.index("docker compose up -d")
+    service_at = LINUX.index("systemctl restart sentora-agent")
+    assert db_at < service_at
+
+
+def test_it_waits_for_postgres_rather_than_hoping():
+    assert "pg_isready" in LINUX
+    assert "did not become ready" in LINUX
+
+
+def test_a_database_that_never_comes_up_stops_the_install():
+    """An agent that cannot reach its database reports nothing, and an install
+    that claims success while that is true is worse than one that stops."""
+    block = LINUX[LINUX.index("Waiting for postgres"):]
+    block = block[:block.index("SERVICE_FILE=")]
+    assert "exit 1" in block
+
+
+def test_the_unit_orders_itself_after_docker():
+    """After a reboot the agent would otherwise start before its database and
+    spend RestartSec cycles failing."""
+    assert "After=network-online.target docker.service" in LINUX
+    assert "Requires=docker.service" in LINUX
+
+
+def test_success_is_verified_rather_than_announced():
+    """`systemctl restart` returns success once systemd has forked the
+    process. A binary that exits immediately still leaves the installer
+    printing "installed and running"."""
+    assert "systemctl is-active --quiet sentora-agent" in LINUX
+    tail = LINUX[LINUX.index("systemctl is-active"):]
+    assert "journalctl -u sentora-agent" in tail
+
+
+def test_the_windows_installer_still_brings_its_database_up():
+    """It always did - this whole fix is the Linux side catching up, and the
+    two must not drift apart again."""
+    assert "docker compose up -d" in SCRIPT
+    assert "sentora-db-agent" in SCRIPT
+
+
+def test_compose_is_installed_separately_from_docker():
+    """`docker.io` is the daemon and nothing else. Compose v2 is a separate
+    package on Debian and Ubuntu, so installing Docker alone leaves
+    `docker compose` unavailable - and the failure arrives later, when the
+    database is meant to start, reported as a Docker problem."""
+    assert "docker compose version" in LINUX
+    assert "docker-compose-v2" in LINUX
+
+
+def test_no_compose_at_all_stops_the_install():
+    """The agent's database is defined as a compose file. Without a compose
+    implementation there is nothing to bring it up with."""
+    block = LINUX[LINUX.index("No Docker Compose available"):]
+    assert "exit 1" in block[:400]
