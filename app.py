@@ -46,10 +46,6 @@ class CreateUserRequest(BaseModel):
             raise ValueError('Password must contain at least one number')
         return v
 
-class CreateRoleRequest(BaseModel):
-    role_name: constr(min_length=2, max_length=50, pattern=r'^[a-zA-Z0-9_-]+$')
-    permissions: List[str] = []
-
 class ChangePasswordRequest(BaseModel):
     username: str
     current_password: str
@@ -116,6 +112,7 @@ from security import session as session_store
 from security import ssrf
 from core import config_validation
 from core import login_guard
+from core import netloc
 from core import threat_feeds
 # Installer templating: pure string generation, extracted so app.py is not
 # also 420 lines of PowerShell. See core/installers.py.
@@ -235,17 +232,6 @@ SOAR_TO_AUTO_STATUS = {
 }
 
 
-def _now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-def _append_comment(old: str | None, add: str | None, limit: int = 500) -> str:
-    old = (old or "").strip()
-    add = (add or "").strip()
-    if not add:
-        return old[:limit]
-    merged = (f"{old} | {add}" if old else add).strip()
-    return merged[:limit]
-
 def _is_valid_ipv4(ip: str) -> bool:
     parts = str(ip).split(".")
     if len(parts) != 4: return False
@@ -257,147 +243,6 @@ def _is_valid_ipv4(ip: str) -> bool:
 _USER_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
 def _is_valid_username(u: str) -> bool:
     return bool(_USER_RE.match(str(u or "")))
-
-async def _insert_soar_action_row(agent: str, *, event_id: int, action: str,
-                                  target: str, comment: str, status: str,
-                                  expires_at: str | None):
-    """Insert straight into the agent database's soar_actions table."""
-    cnx = await connect_db_for_agent(agent)
-    cur = await cnx.cursor()
-    await cur.execute(
-        """
-        INSERT INTO soar_actions
-          (timestamp, event_id, action, target, comment, status, expires_at)
-        VALUES
-          (NOW(), %s, %s, %s, %s, %s, %s)
-        """,
-        (event_id, action, target, comment, status.upper(), expires_at)
-    )
-    await cnx.commit()
-    rid = cur.lastrowid
-    await cur.close(); await cnx.close()
-    return rid
-
-async def _history_block_count(agent: str, target_ip: str) -> int:
-    try:
-        cnx = await connect_db_for_agent(agent)
-        cur = await cnx.cursor()
-        await cur.execute(
-            "SELECT COUNT(*) FROM soar_actions WHERE action=%s AND target=%s AND status IN ('SUCCESS','PERMANENT')",
-            (ActionType.BLOCK_IP.value, target_ip)
-        )
-        row = await cur.fetchone()
-        await cur.close(); await cnx.close()
-        return int(row[0] if row else 0)
-    except Exception:
-        return 0
-
-async def _execute_automation_record(agent: str, rec: dict) -> dict:
-    """
-    Execute an automation record: send the SOAR request to the agent.
-    
-    Args:
-        agent: the agent's name
-        rec: one row from the automations table
-        
-    Returns:
-        What the execution produced.
-    """
-    action = rec["action"].strip()
-    target = rec["target"].strip()
-    event_id = int(rec["event_id"]) if rec.get("event_id") else None
-
-    comment_prefix = f"automation#{rec['id']}"
-    comment_full = f"{comment_prefix} | {rec.get('comment') or ''}".strip()
-
-    cnx = await connect_db_for_agent(agent)
-    cur = await cnx.cursor()
-    await cur.execute(
-        "UPDATE automations SET status='active', updated_at=NOW() WHERE id=%s",
-        (rec["id"],)
-    )
-    await cnx.commit()
-    await cur.close()
-    await cnx.close()
-
-    try:
-        result = await call_agent_soar(
-            agent,
-            action=action,
-            target=target,
-            comment=comment_full,
-            event_id=event_id,
-            ttl=rec.get("ttl"),
-            # Already queued - see the note in run_due_automations.
-            background_queue=False,
-        )
-
-        ok = result.get("ok", False)
-        auto_status = "completed" if ok else "failed"
-        soar_status = result.get("status", "failed")
-        soar_action_id = result.get("soar_action_id")
-        expires_at = result.get("expires_at")
-        msg_detail = result.get("message", "")
-
-        final_comment = _append_comment(
-            rec.get("comment"),
-            f"{comment_prefix} | {msg_detail}"
-        )
-
-        cnx = await connect_db_for_agent(agent)
-        cur = await cnx.cursor()
-        await cur.execute(
-            "UPDATE automations SET status=%s, comment=%s, updated_at=NOW() WHERE id=%s",
-            (auto_status, final_comment, rec["id"])
-        )
-        await cnx.commit()
-        await cur.close()
-        await cnx.close()
-
-        return {
-            "automation": {
-                "id": rec["id"],
-                "status": auto_status,
-                "comment": final_comment,
-                "updated_at": _now_str(),
-            },
-            "soar_action_id": soar_action_id,
-            "soar_status": soar_status,
-            "expires_at": expires_at,
-            "message": msg_detail,
-            "ok": ok,
-        }
-
-    except Exception as e:
-        error_msg = str(e)
-        final_comment = _append_comment(
-            rec.get("comment"),
-            f"{comment_prefix} | ERROR: {error_msg}"
-        )
-
-        cnx = await connect_db_for_agent(agent)
-        cur = await cnx.cursor()
-        await cur.execute(
-            "UPDATE automations SET status='failed', comment=%s, updated_at=NOW() WHERE id=%s",
-            (final_comment, rec["id"])
-        )
-        await cnx.commit()
-        await cur.close()
-        await cnx.close()
-
-        return {
-            "automation": {
-                "id": rec["id"],
-                "status": "failed",
-                "comment": final_comment,
-                "updated_at": _now_str(),
-            },
-            "soar_action_id": None,
-            "soar_status": "failed",
-            "expires_at": None,
-            "message": error_msg,
-            "ok": False,
-        }
 
 def ensure_permissions(path: pathlib.Path) -> bool:
     """Restrict a secret file to its owner, and say so if that did not happen.
@@ -1719,27 +1564,6 @@ def fetch_unsent_siem_logs(agent: str, limit: int = 100):
         f"unsent SIEM logs for {agent}",
     )
 
-def mark_logs_as_analyzed(agent: str, log_ids: list):
-    """Mark SIEM logs as analyzed by AI"""
-    if not log_ids:
-        return
-    db_name = _agent_db_name(agent)
-    try:
-        with sync_mysql_conn(db_name) as conn:
-            cursor = conn.cursor()
-            try:
-                placeholders = ','.join(['%s'] * len(log_ids))
-                cursor.execute(
-                    f"UPDATE siem_events SET ai_analyzed = TRUE, ai_analyzed_at = NOW() WHERE id IN ({placeholders})",
-                    log_ids,
-                )
-                conn.commit()
-                print(f"[+] Marked {len(log_ids)} logs as analyzed for {agent}")
-            finally:
-                cursor.close()
-    except Exception as e:
-        print(f"[!] Error marking logs as analyzed for {agent}: {e}")
-
 def fetch_critical_files_data(agent: str, limit: int = 100):
     return _fetch_rows_safely(
         _agent_db_name(agent),
@@ -2260,10 +2084,6 @@ def load_or_create_fernet_key() -> str:
     except Exception as e:
         print(f"[!] Could not persist generated Fernet key: {e}", flush=True)
     return key.decode("utf-8")
-
-
-def get_local_fernet_key(*_, **__) -> str:
-    return load_or_create_fernet_key()
 
 
 class BootstrapError(Exception):
@@ -5685,74 +5505,67 @@ async def change_password(request):
 @require_permission("manage_agent")
 @app.route("/<agent>/restart", methods=["POST"])
 async def trigger_restart(request, agent):
-    try:
-        if is_soar_enabled():
-            resp = await call_agent_soar(agent, "restart_service", "sentora-agent", comment="Restart from UI", background_queue=True)
-            cnx = await connect_db_for_agent(agent)
-            cursor = await cnx.cursor()
-            await cursor.execute(
-                "INSERT INTO soar_actions (action, target, status, comment) VALUES (%s, %s, %s, %s)",
-                ("restart_service", "sentora-agent", "SUCCESS" if resp.get("ok") else "FAILED", "Restart from UI")
-            )
-            await cnx.commit()
-            await cursor.close(); await cnx.close()
-            return sanic_json({"status": "success", "message": resp.get("message", "Restart command processed")})
-        return sanic_json({"status": "error", "message": "SOAR is disabled, cannot queue action"}, status=400)
-    except Exception as e:
-        return sanic_json({"status": "error", "message": str(e)}, status=500)
+    """Restart the agent process."""
+    body, status = await _agent_lifecycle_command(
+        agent, "/restart", "restart", "Restart from UI",
+        queue_action="restart_service")
+    await _record_lifecycle(request, agent, "restart_service", body, status)
+    return sanic_json(body, status=status)
+
 
 @require_permission("manage_agent")
 @app.route("/<agent>/reload_auth", methods=["POST"])
 async def trigger_reload_auth(request, agent):
-    try:
-        if is_soar_enabled():
-            resp = await call_agent_soar(agent, "reload_auth", "sentora-agent", comment="Auth reload from UI", background_queue=True)
-            cnx = await connect_db_for_agent(agent)
-            cursor = await cnx.cursor()
-            await cursor.execute(
-                "INSERT INTO soar_actions (action, target, status, comment) VALUES (%s, %s, %s, %s)",
-                ("reload_auth", "sentora-agent", "SUCCESS" if resp.get("ok") else "FAILED", "Auth reload from UI")
-            )
-            await cnx.commit()
-            await cursor.close(); await cnx.close()
-            return sanic_json({"status": "success", "message": resp.get("message", "Auth reload command processed")})
-        return sanic_json({"status": "error", "message": "SOAR is disabled, cannot queue action"}, status=400)
-    except Exception as e:
-        return sanic_json({"status": "error", "message": str(e)}, status=500)
+    """Make the agent re-fetch its key from /api/agents/bootstrap."""
+    body, status = await _agent_lifecycle_command(
+        agent, "/reload_auth", "reload_auth", "Auth reload from UI")
+    await _record_lifecycle(request, agent, "reload_auth", body, status)
+    return sanic_json(body, status=status)
+
 
 @require_permission("manage_agent")
 @app.route("/<agent>/self_destruct", methods=["POST"])
 async def trigger_self_destruct(request, agent):
-    try:
-        if is_soar_enabled():
-            resp = await call_agent_soar(agent, "self_destruct", "agent", comment="Self-destruct from UI", background_queue=True)
+    """Uninstall the agent from its host. Irreversible.
 
-            # What the agent actually reports, not that we managed to ask.
-            #
-            # This recorded SUCCESS whenever the call was delivered, and the
-            # agent answered "Destruction initiated" before doing anything -
-            # so an uninstall that was immediately undone by the scheduled
-            # task's watchdog was logged, and displayed, as completed. The
-            # agent now removes its autostart synchronously and answers with
-            # the result, which is the half of the operation that decides
-            # whether the endpoint is really being uninstalled.
-            ok = bool(resp.get("ok"))
-            detail = resp.get("message") or resp.get("error") or "no detail returned"
-            cnx = await connect_db_for_agent(agent)
-            cursor = await cnx.cursor()
-            await cursor.execute(
-                "INSERT INTO soar_actions (action, target, status, comment) VALUES (%s, %s, %s, %s)",
-                ("self_destruct", "agent", "SUCCESS" if ok else "FAILED",
-                 f"Self-destruct from UI - {detail}")
-            )
-            await cnx.commit()
-            await cursor.close(); await cnx.close()
-            if not ok:
-                return sanic_json({"status": "error", "message": detail}, status=502)
-            return sanic_json({"status": "success", "message": detail})
-        return sanic_json({"status": "error", "message": "SOAR is disabled, cannot queue action"}, status=400)
+    Goes to the agent's own `/self_destruct`, not `/soar/execute`: the latter
+    accepts only the members of `ActionType`, which does not include this, so
+    every uninstall push returned 501 for a command the agent implements.
+
+    The agent removes its autostart synchronously and answers with the result,
+    so a reply here means the watchdog is really gone - not merely that the
+    request was delivered. See `Sentora/main.py:disable_autostart`.
+    """
+    body, status = await _agent_lifecycle_command(
+        agent, "/self_destruct", "self_destruct", "Self-destruct from UI",
+        timeout=30)
+    await _record_lifecycle(request, agent, "self_destruct", body, status)
+    return sanic_json(body, status=status)
+
+
+async def _record_lifecycle(request, agent: str, action: str, body: dict, status: int):
+    """Write what happened to the agent's action log and the audit trail.
+
+    Three outcomes, not two. `SUCCESS` used to be recorded whenever the call
+    was delivered, so a push the agent answered 501 to was logged as a
+    completed uninstall - and an operator reading the log later would have had
+    no way to know the endpoint still had an agent on it.
+    """
+    outcome = {"success": "SUCCESS", "pending": "QUEUED"}.get(
+        str(body.get("status")), "FAILED")
+    detail = str(body.get("message") or "")[:400]
+    try:
+        cnx = await connect_db_for_agent(agent)
+        cur = await cnx.cursor()
+        await cur.execute(
+            "INSERT INTO soar_actions (action, target, status, comment) VALUES (%s, %s, %s, %s)",
+            (action, "sentora-agent", outcome, detail))
+        await cnx.commit()
+        await cur.close(); await cnx.close()
     except Exception as e:
-        return sanic_json({"status": "error", "message": str(e)}, status=500)
+        print(f"[!] could not record {action} for {agent}: {e}", flush=True)
+    await audit_log(request, action.upper(), agent, f"{outcome}: {detail}")
+
 
 @require_permission("manage_agent")
 @app.route("/devices/<agent>")
@@ -5952,7 +5765,18 @@ def _agent_display_names() -> dict:
                 cur.execute(
                     "SELECT agent_name, display_name FROM agent_identities "
                     "WHERE display_name IS NOT NULL AND display_name <> ''")
-                return {row[0]: row[1] for row in cur.fetchall()}
+                # Keyed under both spellings. Callers look these up by the
+                # database-derived name, whose hyphens have been flattened to
+                # underscores, so keying only on the stored name meant a
+                # renamed host with a hyphen kept showing its hostname - the
+                # rename appeared to do nothing. See `_get_agent_keys`.
+                names: dict = {}
+                for stored, display in cur.fetchall():
+                    hyphen, underscore, _ = _agent_name_forms(stored)
+                    for form in (stored, hyphen, underscore):
+                        if form:
+                            names[form] = display
+                return names
             finally:
                 cur.close()
     except Exception as e:
@@ -5990,16 +5814,26 @@ async def set_agent_display_name(request, agent):
                            "message": "display name cannot contain control characters"},
                           status=400)
 
+    # Both spellings - see `_get_agent_keys`. The console routes by the
+    # database-derived name, which has had its hyphens flattened, so an exact
+    # match here reported "no such agent" for every host with a hyphen in it.
+    hyphen, underscore, _ = _agent_name_forms(agent)
+    candidates = [n for n in dict.fromkeys([agent, hyphen, underscore]) if n]
+
     def _write():
         with sync_mysql_conn("userdb") as conn:
             cur = conn.cursor()
             try:
-                cur.execute("SELECT 1 FROM agent_identities WHERE agent_name=%s", (agent,))
-                if not cur.fetchone():
+                placeholders = ",".join(["%s"] * len(candidates))
+                cur.execute(
+                    f"SELECT agent_name FROM agent_identities "
+                    f"WHERE agent_name IN ({placeholders})", candidates)
+                row = cur.fetchone()
+                if not row:
                     return False
                 cur.execute(
                     "UPDATE agent_identities SET display_name=%s WHERE agent_name=%s",
-                    (name or None, agent))
+                    (name or None, row[0]))
                 conn.commit()
                 return True
             finally:
@@ -7488,20 +7322,44 @@ async def _get_agent_keys(agent: str) -> list:
     operators tracking which mode each one is in.
     """
     keys: list = []
+    # Both spellings, because the console does not know the agent's real name.
+    #
+    # `agent_identities.agent_name` holds what the agent enrolled as -
+    # `DESKTOP-EVS8H9J`. The console gets its agent list from `SHOW DATABASES`
+    # and strips `_db`, and `server._sanitize_db_name` has already turned
+    # every hyphen into an underscore by then, so what arrives here is
+    # `DESKTOP_EVS8H9J`.
+    #
+    # Matching that exactly found nothing, and the lookup fell through to the
+    # fleet master secret - which the agent rightly refused, because it holds
+    # its own key and does not know that one. Every server-to-agent call on
+    # any host with a hyphen in its name returned 401: config, SOAR dispatch,
+    # the screen stream. The agent was correct at every step and looked broken.
+    #
+    # `_agent_name_forms` already existed for exactly this, written when the
+    # same mismatch left "deleted" agents on disk. It was never applied here.
+    hyphen, underscore, _ = _agent_name_forms(agent)
+    candidates = [n for n in dict.fromkeys([agent, hyphen, underscore]) if n]
     try:
         cnx = await connect_userdb()
         cur = await cnx.cursor()
         try:
+            placeholders = ",".join(["%s"] * len(candidates))
             await cur.execute(
-                "SELECT agent_key FROM agent_identities WHERE agent_name=%s AND revoked_at IS NULL LIMIT 1",
-                (agent,),
+                f"SELECT agent_key FROM agent_identities "
+                f"WHERE agent_name IN ({placeholders}) AND revoked_at IS NULL",
+                candidates,
             )
-            row = await cur.fetchone()
+            rows = await cur.fetchall()
         finally:
             await cur.close()
             await cnx.close()
-        if row and row[0]:
-            keys.append(row[0])
+        # Every match, not the first. Two names can sanitise to one spelling,
+        # and `_try_agent_request` already walks candidate keys - so an
+        # ambiguity costs one extra request instead of a wrong answer.
+        for row in rows or ():
+            if row and row[0] and row[0] not in keys:
+                keys.append(row[0])
     except Exception as e:
         print(f"[!] _get_agent_keys lookup failed for {agent}: {e}", flush=True)
     if AGENT_SHARED_SECRET and AGENT_SHARED_SECRET not in keys:
@@ -7567,27 +7425,34 @@ async def _agent_proxy(agent: str, method: str, path: str, json_body=None,
     bases = await _agent_http_bases(agent)
     keys = await _get_agent_keys(agent)
 
-    last_detail = "no address known for this agent"
+    # Every address's own outcome, not just the last one.
+    #
+    # This kept a single `last_detail` and overwrote it as it went, so the
+    # most informative result was routinely replaced by the least: an address
+    # that connected and answered 401 - which names the actual problem - was
+    # buried under "connection refused" from the loopback fallback tried
+    # afterwards. The operator then read the reason for an address that was
+    # never going to work and never saw the one that did.
+    outcomes: list[str] = []
     for base in bases:
         url = f"{base}{path}"
         try:
             resp = await asyncio.to_thread(
                 _try_agent_request, method, url, keys, json_body, timeout)
         except Exception as e:
-            last_detail = f"{base}: {e}"
+            outcomes.append(f"{base} -> {type(e).__name__}: {_short(e)}")
             continue
         if resp is None:
-            last_detail = f"{base}: no response"
+            outcomes.append(f"{base} -> no response")
             continue
 
         if resp.status_code in (401, 403):
-            # Worth trying the other address before concluding anything: a
-            # different host may be the one actually holding this identity.
-            last_detail = (
-                f"the agent rejected this server's key ({resp.status_code}). "
-                f"The agent may have been re-enrolled, or restored from a "
-                f"backup with an older key - restart it so it re-fetches from "
-                f"/api/agents/bootstrap.")
+            # Reached the agent; it would not accept the key we hold. Worth
+            # trying the remaining addresses, because a different host may be
+            # the one actually holding this identity.
+            outcomes.append(
+                f"{base} -> reached, but the agent rejected this server's key "
+                f"({resp.status_code} with {len(keys) or 1} key(s) tried)")
             continue
 
         try:
@@ -7602,9 +7467,93 @@ async def _agent_proxy(agent: str, method: str, path: str, json_body=None,
             return body, _relayed_status(resp.status_code) or 502
         return body, _relayed_status(resp.status_code)
 
+    reached = [o for o in outcomes if "rejected this server's key" in o]
+    if reached:
+        headline = (
+            "Reached this agent, but it rejected this server's key. The agent "
+            "fetches its key once at startup: restart it so it re-fetches from "
+            "/api/agents/bootstrap. If it was re-enrolled under a different "
+            "name, the identity this console holds belongs to the old one.")
+    else:
+        headline = f"Could not reach {agent} at any known address."
+
     return ({"status": "error",
-             "message": f"Could not reach {agent}: {last_detail}",
+             "message": headline,
+             "outcomes": outcomes,
              "tried": bases},
+            502)
+
+
+def _short(e: Exception, limit: int = 160) -> str:
+    """One line of an exception. `requests` nests three of them by the time a
+    connection failure surfaces, and the useful words are at the end."""
+    text = " ".join(str(e).split())
+    return text if len(text) <= limit else "..." + text[-limit:]
+
+
+async def _agent_lifecycle_command(agent: str, path: str, action: str,
+                                   comment: str, *, queue_action: str | None = None,
+                                   timeout: int = 10) -> tuple[dict, int]:
+    """Restart, reload or uninstall an agent, and say which actually happened.
+
+    These three are not SOAR actions and were being sent as if they were. The
+    agent's `/soar/execute` accepts only the members of its `ActionType` enum,
+    and `self_destruct` is not one - so the direct push came back 501 "action
+    not implemented" every time, for a command the agent implements at its own
+    `/self_destruct` endpoint. `restart_service` happened to be in the enum,
+    which is the whole reason restart appeared to work and uninstall did not.
+
+    Two channels, both kept:
+
+      direct   the dedicated endpoint. Immediate, and it can report a result.
+      queued   a row in `automations` the agent picks up on its next poll.
+               This is what survives an agent that is asleep, mid-restart or
+               briefly unreachable.
+
+    The queue goes first so the command is durable before we try to hurry it,
+    and the answer distinguishes the two - "the agent did it" and "the agent
+    will do it when it next checks in" are different things to tell someone
+    who has just clicked Uninstall.
+    """
+    queued = False
+    try:
+        cnx = await connect_db_for_agent(agent)
+        cur = await cnx.cursor()
+        await cur.execute("""
+            INSERT INTO automations
+            (device, event_id, action, target, comment, status, `timestamp`, created_at, updated_at)
+            VALUES (%s, 0, %s, %s, %s, 'pending', NOW(), NOW(), NOW())
+        """, (agent, queue_action or action, "sentora-agent", comment))
+        await cnx.commit()
+        await cur.close(); await cnx.close()
+        queued = True
+    except Exception as e:
+        print(f"[!] could not queue '{action}' for {agent}: {e}", flush=True)
+
+    body, status = await _agent_proxy(agent, "POST", path, {"comment": comment},
+                                      timeout=timeout)
+
+    if status < 400:
+        detail = body.get("message") if isinstance(body, dict) else None
+        return ({"status": "success", "delivered": "direct", "queued": queued,
+                 "message": detail or f"{action}: the agent acted on it."}, 200)
+
+    reason = body.get("message") if isinstance(body, dict) else str(body)
+    if queued:
+        # Not a failure yet. The row is in the queue and the agent polls it,
+        # so saying "failed" here would be wrong in the ordinary case of an
+        # agent that is simply not answering this second.
+        return ({"status": "pending", "delivered": "queued", "queued": True,
+                 "message": f"Could not reach the agent right now, so "
+                            f"'{action}' is queued and will run when it next "
+                            f"checks in (within a minute). Reason: {reason}",
+                 "outcomes": body.get("outcomes") if isinstance(body, dict) else None},
+                202)
+
+    return ({"status": "error", "delivered": "none", "queued": False,
+             "message": f"Could not reach the agent and could not queue "
+                        f"'{action}': {reason}",
+             "outcomes": body.get("outcomes") if isinstance(body, dict) else None},
             502)
 
 
@@ -7660,17 +7609,33 @@ async def _agent_http_bases(agent: str) -> list[str]:
     except Exception:
         pass
 
+    # The machine this container runs on.
+    #
+    # When an agent reaches us from our own bridge gateway it is running on
+    # the container host - `server.observed_peer_ip` detects exactly that and
+    # discards the gateway as an address. The discarded observation is still
+    # information: it says where the agent is, just not in a form that can be
+    # dialled.
+    #
+    # And the host's LAN address is not the answer either. Under Docker
+    # Desktop the containers live in a Linux VM, so 192.168.1.26 is reached
+    # through a NAT that does not forward back to the Windows host - the
+    # connection is refused against a machine that is listening. The
+    # documented way in is this name, which the runtime resolves to whatever
+    # the host actually is. On plain Linux it needs the `host-gateway` alias
+    # that docker-compose.yaml now sets.
+    #
+    # Tried after the recorded addresses, because on a real deployment - the
+    # server on its own box, agents out on the network - those are correct and
+    # this name is not. It costs one refused connection, which returns at once.
+    if netloc.in_container():
+        hosts.append("host.docker.internal")
+
     # Last resort, and the historical default: the agent may be on this host.
     if "127.0.0.1" not in hosts:
         hosts.append("127.0.0.1")
 
     return [f"http://{h}:{agent_port}" for h in hosts]
-
-
-async def _get_agent_http_base(agent: str) -> str:
-    """The agent's most likely HTTP base URL. See `_agent_http_bases`."""
-    bases = await _agent_http_bases(agent)
-    return bases[0]
 
 
 def _shape_soar_target(action: str, target):
@@ -7757,10 +7722,6 @@ async def call_agent_soar(
         except Exception as e:
             print(f"[!] Background skip: Failed to queue '{action}' for {agent}: {e}")
 
-    base = await _get_agent_http_base(agent)
-    keys = await _get_agent_keys(agent)
-    url = f"{base}/soar/execute"
-
     payload: dict = {
         "action": action,
         "target": target,
@@ -7769,20 +7730,20 @@ async def call_agent_soar(
     if event_id is not None: payload["event_id"] = int(event_id)
     if ttl is not None: payload["ttl"] = int(ttl)
 
-    def _post():
-        return _try_agent_request("POST", url, keys, payload, 5)
-
     try:
-        resp = await asyncio.to_thread(_post)
-        
-        try:
-            data = resp.json() or {}
-        except Exception:
-            data = {}
+        # Through `_agent_proxy`, so SOAR dispatch gets what the config tab
+        # already had: every known address tried rather than the first, keys
+        # resolved under both spellings of the agent's name, and a failure
+        # that names which address did what. This used a single address and a
+        # single guess at the name, which is why dispatch failed on hosts the
+        # console could otherwise talk to.
+        data, status = await _agent_proxy(agent, "POST", "/soar/execute",
+                                          payload, timeout=5)
+        data = data if isinstance(data, dict) else {}
 
-        http_ok = 200 <= resp.status_code < 300
+        http_ok = 200 <= status < 300
         agent_ok = bool(data.get("ok", True))
-        
+
         if http_ok and agent_ok:
             return {
                 "ok": True,
@@ -7791,37 +7752,35 @@ async def call_agent_soar(
                 "soar_action_id": data.get("soar_action_id"),
                 **data
             }
-        else:
-            msg = data.get("error") or data.get("message") or f"HTTP {resp.status_code}"
-            return {
-                "ok": False,
-                "queued": background_queue,
-                "message": f"Direct push failed ({msg}), command will be polled by agent.",
-                "error": msg
-            }
-
-    except Exception as e:
+        msg = data.get("error") or data.get("message") or f"HTTP {status}"
         return {
-            "ok": True,
+            "ok": False,
             "queued": background_queue,
-            "message": f"Agent unreachable, command queued for polling. ({e})",
-            "warning": str(e)
+            "message": (f"Direct push failed ({msg})."
+                        + (" The agent will pick it up on its next poll."
+                           if background_queue else "")),
+            "error": msg,
+            "outcomes": data.get("outcomes"),
         }
 
-    except requests.Timeout:
-        error = "Agent request timeout (>10s)"
-        print(f"[!] {error} (agent={agent}, url={url})")
-        return {"ok": False, "error": error, "status": "failed", "message": error}
-
-    except requests.ConnectionError as e:
-        error = f"Cannot connect to agent: {e}"
-        print(f"[!] {error} (agent={agent}, url={url})")
-        return {"ok": False, "error": error, "status": "failed", "message": error}
-
     except Exception as e:
-        error = f"Agent SOAR call exception: {e}"
-        print(f"[!] {error} (agent={agent}, url={url})")
-        return {"ok": False, "error": error, "status": "failed", "message": error}
+        # Three unreachable `except requests.*` clauses used to follow a
+        # catch-all here, referring to a `url` variable that no longer
+        # existed. They were dead the moment the catch-all was added.
+        #
+        # The catch-all also returned `ok: True` on an exception, on the
+        # grounds that the command was queued. Whether it was queued is
+        # already its own field; conflating that with success is what let a
+        # push nobody received be logged as one that worked.
+        print(f"[!] SOAR call to {agent} failed: {e}", flush=True)
+        return {
+            "ok": False,
+            "queued": background_queue,
+            "message": (f"Could not push to the agent ({e})."
+                        + (" The command is queued and will run on its next"
+                           " poll." if background_queue else "")),
+            "error": str(e),
+        }
 
 async def ensure_playbooks_table(agent: str):
     """Create <agent>_db.playbooks if it does not exist."""

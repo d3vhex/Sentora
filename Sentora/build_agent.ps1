@@ -175,6 +175,8 @@ $hiddenImports = @(
     "modules.soar.soar",
     "modules.soar.vnc_manager",
     "modules.enc_db",
+    "modules.agent_paths",
+    "modules.screen_capture",
     "modules.db"
 )
 

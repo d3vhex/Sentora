@@ -138,15 +138,67 @@ const AgentDetail: React.FC = () => {
     }
   };
 
+  /** The reason a config could not be loaded, as YAML comments.
+   *
+   *  It goes into the editor because that is where the operator is looking,
+   *  and comments are the only thing that can sit there without the linter
+   *  reading the failure message as a broken config.
+   *
+   *  Saving it is refused server-side — a comment-only file parses as empty
+   *  and `config_validation.blocking` rejects it before anything is sent — so
+   *  the note below says that rather than warning about a danger that is
+   *  already handled. */
+  const configFailure = (reason: string, tried?: string[], outcomes?: string[]): string => {
+    const lines = [
+      '# Could not load this config from the agent.',
+      '#',
+      ...String(reason).split('\n').map(l => `#   ${l}`),
+    ];
+    // Per-address outcomes when the server has them: "refused" and "reached
+    // it but the key was rejected" are different problems, and a single
+    // summary line hides which addresses were which.
+    if (Array.isArray(outcomes) && outcomes.length) {
+      lines.push('#', '# What each address did:', ...outcomes.map(o => `#   ${o}`));
+    } else if (Array.isArray(tried) && tried.length) {
+      lines.push('#', '# Addresses tried:', ...tried.map(t => `#   ${t}`));
+    }
+    lines.push(
+      '#',
+      '# This is not the agent\'s configuration, and saving it will be',
+      '# refused — an empty config never reaches a sensor. Fix the reason',
+      '# above, then reload the tab.',
+    );
+    return lines.join('\n');
+  };
+
   const fetchConfig = async (type: string) => {
     if (!agentName) return;
     setConfigLoading(true);
     try {
       const res = await agentService.getAgentYamlConfig(agentName, type);
+      if (typeof res?.content !== 'string') {
+        // A 200 that carries no config is still a failure, and letting
+        // `undefined` reach the editor renders an empty box that looks like
+        // an agent with no rules configured.
+        setConfigContent(configFailure(res?.message || 'the agent returned no content', res?.tried, res?.outcomes));
+        return;
+      }
       setConfigContent(res.content);
-    } catch (err) {
+    } catch (err: any) {
+      // Show what the server said, not that something went wrong.
+      //
+      // This wrote "# Error loading config from agent." over whatever reason
+      // came back, so an unreachable agent, a rejected key and a malformed
+      // response all produced the same sentence - and because the message
+      // lands in the editor, the linter then flagged the placeholder itself
+      // as "Config parsed as empty". Two errors on screen, one lost cause.
       console.error("Failed to fetch config", err);
-      setConfigContent("# Error loading config from agent.");
+      const body = err?.response?.data;
+      setConfigContent(configFailure(
+        body?.message || err?.message || 'no reason given',
+        body?.tried,
+        body?.outcomes,
+      ));
     } finally {
       setConfigLoading(false);
     }
@@ -196,11 +248,12 @@ const AgentDetail: React.FC = () => {
   };
 
   const handleRestart = async () => {
-    if (window.confirm("Restart agent service?")) {
-      try {
-        await agentService.restartAgent(agentName!);
-        alert("Restart command sent.");
-      } catch (err) { alert("Failed to send restart command."); }
+    if (!window.confirm("Restart agent service?")) return;
+    try {
+      const res = await agentService.restartAgent(agentName!);
+      alert(res?.message || 'Restart requested.');
+    } catch (err: any) {
+      alert(commandFailure(err, 'restart the agent'));
     }
   };
 
@@ -231,12 +284,33 @@ const AgentDetail: React.FC = () => {
   };
 
   const handleSelfDestruct = async () => {
-    if (window.confirm("DANGER: This will UNINSTALL and DELETE the agent from the remote host. Proceed?")) {
-      try {
-        await agentService.selfDestructAgent(agentName!);
-        alert("Self-destruct command sent.");
-      } catch (err) { alert("Failed to send command."); }
+    if (!window.confirm("DANGER: This will UNINSTALL and DELETE the agent from the remote host. Proceed?")) return;
+    try {
+      const res = await agentService.selfDestructAgent(agentName!);
+      // "Sent" is not the outcome. The agent removes its autostart before it
+      // answers, so a success here means the watchdog is really gone; a 202
+      // means the command is queued and has not run yet. Saying "sent" for
+      // both is how an uninstall that did nothing looked like one that
+      // worked.
+      alert(res?.message || 'Uninstall requested.');
+    } catch (err: any) {
+      alert(commandFailure(err, 'uninstall'));
     }
+  };
+
+  /** What actually went wrong, rather than "Failed to send command."
+   *
+   *  The server now answers with the reason and, when it tried several
+   *  addresses, what each one did. Replacing that with a fixed sentence made
+   *  an unreachable agent, a rejected key and an action the agent does not
+   *  implement all look identical. */
+  const commandFailure = (err: any, what: string): string => {
+    const body = err?.response?.data;
+    const parts = [body?.message || err?.message || `Could not ${what}.`];
+    if (Array.isArray(body?.outcomes) && body.outcomes.length) {
+      parts.push('', 'What each address did:', ...body.outcomes.map((o: string) => `  ${o}`));
+    }
+    return parts.join('\n');
   };
 
   useEffect(() => {
@@ -377,9 +451,14 @@ const AgentDetail: React.FC = () => {
               onClick={async () => {
                 if (window.confirm("Isolate host? This will block all incoming/outgoing traffic except to the management server.")) {
                    try {
-                     await agentService.executeSoarAction(agentName!, { action: "block_ip", target: "0.0.0.0", comment: "Manual Isolation" });
-                     alert("Isolation command sent.");
-                   } catch (err) { alert("Failed to send isolation command."); }
+                     const res = await agentService.executeSoarAction(agentName!, { action: "block_ip", target: "0.0.0.0", comment: "Manual Isolation" });
+                     // `ok: false` comes back with HTTP 200 when the push
+                     // failed but the command was queued, so the status code
+                     // alone does not say whether the host is isolated.
+                     alert(res?.ok === false
+                       ? `Not isolated yet: ${res?.message || res?.error || 'no reason given'}`
+                       : (res?.message || 'Isolation requested.'));
+                   } catch (err: any) { alert(commandFailure(err, 'isolate the host')); }
                 }
               }}
               style={{ padding: '10px 20px', borderRadius: '8px', backgroundColor: 'var(--accent-color)', color: 'white', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.875rem' }}>
