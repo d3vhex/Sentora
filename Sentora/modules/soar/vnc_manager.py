@@ -1,36 +1,27 @@
 # -*- coding: utf-8 -*-
 import os
 import subprocess
-import urllib.request
-import zipfile
 from pathlib import Path
 import platform
 import logging
 
 class VNCManager:
-    """
-    Downloads and starts a portable TightVNC server for dynamic remote assistance.
-    Intended for Windows platforms natively.
+    """Starts a TightVNC server that has already been placed on the host.
+
+    It does not download anything, and the removed `_download_vnc` did not
+    either - it checked whether `tvnserver.exe` existed and logged "please
+    deploy it here" when it did not. The docstring said "Downloads and starts"
+    and `urllib.request` and `zipfile` were imported to match, so the code
+    read as though acquisition were handled. Nothing called that method.
+
+    `tvnserver.exe` has to be put in `%TEMP%/SentoraVNC/` by other means.
+    Stated here rather than implied by an import.
     """
     def __init__(self):
         self.system = platform.system().lower()
         self.logger = logging.getLogger(__name__)
         self.base_dir = Path(os.environ.get("TEMP", "C:/Windows/Temp")) / "SentoraVNC"
         self.exe_path = self.base_dir / "tvnserver.exe"
-
-    def _download_vnc(self) -> bool:
-        if self.exe_path.exists():
-            return True
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            self.logger.info("Initializing VNC Server payload...")
-            if not self.exe_path.exists():
-                self.logger.warning(f"TightVNC not found at {self.exe_path}. Please deploy tvnserver.exe to this location for VNC to work.")
-                return False
-            return True
-        except Exception as e:
-            self.logger.error(f"VNC Download error: {e}")
-            return False
 
     def start_vnc(self) -> (bool, str):
         self.stop_vnc()

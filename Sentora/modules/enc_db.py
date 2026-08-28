@@ -48,17 +48,6 @@ __FERNET_KEY_STR: Optional[str] = None
 ENC_PREFIX = "enc::"
 
 
-def set_agent_config(
-    refresh_sec: Optional[int] = None,
-    **_legacy_kwargs,
-) -> None:
-    """Configure refresh cadence. Extra keyword args are silently
-    ignored so older callers don't break."""
-    global FERNET_REFRESH_SEC
-    if refresh_sec is not None:
-        FERNET_REFRESH_SEC = max(60, int(refresh_sec))
-
-
 def set_encrypt_fields_map(mapping: Dict[str, List[str]], *, merge: bool = True) -> None:
     """Register fields to encrypt at rest.
 
@@ -108,11 +97,6 @@ def get_fernet_key() -> Optional[str]:
         return __FERNET_KEY_STR
 
 
-def has_key() -> bool:
-    with _LOCK:
-        return __FERNET_OBJ is not None
-
-
 class ConfigError(RuntimeError):
     pass
 
@@ -133,33 +117,6 @@ def _get_fernet() -> Fernet:
 def _should_encrypt(table: str, field: str) -> bool:
     fields = ENCRYPT_FIELDS_MAP.get(table) or []
     return field in fields
-
-
-def encrypt_str(plaintext: str) -> str:
-    f = _get_fernet()
-    token = f.encrypt(plaintext.encode("utf-8")).decode("utf-8")
-    return ENC_PREFIX + token
-
-
-def decrypt_maybe(val: Union[str, bytes]) -> str:
-    if isinstance(val, bytes):
-        try:
-            val = val.decode("utf-8")
-        except Exception:
-            return val.decode("utf-8", errors="ignore")
-
-    if not isinstance(val, str):
-        return str(val)
-
-    if not val.startswith(ENC_PREFIX):
-        return val
-
-    token = val[len(ENC_PREFIX):].encode("utf-8")
-    try:
-        pt = _get_fernet().decrypt(token)
-        return pt.decode("utf-8")
-    except InvalidToken:
-        return val
 
 
 def _enc_value(v: Any) -> str:
