@@ -40,6 +40,26 @@ VALID_REGEX_FLAGS = {
 SEVERITIES = {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"}
 
 
+def _nearest_severity(value: str) -> str | None:
+    """The severity a misspelling probably meant, or None if nothing is close.
+
+    Prefix and containment first, because the real cases are longer or shorter
+    spellings of a valid name - `INFORMATIVE`, `CRIT`, `WARNING` - rather than
+    transpositions. Falls back to close-match, and returns None rather than
+    guess when the input resembles nothing, so the message does not send an
+    operator after a word they never wrote.
+    """
+    value = (value or "").strip().upper()
+    if not value:
+        return None
+    for known in sorted(SEVERITIES):
+        if known.startswith(value) or value.startswith(known):
+            return known
+    import difflib
+    close = difflib.get_close_matches(value, sorted(SEVERITIES), n=1, cutoff=0.6)
+    return close[0] if close else None
+
+
 @dataclass
 class Issue:
     line: int | None          # 1-based; None when the problem has no location
@@ -79,11 +99,6 @@ def _compile_patterns(block: str, first_line: int, label: str) -> list[Issue]:
                 line=first_line + offset,
             ))
     return issues
-
-
-def _scalar_line(node: yaml.Node) -> int:
-    """1-based document line for a node."""
-    return node.start_mark.line + 1
 
 
 def _find_block_lines(root: yaml.Node) -> dict[int, int]:
@@ -166,9 +181,23 @@ def _validate_rules(data: Any, root: yaml.Node | None) -> list[Issue]:
         if not sev:
             issues.append(_err(f"Category `{name}` is missing `severity`"))
         elif sev not in SEVERITIES:
+            # Name the likely intent, not just the rule.
+            #
+            # An unrecognised severity is worth blocking on rather than
+            # warning about: `core.triage` keeps events whose severity it
+            # cannot read - deliberately, so a missing field never silently
+            # means "below the floor" - so a typo here does not disable the
+            # category, it exempts it from the floor and sends every one of
+            # its events to the model.
+            #
+            # `INFORMATIVE` for `INFO` is the one that actually happened, and
+            # "is not one of CRITICAL, HIGH, INFO, LOW, MEDIUM" left the
+            # operator to spot which of the five was meant.
+            suggestion = _nearest_severity(sev)
+            hint = f". Did you mean `{suggestion}`?" if suggestion else ""
             issues.append(_err(
                 f"Category `{name}`: severity `{body.get('severity')}` is not one of "
-                f"{', '.join(sorted(SEVERITIES))}"
+                f"{', '.join(sorted(SEVERITIES))}{hint}"
             ))
 
         weight = body.get("weight")

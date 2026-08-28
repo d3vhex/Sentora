@@ -513,6 +513,51 @@ async def recv_all(reader, length):
     return data
 
 
+def _own_gateways() -> set[str]:
+    """Router addresses on this machine's own interfaces.
+
+    Read from the kernel's routing table, so this costs nothing and asks
+    nobody. In a container the default route points at the Docker bridge
+    gateway - which is exactly the address that turns up as the "peer" when an
+    agent on the host connects to a server in a container.
+    """
+    gateways: set[str] = set()
+    try:
+        with open("/proc/net/route", "r", encoding="ascii") as fh:
+            next(fh, None)                      # header
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                raw = parts[2]                  # gateway, little-endian hex
+                if raw == "00000000":
+                    continue
+                try:
+                    packed = int(raw, 16).to_bytes(4, "little")
+                    gateways.add(".".join(str(b) for b in packed))
+                except Exception:
+                    continue
+    except Exception:
+        # Not Linux, or no procfs. Losing the refinement is acceptable -
+        # refusing telemetry over it is not - so this returns what it has.
+        # Not logged: it runs on every connection, and on a platform without
+        # procfs it would fail on every one of them.
+        return gateways
+    return gateways
+
+
+def peer_is_a_local_router(host: str, gateways: set[str]) -> bool:
+    """Whether this peer address is a router on our side rather than a host.
+
+    A NAT gateway's address is not the address of anything that answers. When
+    the peer we see is our own default gateway, the connection has been
+    translated on the way in and the source address has been replaced by the
+    router's - so it tells us where the packets entered, not where the agent
+    is.
+    """
+    return bool(host) and host in gateways
+
+
 def observed_peer_ip(writer) -> str | None:
     """The address this connection actually came from, when it tells us more
     than the agent already did.
@@ -548,6 +593,24 @@ def observed_peer_ip(writer) -> str | None:
         return None
     if addr.is_loopback or addr.is_link_local or addr.is_unspecified:
         return None
+
+    # Our own router is not an agent.
+    #
+    # The rule above - "what we observed beats what we were told" - assumes
+    # the translation happens on the *agent's* side, which is the cloud-VM
+    # case it was written for. With the server in a container on the agent's
+    # own machine it is the other way round: the connection is NAT'd on the
+    # way in and arrives from the bridge gateway, 172.18.0.1. That address is
+    # a router. Nothing listens on it, it is not where the agent is, and
+    # recording it overwrote the one address that worked - which is how the
+    # console came to show a Docker gateway as a host's "Primary IP" and every
+    # server-to-agent call landed on `Connection refused`.
+    #
+    # Decided from our own routing table, so it needs no configuration and
+    # asks nothing outside.
+    if peer_is_a_local_router(host, _own_gateways()):
+        return None
+
     return host
 
 

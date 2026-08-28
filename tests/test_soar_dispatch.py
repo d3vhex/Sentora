@@ -81,12 +81,45 @@ def test_every_dispatcher_disables_background_queue():
     )
 
 
-def test_at_least_four_dispatchers_are_covered():
-    """There were four independent copies of this dispatch logic, and the fix
-    had to be applied to each. This pins that the walk still sees them all -
-    a detector that quietly finds one would let the other three regress."""
-    dispatchers = [f"{fn}:{ln}" for fn, ln, _, is_d in SITES if is_d]
-    assert len(dispatchers) >= 4, f"expected 4+ dispatchers, found {dispatchers}"
+#: The dispatchers this file exists to watch.
+#
+# There were four. `_execute_automation_record` was the fourth and has been
+# removed: nothing in the tree referenced it - not a call, not a string, not a
+# route - so it was a fourth copy of the loop that could never run.
+#
+# Named rather than counted. A count catches a disappearance and misses a
+# rename, and the failure this guards against is the walk quietly finding
+# fewer than there are.
+KNOWN_DISPATCHERS = {
+    "execute_automation",
+    "run_due_automations",
+    "_run_due_automations_logic",
+}
+
+
+def test_every_known_dispatcher_is_still_seen():
+    """The fix had to be applied to each copy of this logic, so the detector
+    has to keep finding each copy. A detector that quietly sees one would let
+    the others regress."""
+    seen = {fn for fn, _, _, is_d in SITES if is_d}
+    missing = KNOWN_DISPATCHERS - seen
+    assert not missing, (
+        f"the walk no longer sees {sorted(missing)}. Either they were renamed "
+        f"- update KNOWN_DISPATCHERS - or the detection above stopped working, "
+        f"which would let the dispatch loop come back unnoticed. Seen: {sorted(seen)}"
+    )
+
+
+def test_any_new_dispatcher_is_noticed():
+    """A fifth copy is not forbidden, but it has to be added here knowingly:
+    every copy needs `background_queue=False` and the test above only checks
+    the ones it knows about."""
+    seen = {fn for fn, _, _, is_d in SITES if is_d}
+    unexpected = seen - KNOWN_DISPATCHERS
+    assert not unexpected, (
+        f"new dispatcher(s) {sorted(unexpected)}. Confirm each passes "
+        f"background_queue=False, then add them to KNOWN_DISPATCHERS."
+    )
 
 
 def test_the_default_is_still_queue_on_new_commands():

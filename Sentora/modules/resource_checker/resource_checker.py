@@ -3,12 +3,6 @@ import time
 from datetime import datetime
 from modules.db import insert_record, delete_all
 
-def get_cpu_usage():
-    try:
-        return psutil.cpu_percent(interval=1)
-    except Exception:
-        return 0.0
-
 def get_memory_usage():
     try:
         mem = psutil.virtual_memory()

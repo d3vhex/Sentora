@@ -161,6 +161,36 @@ else
   exit 1
 fi
 
+# ── let the server reach the agent's API ─────────────────────────────────────
+# The agent listens on 0.0.0.0:9099 and the server calls it there for config
+# reads, SOAR dispatch and the screen stream. A host running ufw drops that,
+# and the symptom is a `Connection refused` against a process that is plainly
+# listening - which reads as a broken agent rather than a closed port.
+#
+# Only when a firewall is actually active: adding rules to an inactive ufw
+# quietly enables nothing, and running `ufw allow` on a host that does not use
+# ufw is noise in someone else's configuration.
+#
+# Scoped to private networks. The listener requires X-Agent-Key on every
+# route, but a firewall rule is a second thing that has to be wrong before an
+# endpoint's management API is reachable from anywhere.
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+  echo "[*] ufw is active - allowing inbound 9099 from private networks..."
+  for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+    ufw allow from "$net" to any port 9099 proto tcp >/dev/null 2>&1 || true
+  done
+  if ufw status | grep -q "9099"; then
+    echo "[+] Firewall: inbound TCP 9099 allowed from private networks."
+  else
+    # Not fatal - telemetry is agent-initiated and keeps flowing. What breaks
+    # is the server calling in, so this has to be visible rather than assumed.
+    echo "[!] Could not confirm the ufw rule for 9099."
+    echo "    The agent will still send telemetry, but the server cannot reach"
+    echo "    it for config, SOAR or the screen stream. Add it by hand:"
+    echo "    ufw allow from 192.168.0.0/16 to any port 9099 proto tcp"
+  fi
+fi
+
 SERVICE_FILE="/etc/systemd/system/sentora-agent.service"
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
@@ -448,6 +478,54 @@ def _render_windows_install(server_url: str, server_ip: str, token: str) -> str:
         $taskName = "SentoraAgent"
         $exePath  = Join-Path $InstallDir "main.exe"
         $workDir  = $InstallDir
+
+        # Let the server reach the agent's API.
+        #
+        # The agent listens on 0.0.0.0:9099 and the server calls it there for
+        # config reads, SOAR dispatch and the screen stream. Windows blocks
+        # inbound connections to a program that has not been allowed, and the
+        # prompt that would normally ask cannot appear here: the agent runs as
+        # SYSTEM in session 0, which has no desktop to show it on. So the port
+        # stayed shut with nothing anywhere saying so - every server-to-agent
+        # call came back `Connection refused` against a process that was
+        # listening, which reads as a broken agent rather than a closed port.
+        #
+        # Scoped by remote address, not by network profile.
+        #
+        # `-Profile Domain,Private` is the obvious way to write this and it
+        # does not work where it is most needed: Windows classifies the
+        # Hyper-V / WSL virtual adapter - the one Docker Desktop's traffic
+        # arrives on - as Public. A profile-scoped rule therefore does not
+        # apply to it, and the port stays shut with a rule sitting there
+        # looking correct.
+        #
+        # Remote address is the property actually being reasoned about, and it
+        # does not depend on how Windows happened to classify an adapter. The
+        # listener requires X-Agent-Key on every route regardless; this is the
+        # second thing that has to be wrong before an endpoint's management API
+        # is reachable from a coffee shop network.
+        $agentPort = 9099
+        try {{
+            Get-NetFirewallRule -DisplayName "Sentora Agent API" -ErrorAction SilentlyContinue |
+                Remove-NetFirewallRule -ErrorAction SilentlyContinue
+            New-NetFirewallRule -DisplayName "Sentora Agent API" `
+                -Direction Inbound -Action Allow -Protocol TCP `
+                -LocalPort $agentPort -Profile Any `
+                -RemoteAddress LocalSubnet,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16 `
+                -Program $exePath `
+                -Description "Lets the Sentora server reach this agent's API." | Out-Null
+            Write-Host "[+] Firewall: inbound TCP $agentPort allowed from private networks." -ForegroundColor Green
+        }} catch {{
+            # Not fatal: telemetry is agent-initiated and keeps flowing. What
+            # breaks is the server calling *in*, so this must be visible rather
+            # than swallowed - it is the difference between "the agent is down"
+            # and "the port is shut".
+            Write-Host "[!] Could not add the firewall rule: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "    The agent will still send telemetry, but the server" -ForegroundColor Yellow
+            Write-Host "    cannot reach it for config, SOAR or the screen stream." -ForegroundColor Yellow
+            Write-Host "    Add it by hand:" -ForegroundColor Yellow
+            Write-Host "    New-NetFirewallRule -DisplayName 'Sentora Agent API' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $agentPort -Profile Any -RemoteAddress LocalSubnet,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16" -ForegroundColor Yellow
+        }}
 
         # Remove legacy sc.exe service if it exists from a previous install
         $legacy = Get-Service -Name $taskName -ErrorAction SilentlyContinue

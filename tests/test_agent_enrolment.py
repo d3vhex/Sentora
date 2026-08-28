@@ -280,3 +280,62 @@ def test_the_agents_database_is_not_published_to_the_world():
     assert published, "the port mapping disappeared"
     for line in published:
         assert line.startswith('- "127.0.0.1:'), line
+
+
+# --------------------------------------------------------------------------
+# The server has to be able to reach the agent it just installed
+# --------------------------------------------------------------------------
+#
+# The agent listens on 0.0.0.0:9099 and the server calls it there for config
+# reads, SOAR dispatch and the screen stream. Windows blocks inbound
+# connections to a program that has not been allowed, and the prompt that
+# normally asks cannot appear: the agent runs as SYSTEM in session 0, which
+# has no desktop to show it on.
+#
+# So the port stayed shut with nothing anywhere saying so, and every call in
+# returned `Connection refused` against a process that was listening - which
+# reads as a broken agent rather than a closed port.
+
+def _windows_script() -> str:
+    from core import installers
+    return installers._render_windows_install(
+        "http://sentora.example", "10.0.0.1", "t" * 64)
+
+
+def test_the_windows_installer_opens_the_agent_port():
+    script = _windows_script()
+    assert "New-NetFirewallRule" in script
+    assert "9099" in script
+
+
+def test_the_rule_is_scoped_rather_than_wide_open():
+    """The listener requires X-Agent-Key on every route, but a firewall rule
+    is a second thing that has to be wrong before an endpoint's management API
+    is reachable from a coffee shop network."""
+    script = _windows_script()
+    assert "-Protocol TCP" in script
+    assert "-Direction Inbound" in script
+    # Scoped by remote address, not by profile. Windows classifies the
+    # Hyper-V / WSL adapter that Docker Desktop's traffic arrives on as
+    # Public, so a `-Profile Domain,Private` rule does not apply to exactly
+    # the case it was added for - and sits there looking correct.
+    assert "-RemoteAddress" in script
+    for net in ("LocalSubnet", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"):
+        assert net in script, f"{net} missing from the rule's scope"
+    assert "0.0.0.0/0" not in script, "the rule must not be open to any address"
+
+
+def test_a_failed_rule_is_reported_not_swallowed():
+    """Telemetry is agent-initiated and keeps flowing either way. What breaks
+    is the server calling in, so the difference between "the agent is down"
+    and "the port is shut" has to be visible at install time."""
+    script = _windows_script()
+    assert "Could not add the firewall rule" in script
+
+
+def test_uninstall_removes_the_rule():
+    """A hole named after software that is no longer installed is not
+    something anyone goes looking for later."""
+    main = (pathlib.Path(__file__).resolve().parent.parent
+            / "Sentora" / "main.py").read_text(encoding="utf-8")
+    assert "Remove-NetFirewallRule" in main

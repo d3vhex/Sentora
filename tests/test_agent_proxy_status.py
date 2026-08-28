@@ -137,3 +137,136 @@ def test_a_failed_push_is_not_audited_as_a_config_change():
     audit log saying it was is worse than no entry."""
     code = _source("set_agent_config_proxy")
     assert "CONFIG_PUSH_FAILED" in code
+
+
+# --------------------------------------------------------------------------
+# Reaching an agent that runs on this machine
+# --------------------------------------------------------------------------
+#
+# The agent was listening on 0.0.0.0:9099 and every address the server knew
+# was refused, including the right one. Under Docker Desktop the containers
+# live in a Linux VM, so the host's LAN address (192.168.1.26) is reached
+# through a NAT that does not forward back - refused against a machine that is
+# listening.
+#
+# The signal for this case already existed and was being thrown away: an agent
+# that reaches us from our own bridge gateway is running on the container
+# host. `observed_peer_ip` detects exactly that and discards the gateway as an
+# address, which is right - it cannot be dialled - but it still says where the
+# agent is.
+
+
+def test_the_container_host_is_a_candidate_address():
+    code = _source("_agent_http_bases")
+    assert "host.docker.internal" in code
+    assert "in_container" in code, \
+        "the name is only meaningful from inside a container"
+
+
+def test_the_recorded_addresses_are_tried_first():
+    """On a real deployment - server on its own box, agents on the network -
+    the recorded addresses are correct and this name is not."""
+    code = _source("_agent_http_bases")
+    assert code.index("reported_ip") < code.index("host.docker.internal")
+
+
+def test_loopback_stays_the_last_resort():
+    code = _source("_agent_http_bases")
+    assert code.index("host.docker.internal") < code.rindex("127.0.0.1")
+
+
+def test_compose_defines_the_name_for_plain_docker():
+    """Docker Desktop provides it; Linux Docker does not, and without the
+    alias the candidate silently never resolves."""
+    import yaml
+    compose = yaml.safe_load((ROOT / "docker-compose.yaml").read_text(encoding="utf-8"))
+    hosts = compose["services"]["app"].get("extra_hosts") or []
+    assert any("host.docker.internal:host-gateway" in h for h in hosts), \
+        "app cannot resolve host.docker.internal on plain Linux Docker"
+
+
+# --------------------------------------------------------------------------
+# The informative error must not be overwritten by the useless one
+# --------------------------------------------------------------------------
+#
+# `_agent_proxy` kept a single `last_detail` and overwrote it per address, so
+# the address that connected and answered 401 - which names the actual
+# problem - was buried under "connection refused" from the loopback fallback
+# tried after it. The operator read the reason for an address that was never
+# going to work, and never saw the one that did.
+
+
+def test_every_address_reports_its_own_outcome():
+    code = _source("_agent_proxy")
+    assert "outcomes" in code
+    assert "outcomes.append" in code
+
+
+def test_a_rejected_key_is_not_lost_behind_a_later_refusal():
+    """Reaching the agent is a different fact from failing to reach it, and it
+    survives whatever the remaining addresses do."""
+    code = _source("_agent_proxy")
+    assert "reached, but the agent rejected" in code
+    # The headline is chosen from what happened, not from the last iteration.
+    assert "if reached:" in code
+
+
+def test_the_headline_distinguishes_the_two_failures():
+    code = _source("_agent_proxy")
+    assert "rejected this server's key" in code
+    assert "Could not reach" in code
+
+
+# --------------------------------------------------------------------------
+# The console does not know the agent's real name
+# --------------------------------------------------------------------------
+#
+# `agent_identities.agent_name` holds what the agent enrolled as -
+# `DESKTOP-EVS8H9J`. The console builds its agent list from `SHOW DATABASES`
+# and strips `_db`, and `server._sanitize_db_name` has already turned every
+# hyphen into an underscore by then, so what reaches these handlers is
+# `DESKTOP_EVS8H9J`.
+#
+# Matching that exactly found no row, so the key lookup fell through to the
+# fleet master secret - which the agent rightly refused, because it holds its
+# own key and has never seen that one. Every server-to-agent call on any host
+# with a hyphen in its name returned 401: config reads, SOAR dispatch, the
+# screen stream. The agent was correct at every step and looked broken.
+
+def _name_forms():
+    namespace: dict = {"re": __import__("re")}
+    exec(compile(ast.Module(body=[_function("_agent_name_forms")], type_ignores=[]),
+                 "<app.py>", "exec"), namespace)
+    return namespace["_agent_name_forms"]
+
+
+def test_the_two_spellings_of_one_host():
+    hyphen, underscore, _ = _name_forms()("DESKTOP_EVS8H9J")
+    assert hyphen == "DESKTOP-EVS8H9J"
+    assert underscore == "DESKTOP_EVS8H9J"
+
+
+@pytest.mark.parametrize("handler", ["_get_agent_keys", "set_agent_display_name",
+                                     "_agent_display_names"])
+def test_identity_lookups_accept_both_spellings(handler):
+    assert "_agent_name_forms" in _source(handler), (
+        f"{handler} matches the identity name exactly, so it finds nothing "
+        f"for any host whose name contains a hyphen")
+
+
+def test_the_key_lookup_returns_every_match():
+    """Two names can flatten to one spelling. `_try_agent_request` already
+    walks candidate keys, so an ambiguity costs one extra request rather than
+    a wrong answer."""
+    code = _source("_get_agent_keys")
+    assert "fetchall" in code
+    assert "LIMIT 1" not in code
+
+
+def test_the_master_secret_is_still_only_a_fallback():
+    """It is appended after the per-agent keys, never instead of them - the
+    whole failure was reaching for it when the real key existed."""
+    code = _source("_get_agent_keys")
+    # The per-agent keys are collected before the fallback is appended. Read
+    # off the statements, not the docstring, which names both.
+    assert code.index("keys.append(row[0])") < code.index("keys.append(AGENT_SHARED_SECRET)")

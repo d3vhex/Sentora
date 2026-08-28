@@ -24,6 +24,7 @@ from sanic.response import json as sanic_json, text as sanic_text
 from modules.db import insert_record, fetch_unsent, mark_sent, fetch_one
 import modules.enc_db as enc_db
 import modules.screen_capture as screen_capture
+import modules.agent_paths as agent_paths
 
 import logging
 import builtins
@@ -1108,6 +1109,14 @@ def disable_autostart() -> tuple[bool, str]:
     if system == "windows":
         code, out = _run(["schtasks", "/Delete", "/TN", WINDOWS_TASK_NAME, "/F"])
         detail = out or f"schtasks exited {code}"
+        # The installer opens inbound 9099 for the agent's API. Leaving the
+        # rule behind after an uninstall leaves a hole named after software
+        # that is no longer here, which is exactly the kind of thing nobody
+        # goes looking for later.
+        _run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+              "Get-NetFirewallRule -DisplayName 'Sentora Agent API' "
+              "-ErrorAction SilentlyContinue | Remove-NetFirewallRule "
+              "-ErrorAction SilentlyContinue"])
     else:
         # `disable --now` stops it and removes the enablement symlink; the
         # unit file itself has to go too, or `systemctl start` still works and
@@ -1432,29 +1441,6 @@ def _load_identity_from_config(path: str) -> dict:
     return cfg
 
 
-def _insert_soar_action_local(*, event_id: int | None, action: str, target: str,
-                              comment: str | None, status: str,
-                              expires_at: str | None) -> int | None:
-    try:
-        rec = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "event_id": event_id,
-            "action": action,
-            "target": target,
-            "comment": (comment or "")[:500],
-            "status": status.upper(),
-            "resolved_at": None,
-            "expires_at": expires_at,
-        }
-        rid = insert_record("soar_actions", rec)
-        try:
-            return int(rid)
-        except Exception:
-            return None
-    except Exception:
-        return None
-
-
 def _accepted_auth_tokens() -> set:
     """Both the per-agent enrollment key (AGENT_SHARED_SECRET runtime
     global, set from cfg.agent_key after registration) AND the server's
@@ -1681,11 +1667,12 @@ async def get_config(request, cfg_type):
         return sanic_json({"ok": False, "error": "invalid type"}, status=400)
     
     try:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        path = os.path.join(base_dir, mapping[cfg_type])
+        # Persistent copy if the operator has ever pushed one, else the copy
+        # that shipped inside the build. See modules/agent_paths.
+        path = agent_paths.config_path(cfg_type)
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
-        return sanic_json({"ok": True, "content": content})
+        return sanic_json({"ok": True, "content": content, "path": path})
     except Exception as e:
         return sanic_json({"ok": False, "error": str(e)}, status=500)
 
@@ -1708,11 +1695,17 @@ async def set_config(request, cfg_type):
         return sanic_json({"ok": False, "error": "no content"}, status=400)
 
     try:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        path = os.path.join(base_dir, mapping[cfg_type])
+        # Beside the executable, never into the PyInstaller extraction
+        # directory: that one is deleted when the process exits, so the old
+        # write reported success and silently reverted on the next restart.
+        path = agent_paths.writable_config_path(cfg_type)
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
-        return sanic_json({"ok": True, "message": "Config updated successfully"})
+        return sanic_json({
+            "ok": True,
+            "message": f"Config written to {path}. It survives a restart.",
+            "path": path,
+        })
     except Exception as e:
         return sanic_json({"ok": False, "error": str(e)}, status=500)
 
@@ -1911,6 +1904,13 @@ def main():
             signal.signal(signal.SIGTERM, handle_sigterm)
         except Exception:
             pass
+
+    # Put the shipped configs beside the executable on first run, so the
+    # writable copy and the read path are the same file from the start.
+    # Never overwrites: a config an operator pushed is their decision, and a
+    # new build must not quietly discard it.
+    for created in agent_paths.seed_persistent_config():
+        print(f"[*] seeded config: {created}", flush=True)
 
     kill_old_agent_if_exists()
 

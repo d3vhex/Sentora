@@ -173,3 +173,99 @@ def test_the_path_is_not_handed_to_a_shell_to_re_parse():
     assert "shell=True" not in code
     assert "-LiteralPath" in code      # Windows: not treated as a wildcard
     assert '"$0"' in code              # POSIX: passed as an argument
+
+
+# --------------------------------------------------------------------------
+# Uninstall was sent to an endpoint that does not implement it
+# --------------------------------------------------------------------------
+#
+# `trigger_self_destruct` pushed `action: "self_destruct"` to the agent's
+# `/soar/execute`, which accepts only the members of its `ActionType` enum -
+# and `self_destruct` is not one of them, so every push came back 501 "action
+# not implemented". The agent implements it at its own `/self_destruct`
+# endpoint, which the server never called.
+#
+# `restart_service` *is* in that enum. That is the entire reason restart
+# appeared to work while uninstall did not.
+
+import ast as _ast
+
+APP = pathlib.Path(__file__).resolve().parent.parent / "app.py"
+APP_TREE = _ast.parse(APP.read_text(encoding="utf-8"))
+SOAR_SRC = (pathlib.Path(__file__).resolve().parent.parent / "Sentora"
+            / "modules" / "soar" / "soar.py").read_text(encoding="utf-8")
+
+
+def _app_fn(name: str) -> str:
+    """A handler's statements, without its docstring.
+
+    The docstrings here quote the endpoint that was wrong, so matching against
+    them would fail on the prose that explains the fix.
+    """
+    for node in _ast.walk(APP_TREE):
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)) and node.name == name:
+            body = list(node.body)
+            if (body and isinstance(body[0], _ast.Expr)
+                    and isinstance(body[0].value, _ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                body = body[1:]
+            return "\n".join(_ast.unparse(n) for n in body)
+    raise AssertionError(f"{name} not found in app.py")
+
+
+def test_self_destruct_uses_the_agents_own_endpoint():
+    code = _app_fn("trigger_self_destruct")
+    assert "/self_destruct" in code
+    assert "soar/execute" not in code, \
+        "uninstall is being sent as a SOAR action again; the agent answers 501"
+
+
+def test_the_agent_does_not_accept_it_as_a_soar_action():
+    """Pinning the reason the above matters. If `self_destruct` is ever added
+    to ActionType this test should be revisited deliberately, not silently."""
+    actions = SOAR_SRC.split("class ActionType(Enum):", 1)[1].split("class ", 1)[0]
+    assert "self_destruct" not in actions
+    assert "restart_service" in actions, "the enum no longer looks as expected"
+
+
+@pytest.mark.parametrize("handler,path", [
+    ("trigger_restart", "/restart"),
+    ("trigger_reload_auth", "/reload_auth"),
+    ("trigger_self_destruct", "/self_destruct"),
+])
+def test_lifecycle_commands_go_to_their_own_endpoints(handler, path):
+    code = _app_fn(handler)
+    assert "_agent_lifecycle_command" in code
+    assert path in code
+
+
+def test_a_queued_command_is_not_reported_as_done():
+    """"Sent" and "the agent did it" are different things to tell someone who
+    has just clicked Uninstall."""
+    code = _app_fn("_agent_lifecycle_command")
+    assert '"delivered": "direct"' in code or "'delivered': 'direct'" in code
+    assert '"delivered": "queued"' in code or "'delivered': 'queued'" in code
+    assert "202" in code, "a queued command should not answer 200"
+
+
+def test_a_queued_command_is_not_reported_as_failed_either():
+    """The row is in the queue and the agent polls it, so an agent that is
+    simply not answering this second has not failed."""
+    code = _app_fn("_agent_lifecycle_command")
+    assert '"status": "pending"' in code or "'status': 'pending'" in code
+
+
+def test_the_command_is_durable_before_it_is_hurried():
+    """Queue first, then push. The other order loses the command if the push
+    raises."""
+    code = _app_fn("_agent_lifecycle_command")
+    assert code.index("INSERT INTO") < code.index("_agent_proxy")
+
+
+def test_the_action_log_records_three_outcomes():
+    """SUCCESS was written whenever the call was delivered, so a push the
+    agent answered 501 to was logged as a completed uninstall - and anyone
+    reading that log later had no way to know the host still had an agent."""
+    code = _app_fn("_record_lifecycle")
+    for outcome in ("SUCCESS", "QUEUED", "FAILED"):
+        assert outcome in code

@@ -49,16 +49,31 @@ class _Writer:
         return self._peer
 
 
-@pytest.fixture(scope="module")
-def observed():
-    """Import just the helper, without importing server.py's dependencies."""
+def _peer_module(gateways: set[str] | None = None):
+    """server.py's peer helpers, without importing its dependencies.
+
+    `_own_gateways` reads the kernel routing table, which on the test machine
+    is the test machine's - not the deployment's. It is stubbed so the callers
+    can be exercised against a known set.
+    """
     import types
 
     module = types.ModuleType("_peer")
-    fn = _fn(SERVER, "observed_peer_ip")
-    exec(compile(ast.Module(body=[fn], type_ignores=[]), "<peer>", "exec"),
+    body = [_fn(SERVER, name) for name in
+            ("_own_gateways", "peer_is_a_local_router", "observed_peer_ip")]
+    exec(compile(ast.Module(body=body, type_ignores=[]), "<peer>", "exec"),
          module.__dict__)
-    return module.observed_peer_ip
+    if gateways is not None:
+        module._own_gateways = lambda: gateways
+    else:
+        module._own_gateways = lambda: set()
+    return module
+
+
+@pytest.fixture(scope="module")
+def observed():
+    """Import just the helper, without importing server.py's dependencies."""
+    return _peer_module().observed_peer_ip
 
 
 # --------------------------------------------------------------------------
@@ -221,3 +236,69 @@ def test_plaintext_and_wrong_key_both_come_back_unchanged():
     assert _decrypt_field("openssl", fernet) == "openssl"
     stored = "enc::" + other.encrypt(b'"openssl"').decode()
     assert _decrypt_field(stored, fernet) == stored
+
+
+# --------------------------------------------------------------------------
+# Our own router is not an agent
+# --------------------------------------------------------------------------
+#
+# "What we observed beats what we were told" assumes the address translation
+# happens on the *agent's* side - the cloud-VM case it was written for, where
+# the agent reports 172.31.x and we see the elastic IP.
+#
+# With the server in a container on the agent's own machine it is the other
+# way round: the connection is NAT'd on the way in and arrives from the Docker
+# bridge gateway. The console showed 172.18.0.1 as a Windows host's Primary
+# IP, and every server-to-agent call - config, SOAR dispatch, the screen
+# stream - landed on `Connection refused` against an address that has never
+# had a listener and never will.
+
+DOCKER_GATEWAY = "172.18.0.1"
+
+
+def test_the_docker_gateway_is_not_taken_for_the_agent():
+    observed = _peer_module({DOCKER_GATEWAY}).observed_peer_ip
+    assert observed(_Writer((DOCKER_GATEWAY, 51234))) is None, (
+        "the bridge gateway was recorded as the agent's address")
+
+
+def test_a_lan_peer_that_is_not_our_gateway_is_still_used():
+    """The fix must not swallow the ordinary case. On a flat corporate LAN the
+    agent's 192.168.x is its real address and there is nothing more public."""
+    observed = _peer_module({DOCKER_GATEWAY}).observed_peer_ip
+    assert observed(_Writer(("192.168.1.26", 51234))) == "192.168.1.26"
+
+
+def test_the_nat_case_this_rule_exists_for_still_works():
+    """A cloud VM's elastic IP is not one of our gateways, so it survives."""
+    observed = _peer_module({DOCKER_GATEWAY}).observed_peer_ip
+    assert observed(_Writer(("16.171.42.197", 51234))) == "16.171.42.197"
+
+
+def test_the_router_check_is_exact_not_a_prefix():
+    """172.18.0.1 being a gateway says nothing about 172.18.0.5, which is an
+    ordinary host on that network."""
+    module = _peer_module({DOCKER_GATEWAY})
+    assert module.peer_is_a_local_router("172.18.0.1", {DOCKER_GATEWAY}) is True
+    assert module.peer_is_a_local_router("172.18.0.5", {DOCKER_GATEWAY}) is False
+    assert module.peer_is_a_local_router("", {DOCKER_GATEWAY}) is False
+
+
+def test_no_routing_table_leaves_the_old_behaviour():
+    """Off Linux, or with no procfs, the check simply does not fire. Losing a
+    refinement is acceptable; refusing telemetry over it is not."""
+    observed = _peer_module(set()).observed_peer_ip
+    assert observed(_Writer((DOCKER_GATEWAY, 51234))) == DOCKER_GATEWAY
+
+
+def test_own_gateways_survives_a_missing_routing_table(tmp_path, monkeypatch):
+    """`_own_gateways` runs on the ingest path for every connection. It has to
+    return an empty set rather than raise."""
+    module = _peer_module()
+    real = _fn(SERVER, "_own_gateways")
+    import types
+    fresh = types.ModuleType("_gw")
+    exec(compile(ast.Module(body=[real], type_ignores=[]), "<gw>", "exec"),
+         fresh.__dict__)
+    monkeypatch.chdir(tmp_path)
+    assert isinstance(fresh._own_gateways(), set)

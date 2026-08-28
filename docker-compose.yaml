@@ -94,6 +94,18 @@ services:
     build: .
     container_name: sentora-server
     restart: always
+    # Reaching an agent that runs on this machine.
+    #
+    # Docker Desktop defines this name; plain Linux Docker does not, and
+    # `host-gateway` is the supported way to ask for it. The server needs it
+    # because an agent on the container host is not reachable at the host's
+    # own LAN address: that goes through a NAT which does not forward back,
+    # so the connection is refused against a machine that is listening.
+    #
+    # See `app._agent_http_bases` - it is one candidate among several, tried
+    # after the addresses actually recorded for the agent.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     security_opt:
       - no-new-privileges:true
     env_file:

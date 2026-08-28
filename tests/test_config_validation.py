@@ -192,3 +192,53 @@ def test_validate_never_raises(cfg):
     a 500 on every malformed paste."""
     for junk in ("\x00\x01", "!!python/object:os.system 'x'", "[", "a: [1,", "%YAML 1.9\n---\n"):
         cv.validate(cfg, junk)
+
+
+# --------------------------------------------------------------------------
+# A rejected severity should name the likely intent
+# --------------------------------------------------------------------------
+#
+# An agent in the field carried `severity: INFORMATIVE`, and the message read
+# "is not one of CRITICAL, HIGH, INFO, LOW, MEDIUM" - correct, and it left the
+# operator to work out which of the five was meant.
+#
+# Worth blocking on rather than warning about: `core.triage` deliberately
+# *keeps* events whose severity it cannot read, so that a missing field never
+# silently means "below the floor". A typo therefore does not disable the
+# category - it exempts it from the floor and sends every one of its events to
+# the model.
+
+def test_the_case_that_actually_happened():
+    doc = GOOD_RULES.replace("severity: CRITICAL", "severity: INFORMATIVE")
+    issues = cv.validate("rules", doc)
+    message = " ".join(i.message for i in issues)
+    assert "INFORMATIVE" in message
+    assert "Did you mean `INFO`?" in message
+
+
+def test_a_suggestion_is_offered_only_when_there_is_one():
+    """Pointing an operator at a word they never wrote is worse than not
+    guessing."""
+    doc = GOOD_RULES.replace("severity: CRITICAL", "severity: BANANA")
+    issues = cv.validate("rules", doc)
+    message = " ".join(i.message for i in issues)
+    assert "BANANA" in message
+    assert "Did you mean" not in message
+
+
+def test_valid_severities_still_pass_untouched():
+    """The suggestion must not fire on anything correct."""
+    for severity in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+        doc = GOOD_RULES.replace("severity: CRITICAL", f"severity: {severity}")
+        assert not errors(cv.validate("rules", doc)), severity
+
+
+def test_the_shipped_rules_file_validates():
+    """The repository's own rules.yaml is what a fresh agent gets, and it is
+    the file this error was reported against. If it does not pass its own
+    validator, every install starts with a config the console refuses."""
+    import pathlib
+    shipped = (pathlib.Path(__file__).resolve().parent.parent
+               / "Sentora" / "conf" / "rules.yaml").read_text(encoding="utf-8")
+    found = errors(cv.validate("rules", shipped))
+    assert not found, [i.message for i in found]

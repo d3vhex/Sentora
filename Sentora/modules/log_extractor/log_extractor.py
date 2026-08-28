@@ -15,6 +15,7 @@ from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Set
 
 import modules.enc_db as enc_db
+import modules.agent_paths as agent_paths
 # Encrypted fields are declared once in enc_db.ENCRYPT_FIELDS_MAP. Setting
 # them here replaced the map for the whole process, dropping every table other
 # modules had registered.
@@ -58,8 +59,16 @@ except ImportError:
 IS_WINDOWS = platform.system() == "Windows"
 
 here = os.path.dirname(os.path.abspath(__file__))
-default_cfg = os.path.normpath(os.path.join(here, "../../conf/log_paths.yaml"))
-RULES_YAML_PATH = os.path.normpath(os.path.join(here, "../../conf/rules.yaml"))
+
+# Resolved through agent_paths, not by walking up from __file__.
+#
+# In a PyInstaller onefile build `__file__` is inside the extraction directory
+# the bootloader deletes on exit, so a config the console pushed was written
+# there, read back correctly for the rest of that process, and gone after the
+# next restart. These now prefer the persistent copy beside the executable and
+# fall back to the one that shipped in the build.
+default_cfg = agent_paths.config_path("log_paths")
+RULES_YAML_PATH = agent_paths.config_path("rules")
 # Sigma rules. `builtin/` ships with the agent; community rulesets go beside
 # it, and everything under here is loaded recursively at start.
 #
@@ -942,20 +951,6 @@ def stats_reporter(metrics: MetricsCollector, interval: int = 60):
             stats.get('runtime_seconds', 0), stats.get('events_per_second', 0),
         )
 
-def create_health_check_data(metrics: MetricsCollector) -> Dict:
-    stats = metrics.get_stats()
-    return {
-        'status': 'healthy' if stats.get('events_per_second', 0) >= 0 else 'degraded',
-        'uptime': stats.get('runtime_seconds', 0),
-        'events_processed': stats.get('events_processed', 0),
-        'events_per_second': stats.get('events_per_second', 0),
-        'errors': {
-            'rate_limited': stats.get('rate_limited_events', 0),
-            'duplicates': stats.get('duplicate_events', 0),
-            'output_errors': stats.get('output_errors', 0)
-        }
-    }
-
 def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
@@ -965,8 +960,14 @@ def main():
     metrics = MetricsCollector()
     log_rotator = LogRotator()
 
-    logging.info(f"Loading rules: {RULES_YAML_PATH}")
-    rules_list = load_rules_from_yaml(RULES_YAML_PATH)
+    # Resolved here, not at import. A config pushed from the console lands
+    # beside the executable while this process is already running, and a path
+    # frozen at import time would keep reading the copy inside the build for
+    # the rest of that process's life - so a rules change would appear to take
+    # and change nothing until the next restart.
+    rules_path = agent_paths.config_path("rules")
+    logging.info(f"Loading rules: {rules_path}")
+    rules_list = load_rules_from_yaml(rules_path)
 
     if not rules_list:
         logging.warning("WARNING: No rules loaded. SIEM will be silent.")
@@ -1003,7 +1004,7 @@ def main():
 
     exclude_patterns = compile_exclude_patterns(DEFAULT_EXCLUDE_PATTERNS)
 
-    y = load_paths_from_yaml(PATHS_YAML_PATH)
+    y = load_paths_from_yaml(agent_paths.config_path('log_paths'))
 
     distro = detect_distro()
     paths = get_log_paths_from_yaml_or_fallback(y['log_paths'] if y else None, distro)
