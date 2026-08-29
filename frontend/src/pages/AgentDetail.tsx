@@ -22,13 +22,16 @@ import {
   FileDown,
   Bomb,
   MonitorPlay,
+  TerminalSquare as TerminalIcon,
   Box
 } from 'lucide-react';
 import { agentService } from '../services/api';
 import { saveBlobResponse } from '../utils/downloadBlob';
 import VncViewer from '../components/VncViewer';
+import AgentConsole from '../components/AgentConsole';
 import Fuse from 'fuse.js';
 import { isUnanswered, countUnanswered } from '../lib/insightTriage';
+import { summariseEventMessage } from '../lib/windowsEvent';
 
 // log_extractor often stuffs the enriched event into the `message` column as a
 // JSON string. Surface the inner fields so the table shows real columns instead
@@ -48,6 +51,11 @@ function parseSiemRow(r: any) {
     event_type: get('event_type') || get('categories') || '',
     source: get('source') || '',
     message: (inner && inner.message) ? inner.message : (r?.message ?? ''),
+    // A readable single line for table cells. `message` stays exactly as it
+    // arrived - this is a rendering choice, not a change to the record, and
+    // anything that needs the whole body still has it.
+    summary: summariseEventMessage(
+      (inner && inner.message) ? inner.message : (r?.message ?? '')),
   };
 }
 
@@ -328,6 +336,7 @@ const AgentDetail: React.FC = () => {
     { id: 'docker', label: 'Docker', icon: <Box size={18} /> },
     { id: 'portscan', label: 'Ports', icon: <Network size={18} /> },
     { id: 'files', label: 'Files', icon: <FileSearch size={18} /> },
+    { id: 'console', label: 'Console', icon: <TerminalIcon size={18} /> },
     { id: 'vnc', label: 'VNC', icon: <MonitorPlay size={18} /> },
     { id: 'config', label: 'Config', icon: <Settings size={18} /> },
     { id: 'ai', label: 'AI Analysis', icon: <BrainCircuit size={18} /> },
@@ -517,7 +526,7 @@ const AgentDetail: React.FC = () => {
             ]}
             data={data.siem.map((r: any) => {
               const p = parseSiemRow(r);
-              return [p.timestamp, p.severity, p.event_type, p.source, p.message];
+              return [p.timestamp, p.severity, p.event_type, p.source, p.summary];
             })}
           />
         )}
@@ -562,6 +571,11 @@ const AgentDetail: React.FC = () => {
             ]}
             data={data.criticalFiles.map((r: any) => [r.path, r.owner, r.grp, r.permissions, r.last_opened])}
           />
+        )}
+        {activeTab === 'console' && (
+          <div style={{ backgroundColor: 'var(--card-bg)', border: '1px solid var(--border-color)', borderRadius: '12px', overflow: 'hidden', height: '700px' }}>
+            {agentName && <AgentConsole agentName={agentName} />}
+          </div>
         )}
         {activeTab === 'vnc' && (
           <div style={{ backgroundColor: 'var(--card-bg)', border: '1px solid var(--border-color)', borderRadius: '12px', overflow: 'hidden', height: '700px' }}>

@@ -339,3 +339,53 @@ def test_uninstall_removes_the_rule():
     main = (pathlib.Path(__file__).resolve().parent.parent
             / "Sentora" / "main.py").read_text(encoding="utf-8")
     assert "Remove-NetFirewallRule" in main
+
+
+# --------------------------------------------------------------------------
+# The same asymmetry on Linux
+# --------------------------------------------------------------------------
+#
+# The Windows installer opens 9099 because the port stayed shut and every
+# server-to-agent call came back `Connection refused` against a listening
+# process. A Linux host running ufw has the identical failure and the
+# installer said nothing about it. The asymmetry was an accident.
+
+def _linux_script() -> str:
+    from core import installers
+    return installers._render_linux_install(
+        "http://sentora.example", "10.0.0.1", "t" * 64)
+
+
+def test_the_linux_installer_opens_the_agent_port():
+    script = _linux_script()
+    assert "ufw allow from" in script
+    assert "9099" in script
+
+
+def test_it_only_touches_a_firewall_that_is_running():
+    """Adding rules to an inactive ufw enables nothing, and running `ufw` on a
+    host that does not use it is noise in someone else's configuration."""
+    script = _linux_script()
+    assert "command -v ufw" in script
+    assert "Status: active" in script
+
+
+def test_the_linux_rule_is_scoped_to_private_networks():
+    script = _linux_script()
+    for net in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"):
+        assert net in script, f"{net} missing from the ufw scope"
+    assert "ufw allow 9099" not in script, "the rule must not be open to any address"
+
+
+def test_a_firewall_failure_is_reported_not_assumed():
+    """Telemetry is agent-initiated and keeps flowing either way. What breaks
+    is the server calling in, so the difference between "the agent is down"
+    and "the port is shut" has to be visible at install time."""
+    script = _linux_script()
+    assert "Could not confirm the ufw rule" in script
+
+
+def test_the_installer_scripts_stay_lf_only():
+    """CRLF in a shell script breaks bash on Linux, and the installer is piped
+    straight into it."""
+    assert "\r" not in _linux_script()

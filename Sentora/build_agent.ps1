@@ -177,6 +177,9 @@ $hiddenImports = @(
     "modules.enc_db",
     "modules.agent_paths",
     "modules.screen_capture",
+    "modules.console",
+    "winpty",
+    "winpty.ptyprocess",
     "modules.db"
 )
 

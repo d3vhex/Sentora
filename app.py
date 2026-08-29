@@ -5536,11 +5536,89 @@ async def trigger_self_destruct(request, agent):
     so a reply here means the watchdog is really gone - not merely that the
     request was delivered. See `Sentora/main.py:disable_autostart`.
     """
+    # Remove the autostart from here first, before asking the agent to remove
+    # itself.
+    #
+    # The agent gained a `disable_autostart` step that runs before it deletes
+    # anything, and that is the right place for it - but it only exists in
+    # builds that carry it. An older binary answers "Destruction initiated",
+    # deletes its files, exits, and is restarted a minute later by the
+    # scheduled task's watchdog. The server reads HTTP 200 and reports a
+    # completed uninstall.
+    #
+    # This does not depend on the agent implementing uninstall correctly. The
+    # server generated the installer, so it knows what the autostart is
+    # called, and `run_cmd` is in every version of `ActionType` - so this
+    # works against an agent of any age. Doing it first also means the
+    # watchdog is already gone by the time the files go.
+    autostart = await _remove_agent_autostart(agent)
+
     body, status = await _agent_lifecycle_command(
         agent, "/self_destruct", "self_destruct", "Self-destruct from UI",
         timeout=30)
+
+    # One sentence, not two overlapping ones.
+    #
+    # The server removes the autostart and then the agent removes it again, so
+    # both had something to say about it and the message concatenated them:
+    # "Autostart removed (ERROR: cannot find the file) ... Autostart: removed
+    # via schtasks". Both halves were true and together they read as a
+    # failure. What the operator needs is whether the watchdog is gone.
+    body["autostart_removal"] = autostart
+    body["message"] = (
+        f"Autostart: {autostart}. "
+        + ("The agent is deleting itself and exiting."
+           if status < 400 else
+           f"The agent did not confirm the uninstall: {body.get('message', '')}")
+    )
     await _record_lifecycle(request, agent, "self_destruct", body, status)
     return sanic_json(body, status=status)
+
+
+async def _agent_os(agent: str) -> str:
+    """Lower-cased `os_info` for an agent, or "" when it is not known."""
+    try:
+        cnx = await connect_db_for_agent(agent)
+        cur = await cnx.cursor()
+        await cur.execute(
+            "SELECT os_info FROM agent_info ORDER BY last_seen DESC LIMIT 1")
+        row = await cur.fetchone()
+        await cur.close()
+        await cnx.close()
+        return str((row or [""])[0] or "").lower()
+    except Exception as e:
+        print(f"[!] could not read os_info for {agent}: {e}", flush=True)
+        return ""
+
+
+async def _remove_agent_autostart(agent: str) -> str:
+    """Delete whatever relaunches this agent, using a command it will accept.
+
+    Returns a sentence describing what happened, for the operator and the
+    action log. Never raises: this runs before the uninstall proper, and
+    failing here must not stop that from being attempted.
+    """
+    os_info = await _agent_os(agent)
+    if "windows" in os_info:
+        argv = ["schtasks", "/Delete", "/TN", "SentoraAgent", "/F"]
+    elif os_info:
+        argv = ["systemctl", "disable", "--now", "sentora-agent"]
+    else:
+        return ("skipped - this agent's OS is unknown, so there was no safe "
+                "command to send")
+
+    try:
+        resp = await call_agent_soar(
+            agent, "run_cmd", argv,
+            comment="Remove autostart before uninstall",
+            background_queue=False)
+    except Exception as e:
+        return f"failed to send ({e})"
+
+    if resp.get("ok"):
+        return f"removed via {' '.join(argv)}"
+    return (f"not confirmed ({resp.get('error') or resp.get('message')}) - "
+            f"if the agent comes back, run `{' '.join(argv)}` on the host")
 
 
 async def _record_lifecycle(request, agent: str, action: str, body: dict, status: int):
@@ -9071,6 +9149,122 @@ async def _relay_upstream_close(ws, upstream) -> None:
         # feed die with no reason given, and that is worth a line in the log.
         print(f"[screen-proxy] could not relay close reason {reason!r}: {e}",
               flush=True)
+
+
+async def _ws_notify(ws, payload: str) -> None:
+    """Tell the browser something, if it is still listening.
+
+    The one swallow on the console path. Every caller is about to close the
+    socket and has already logged the reason, so a browser that has gone away
+    cannot be told anything. Separate try/excepts saying the same thing is how
+    a real error ends up hidden among them.
+    """
+    try:
+        await ws.send(payload)
+    except Exception:
+        pass
+
+
+@app.websocket("/console-proxy/<agent>")
+@require_permission("manage_soar")
+async def console_proxy(request, ws, agent):
+    """Browser <-> agent interactive shell.
+
+    `manage_soar`, not `read_telemetry`. The screen stream is an observation
+    and is gated as one; this is a root shell on the endpoint. The permission
+    that already governs `run_cmd` is the one that governs this, because they
+    are the same power.
+
+    Audited on open rather than on close: a session that ends because the
+    server died would otherwise leave no record that it happened at all.
+    """
+    await audit_log(request, "CONSOLE_OPEN", agent,
+                    f"interactive shell requested by {_client_ip(request)}")
+
+    try:
+        bases = await _agent_http_bases(agent)
+        keys = await _get_agent_keys(agent)
+    except Exception as e:
+        print(f"[console-proxy] resolve {agent} failed: {e}", flush=True)
+        await _ws_notify(ws, pyjson.dumps({"t": "e", "d": f"agent lookup failed: {e}"}))
+        await ws.close()
+        return
+
+    agent_key = (keys[0] if keys else "")
+    last_error = "no address known for this agent"
+    tried: list[str] = []
+    for base in bases:
+        target = (base or "").replace("http://", "ws://").replace("https://", "wss://").rstrip("/")
+        if not target:
+            continue
+        tried.append(base)
+        reached, last_error = await _console_relay(
+            ws, f"{target}/console/ws?key={agent_key}", agent_key)
+        if reached:
+            await audit_log(request, "CONSOLE_CLOSE", agent, f"via {base}")
+            return
+        print(f"[console-proxy] {agent}: {base} unreachable ({last_error})", flush=True)
+
+    await _ws_notify(ws, pyjson.dumps({
+        "t": "e",
+        "d": f"Could not reach {agent}: {last_error} - tried {', '.join(tried) or 'no address'}",
+    }))
+    await ws.close()
+
+
+async def _console_relay(ws, target_url: str, agent_key: str) -> tuple[bool, str]:
+    """Pump one console session between the browser and one agent address.
+
+    Text frames both ways - see `Sentora/modules/console` for the format.
+    `reached` is True once the upstream opened, so a shell that connects and
+    then exits does not send us on to try a different host.
+    """
+    import websockets
+
+    headers = {"X-Agent-Key": agent_key} if agent_key else None
+    connect_kwargs = dict(max_size=4 * 1024 * 1024, open_timeout=10,
+                          ping_interval=20, ping_timeout=20)
+
+    async def pump(upstream):
+        # Either direction ending means a peer hung up, which is the ordinary
+        # end of a relay rather than something to report. Returning says that;
+        # the gather below then finishes and the session is torn down.
+        async def to_agent():
+            try:
+                while True:
+                    data = await ws.recv()
+                    if data is None:
+                        return
+                    await upstream.send(data)
+            except Exception:
+                return
+
+        async def to_browser():
+            try:
+                async for data in upstream:
+                    await ws.send(data)
+            except Exception:
+                return
+
+        await asyncio.gather(to_agent(), to_browser())
+        await _relay_upstream_close(ws, upstream)
+
+    try:
+        async with websockets.connect(target_url, additional_headers=headers,
+                                      **connect_kwargs) as upstream:
+            await pump(upstream)
+            return True, ""
+    except TypeError:
+        # websockets < 14 spells the argument `extra_headers`.
+        try:
+            async with websockets.connect(target_url, extra_headers=headers,
+                                          **connect_kwargs) as upstream:
+                await pump(upstream)
+                return True, ""
+        except Exception as e:
+            return False, str(e) or type(e).__name__
+    except Exception as e:
+        return False, str(e) or type(e).__name__
 
 
 @app.websocket("/vnc-proxy/<agent>")
