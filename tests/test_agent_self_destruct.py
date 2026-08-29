@@ -262,6 +262,112 @@ def test_the_command_is_durable_before_it_is_hurried():
     assert code.index("INSERT INTO") < code.index("_agent_proxy")
 
 
+def test_the_server_removes_the_autostart_itself():
+    """Uninstall must not depend on the agent uninstalling itself correctly.
+
+    The agent gained a `disable_autostart` step that runs before it deletes
+    anything, and that is the right place for it - but it only exists in
+    builds that carry it. An older binary answers "Destruction initiated",
+    deletes its files, exits, and is restarted a minute later by the scheduled
+    task's watchdog, while the server reads HTTP 200 and reports a completed
+    uninstall.
+    """
+    assert "_remove_agent_autostart" in _app_fn("trigger_self_destruct")
+
+
+def test_the_autostart_goes_before_the_agent_is_told_to_destroy_itself():
+    """The other order leaves a window in which the watchdog restarts an agent
+    that has already deleted half of itself."""
+    code = _app_fn("trigger_self_destruct")
+    assert code.index("_remove_agent_autostart") < code.index("_agent_lifecycle_command")
+
+
+def test_it_uses_a_command_every_agent_version_accepts():
+    """`run_cmd` is in every `ActionType`; `self_destruct` never was."""
+    assert "run_cmd" in _app_fn("_remove_agent_autostart")
+
+
+def test_the_command_matches_how_the_installer_set_it_up():
+    code = _app_fn("_remove_agent_autostart")
+    assert "SentoraAgent" in code
+    assert "schtasks" in code
+    assert "sentora-agent" in code
+    assert "systemctl" in code
+
+
+def test_an_unknown_os_sends_nothing():
+    """Guessing a command for an OS we cannot identify is how an uninstall
+    turns into an unrelated failure on the endpoint."""
+    assert "OS is unknown" in _app_fn("_remove_agent_autostart")
+
+
+def test_a_failure_removing_autostart_does_not_stop_the_uninstall():
+    """This runs before the uninstall proper. Raising would leave the agent
+    installed and the operator with no idea why."""
+    code = _app_fn("_remove_agent_autostart")
+    assert "except Exception" in code
+    assert "failed to send" in code
+
+
+def test_the_autostart_outcome_reaches_the_operator():
+    """"Uninstalled" and "uninstalled, but the watchdog may bring it back" are
+    different things to have been told."""
+    assert "autostart_removal" in _app_fn("trigger_self_destruct")
+    assert "if the agent comes back" in _app_fn("_remove_agent_autostart")
+
+
+def test_an_absent_autostart_is_a_success_not_an_error():
+    """Deleting something that is not there prints an error, and reporting
+    that as the detail of a success read as "Autostart removed (ERROR: cannot
+    find the file)"."""
+    assert "was already absent" in _code_of("disable_autostart")
+
+
+def test_the_removal_always_runs():
+    """The check chooses the wording. It must not choose whether to act.
+
+    An earlier version returned early when the autostart looked absent, to
+    avoid that error message. `_autostart_still_present` answers False for any
+    non-zero exit - schtasks missing from PATH, a permissions refusal, output
+    it cannot read - so on any of those the agent deleted its files, exited,
+    and was restarted by the watchdog it had never touched. A confusing
+    message is worth less than an uninstall that happens.
+    """
+    code = _code_of("disable_autostart")
+    head = code[:code.index("schtasks")]
+    assert "return True" not in head, \
+        "disable_autostart can still return before deleting anything"
+    assert "was_present" in code, "the check should feed the wording, not the flow"
+
+
+def test_success_is_decided_by_verification_not_by_the_command():
+    """Both `schtasks /Delete` and `systemctl disable` report success in cases
+    where the unit survives, and the next step is irreversible."""
+    code = _code_of("disable_autostart")
+    tail = code[code.rindex("_autostart_still_present"):]
+    assert "still registered after removal" in tail
+
+
+def test_console_output_is_decoded_with_the_oem_codepage():
+    """`text=True` uses the locale codepage; console tools write in the OEM
+    one. On a Turkish install schtasks produced mojibake that travelled all
+    the way to the operator's screen."""
+    source = MAIN.read_text(encoding="utf-8")
+    assert "GetOEMCP" in source
+    run = _code_of("_run")
+    assert "text=True" not in run, "raw bytes, then decode deliberately"
+    assert "_decode_console" in run
+
+
+def test_the_operator_is_told_once():
+    """The server removes the autostart and the agent removes it again, so
+    both had something to say. Concatenated, two true halves read as a
+    failure."""
+    code = _app_fn("trigger_self_destruct")
+    assert 'body["message"] = ' in code or "body['message'] = " in code
+    assert "Autostart:" in code
+
+
 def test_the_action_log_records_three_outcomes():
     """SUCCESS was written whenever the call was delivered, so a push the
     agent answered 501 to was logged as a completed uninstall - and anyone
