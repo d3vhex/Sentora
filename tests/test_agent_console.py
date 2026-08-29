@@ -565,11 +565,38 @@ def test_closing_kills_the_whole_process_group(console):
     session = console.PtySession(["/bin/sh"])
     session.write("sleep 300 &\n")
     time.sleep(0.5)
-    pid = session.proc.pid
+    # Read the group id while the shell is alive: once it is gone `getpgid`
+    # has nothing to answer from.
+    pgid = os.getpgid(session.proc.pid)
     session.close()
+
+    # Polled rather than slept on. `killpg` is delivered asynchronously, and a
+    # fixed sleep is either a flake on a loaded machine or a second wasted on
+    # every run. The first version also asked `getpgid` about a pid the parent
+    # had killed but never reaped - a zombie answers that quite happily, so
+    # the check passed on Windows by being skipped and failed on CI by being
+    # true.
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except (ProcessLookupError, PermissionError):
+            return
+        time.sleep(0.05)
+    pytest.fail("the shell's process group outlived the session")
+
+
+@pytest.mark.skipif(not IS_POSIX, reason="a PTY needs a POSIX host")
+@pytest.mark.skipif(not IS_POSIX, reason="a PTY needs a POSIX host")
+def test_the_shell_is_reaped_not_left_a_zombie(console):
+    """A killed child that is never waited on stays a zombie for the life of
+    the agent, and the agent is long-lived: a console opened a few times a day
+    would accumulate them quietly."""
+    session = console.PtySession(["/bin/sh"])
     time.sleep(0.3)
-    with pytest.raises(ProcessLookupError):
-        os.killpg(os.getpgid(pid), 0)
+    session.close()
+    assert session.proc.poll() is not None, \
+        "the shell was killed but never waited on"
 
 
 @pytest.mark.skipif(not IS_POSIX, reason="a PTY needs a POSIX host")

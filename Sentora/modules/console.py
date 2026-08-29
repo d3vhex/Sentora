@@ -37,11 +37,34 @@ pointing at who ran it.
 
 Platforms
 ---------
-Linux gets a real PTY, which is what makes editors, job control and
-line-editing work. Windows needs ConPTY, reached through `pywinpty`, which the
-agent does not ship - so on Windows this reports exactly that rather than
-offering a pipe-backed shell that looks like a terminal and behaves like a
-broken one.
+**Linux** gets a real PTY - `pty.openpty()` and a shell in its own session.
+That is the whole story there: a pty is a kernel object and needs no desktop,
+so the headless server with no screen has a full terminal, editors included.
+
+**Windows** took three attempts, and the reasons are recorded here once
+because three classes below would otherwise each repeat them.
+
+A pseudoconsole hosted by the agent is killed at once with
+`STATUS_CONTROL_C_EXIT` (0xC000013A) - the status a process gets when the
+console it is attached to is destroyed. The agent is a service in session 0
+with no console of its own. Allocating one first does not help, and `cmd.exe`
+fails the same way as PowerShell, so it is a property of the session rather
+than of the shell.
+
+Hosting it in the logged-in user's session, the way the screen capture does,
+does not help either. `WinPtySession` and `HelperSession` are both still here
+because they are the good paths where they work - an agent run from a terminal
+rather than as a service gets a real terminal - and `new_session` tries them
+in that order.
+
+`PipeSession` is the last resort: a shell behind pipes, with no terminal, so
+no echo, no line editing, and `vim` or `top` will hang rather than draw. The
+argument against shipping that was right, and it is here anyway because "run a
+command, read the output" is most of what a console is opened for. What makes
+it defensible is that the limits are *announced* - the session sends
+`mode: pipe`, the browser says what is missing and takes over the line
+discipline the pipe does not have. A degraded tool that says it is degraded is
+a different thing from a broken one.
 """
 
 from __future__ import annotations
@@ -104,22 +127,12 @@ def _close_fd(fd: int) -> None:
 def default_shell() -> list[str]:
     """The shell to start, honouring $SHELL when it names something real."""
     if IS_WINDOWS:
-        # An absolute path, not a bare name.
-        #
-        # The agent runs as SYSTEM, and PATH in that context is not the one an
-        # interactive login gets. A name that does not resolve makes ConPTY
-        # create the pseudoconsole - so `spawn` succeeds - and the process
-        # inside it die at once, which arrives as "the shell exited" with
-        # nothing behind it.
-        root = os.environ.get("SystemRoot", r"C:\Windows")
-        for candidate in (
-            os.path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
-            os.path.join(root, "System32", "cmd.exe"),
-        ):
-            if os.path.exists(candidate):
-                return [candidate, "-NoLogo", "-NoProfile"] \
-                    if candidate.endswith("powershell.exe") else [candidate]
-        return ["powershell.exe", "-NoLogo", "-NoProfile"]
+        # One list, in `windows_shell_candidates`. This had its own copy of
+        # the same paths and flags, which is two places to keep a hard-won
+        # detail correct - the absolute path that stops a bare name failing
+        # under SYSTEM's PATH.
+        return windows_shell_candidates()[0]
+
     shell = os.environ.get("SHELL", "")
     if shell and os.path.exists(shell):
         return [shell, "-i"]
@@ -294,6 +307,18 @@ class PtySession:
             # shell still running with nobody attached to it.
             if self.proc.poll() is None:
                 print(f"[console] could not kill session group: {e}", flush=True)
+
+        # Reap it. A killed child that is never waited on stays a zombie for
+        # the life of the agent, and the agent is long-lived - a console
+        # opened a few times a day would accumulate them quietly. It also
+        # means the process group genuinely goes away, rather than lingering
+        # around an unreaped leader.
+        try:
+            self.proc.wait(timeout=2)
+        except Exception as e:
+            print(f"[console] shell did not exit after being killed: {e}",
+                  flush=True)
+
         _close_fd(self.fd)
 
     # -- io ----------------------------------------------------------------
@@ -592,24 +617,11 @@ def pipe_shell() -> list[str]:
 
 
 class PipeSession:
-    r"""A shell behind pipes, when no pseudoconsole can be had.
+    """A shell behind pipes, when no pseudoconsole can be had.
 
-    ConPTY does not work in this deployment: both PowerShell and `cmd.exe` are
-    killed at once with `STATUS_CONTROL_C_EXIT`, in session 0 and in the
-    logged-in user's session, with a console allocated and without one.
-
-    This is the thing I did not want to build, and the argument against it was
-    right: a shell behind pipes has no terminal, so there is no echo, no line
-    editing, no job control, and `vim` or `top` will hang rather than draw.
-    Presented as a terminal it looks broken.
-
-    It is here because "run a command, read the output" is most of what an
-    operator opens a console for, and a limited console that works beats an
-    elegant one that does not exist. What makes it defensible is that the
-    limits are *stated*: the session announces `mode: pipe`, the browser
-    echoes locally so typing is visible, and the banner says what is missing.
-    A degraded tool that says it is degraded is a different thing from a
-    broken one.
+    The last resort, and why it exists at all is in the module docstring.
+    What matters here: no terminal, so this session announces `mode: pipe`
+    and the browser owns the echo and the line editing.
     """
 
     mode = "pipe"
@@ -845,27 +857,18 @@ def _spawn_user_session_helper():
 
 
 class HelperSession:
-    r"""A console hosted by a helper in the logged-in user's session.
+    """A console hosted by a helper in the logged-in user's session.
 
-    ConPTY cannot be hosted from session 0. Both PowerShell and `cmd.exe` are
-    killed at once with `STATUS_CONTROL_C_EXIT` there, with a console
-    allocated and without one - the pseudoconsole is created, and the process
-    inside it never survives.
+    `main.exe --console-helper`, launched with `CreateProcessAsUser` into the
+    active console session, relaying frames over two inherited pipes. Why
+    session 0 cannot host one itself is in the module docstring.
 
-    That is the same wall the screen stream hit, and it has the same answer:
-    run the part that needs a desktop session inside one. `main.exe
-    --console-helper` is launched with `CreateProcessAsUser` into the active
-    console session, hosts the PTY there, and relays frames over two
-    inherited pipes.
+    **The shell runs as the logged-in user, not SYSTEM** - a smaller privilege
+    than the rest of the agent has, which for an interactive console is the
+    better default. A host with nobody logged in has no console, exactly as it
+    has no screen.
 
-    **The shell runs as the logged-in user, not SYSTEM.** That is a real
-    change and worth stating rather than discovering: it is a smaller
-    privilege than the rest of the agent has, which for an interactive console
-    is the better default, and it is the only way to have one at all on
-    Windows. A host with nobody logged in has no console, exactly as it has no
-    screen.
-
-    Frames are newline-delimited JSON, the same shapes the websocket uses.
+    Frames are newline-delimited JSON, the same shapes the websocket uses:
     JSON escapes its own newlines, so a line is always a whole frame.
     """
 
@@ -1192,9 +1195,6 @@ def new_session(argv: list[str] | None = None) -> "PtySession | WinPtySession":
         print(f"[console] no console in this process ({direct_error}); "
               f"trying the user's session", flush=True)
 
-    # Session 0 cannot host a pseudoconsole: both shells are killed at once
-    # with STATUS_CONTROL_C_EXIT, with a console allocated and without one.
-    # The screen stream hit the same wall and this is the same answer.
     try:
         return HelperSession()
     except ConsoleUnavailable as e:
@@ -1203,10 +1203,7 @@ def new_session(argv: list[str] | None = None) -> "PtySession | WinPtySession":
               f"({helper_error}); falling back to a shell behind pipes",
               flush=True)
 
-    # Last resort, and honest about it. See PipeSession: no terminal, so no
-    # echo, no line editing, and full-screen programs will hang. The session
-    # announces `mode: pipe` so the browser can say so rather than present it
-    # as a terminal that is behaving strangely.
+    # Last resort, and honest about it - see PipeSession.
     try:
         return PipeSession()
     except ConsoleUnavailable as pipe_error:
@@ -1251,10 +1248,6 @@ def close_active(why: str = "") -> None:
         if _active is not None:
             _active.close(why)
             _active = None
-
-
-def active_session() -> PtySession | None:
-    return _active
 
 
 # ---------------------------------------------------------------------------
