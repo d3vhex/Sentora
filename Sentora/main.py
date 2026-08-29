@@ -25,6 +25,7 @@ from modules.db import insert_record, fetch_unsent, mark_sent, fetch_one
 import modules.enc_db as enc_db
 import modules.screen_capture as screen_capture
 import modules.agent_paths as agent_paths
+import modules.console as console
 
 import logging
 import builtins
@@ -1076,11 +1077,54 @@ def _uninstall_log(message: str) -> None:
         print(f"[uninstall] could not write {UNINSTALL_LOG}: {e}", flush=True)
 
 
+def _oem_encoding() -> str:
+    """The codepage Windows console tools write in. Asked once, not per call.
+
+    Computed at import rather than inside the decoder: the decoder runs on
+    every command the uninstall path issues, and a ctypes call per line is
+    both wasteful and a failure that would be reported over and over.
+    """
+    if platform.system().lower() != "windows":
+        return ""
+    try:
+        import ctypes
+        return f"cp{ctypes.windll.kernel32.GetOEMCP()}"
+    except Exception as e:
+        print(f"[!] could not read the OEM codepage ({e}); console output "
+              f"from Windows tools may be shown with the wrong characters",
+              flush=True)
+        return ""
+
+
+_OEM_ENCODING = _oem_encoding()
+
+
+def _decode_console(raw: bytes) -> str:
+    """Decode output from a Windows console tool.
+
+    `text=True` decodes with the locale codepage, and console tools write in
+    the *OEM* one - so on a Turkish install `schtasks` produced "Sistem
+    belirtilen dosyayÄ± bulamÄ±yor", which then travelled all the way to the
+    operator's screen. The reason for a failed uninstall is not a place to
+    show mojibake.
+    """
+    if not raw:
+        return ""
+    encodings = ([_OEM_ENCODING] if _OEM_ENCODING else []) + ["utf-8", "cp1252"]
+    for encoding in encodings:
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", "replace")
+
+
 def _run(argv: list[str], timeout: int = 30) -> tuple[int, str]:
     """Run a command and return `(returncode, combined output)`."""
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-        return done.returncode, ((done.stdout or "") + (done.stderr or "")).strip()
+        done = subprocess.run(argv, capture_output=True, timeout=timeout)
+        return done.returncode, _decode_console(
+            (done.stdout or b"") + (done.stderr or b"")).strip()
     except Exception as e:
         return -1, str(e)
 
@@ -1105,6 +1149,22 @@ def disable_autostart() -> tuple[bool, str]:
     whole point of this step is that the next one is irreversible.
     """
     system = platform.system().lower()
+
+    # Looked at for the wording, never to decide whether to act.
+    #
+    # A previous version returned early here when the autostart appeared to be
+    # absent, to avoid reporting the error that deleting a missing task
+    # prints. That traded a confusing message for a silent failure to remove:
+    # `_autostart_still_present` answers False for any non-zero exit, not only
+    # for genuine absence - `schtasks` missing from PATH, a permissions
+    # refusal, output this cannot read - and on any of those the agent deleted
+    # its files, exited, and was restarted by the watchdog it had never
+    # touched.
+    #
+    # The removal now always runs. The check only chooses between "removed"
+    # and "was already absent", and the verification at the end is what
+    # decides success.
+    was_present = _autostart_still_present()
 
     if system == "windows":
         code, out = _run(["schtasks", "/Delete", "/TN", WINDOWS_TASK_NAME, "/F"])
@@ -1135,8 +1195,8 @@ def disable_autostart() -> tuple[bool, str]:
         detail = out or "systemd reloaded"
 
     if _autostart_still_present():
-        return False, f"autostart is still registered after removal ({detail})"
-    return True, detail or "autostart removed"
+        return False, f"still registered after removal ({detail})"
+    return True, "removed" if was_present else "was already absent"
 
 
 def perform_destruction():
@@ -1729,6 +1789,122 @@ def _ws_authorized(request) -> bool:
     return _timing_safe_in(qkey, _accepted_auth_tokens())
 
 
+async def _ws_notify(ws, payload: str) -> None:
+    """Tell the browser something, if it is still listening.
+
+    The one swallow on the console path. Every caller is on its way to closing
+    the socket and has already logged the reason locally, so a browser that
+    has gone away cannot be told anything and nothing is lost by the failure.
+    The alternative - four separate try/excepts saying the same thing - is how
+    a genuine error ends up hidden among them.
+    """
+    try:
+        await ws.send(payload)
+    except Exception:
+        pass
+
+
+@app.websocket("/console/ws")
+async def console_stream(request, ws):
+    """An interactive shell on this host.
+
+    The screen stream is the wrong tool for the machines that matter: a
+    headless server has no desktop and never will. What an operator wanted
+    from it was a console, and this is that.
+
+    Authentication is the same as every other route here. It is worth being
+    plain about what this grants: a shell as whoever the agent runs as, which
+    is root or SYSTEM. `ActionType.RUN_CMD` already grants exactly that
+    through /soar/execute, so this adds no capability - but it is the most
+    dangerous interface in the product and the limits in modules/console are
+    part of it, not decoration.
+    """
+    if not _ws_authorized(request):
+        await ws.close(code=1008, reason="unauthorized")
+        return
+
+    try:
+        session = await asyncio.to_thread(console.open_session)
+    except console.ConsoleUnavailable as e:
+        print(f"[console] refused: {e}", flush=True)
+        await _ws_notify(ws, console.encode_error(str(e)))
+        await ws.close(code=1011, reason="no console")
+        return
+    except Exception as e:
+        print(f"[console] could not start: {e}", flush=True)
+        await _ws_notify(ws, console.encode_error(f"could not start a shell: {e}"))
+        await ws.close(code=1011, reason="console failed")
+        return
+
+    print(f"[console] session opened for {request.ip} ({' '.join(session.argv)}, "
+          f"mode={getattr(session, 'mode', 'pty')})", flush=True)
+    # Before any output: the browser has to know whether it is driving a
+    # terminal or a pipe before the first keystroke, not after.
+    await _ws_notify(ws, console.encode_mode(session))
+    reason = "closed"
+
+    async def pump_output():
+        """Shell -> browser. Also enforces the timeouts.
+
+        Enforced here rather than in the browser because a tab that was closed
+        cannot time anything out, and an abandoned root shell is exactly the
+        case that matters.
+        """
+        nonlocal reason
+        while True:
+            expired = session.expired()
+            if expired:
+                reason = expired
+                await _ws_notify(ws, console.encode_exit(None, expired))
+                return
+            data = await asyncio.to_thread(session.read, 0.2)
+            if data is None:
+                # Whatever the session worked out, not a generic sentence. A
+                # shell that died on startup and one the operator typed `exit`
+                # into look identical without this.
+                reason = getattr(session, "exit_reason", "") or "the shell exited"
+                await _ws_notify(ws, console.encode_exit(session.proc.poll(), reason))
+                return
+            if data:
+                try:
+                    await ws.send(console.encode_output(data))
+                except Exception:
+                    reason = "the browser went away"
+                    return
+
+    async def pump_input():
+        """Browser -> shell."""
+        nonlocal reason
+        while True:
+            try:
+                raw = await ws.recv()
+            except Exception:
+                reason = "the browser went away"
+                return
+            if raw is None:
+                reason = "the browser went away"
+                return
+            kind, payload = console.decode_input(raw)
+            if kind == "input":
+                session.write(payload["data"])
+            elif kind == "resize":
+                session.resize(payload["cols"], payload["rows"])
+
+    try:
+        done, pending = await asyncio.wait(
+            [asyncio.create_task(pump_output()), asyncio.create_task(pump_input())],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+    finally:
+        # Always, on every exit path. The shell and everything it started go
+        # with the session - a backgrounded job that outlives the console has
+        # nothing left pointing at who ran it.
+        console.close_active(reason)
+        print(f"[console] session closed for {request.ip}: {reason}", flush=True)
+
+
 @app.websocket("/screen/ws")
 async def screen_stream(request, ws):
     """Continuous JPEG screen-frame stream.
@@ -2013,6 +2189,14 @@ if __name__ == "__main__":
         import multiprocessing
         multiprocessing.freeze_support()
         sys.exit(screen_capture.helper_main(sys.argv))
+
+    # Same reasoning: the console helper hosts a pseudoconsole in the user's
+    # session, because session 0 cannot. It must not take the single-instance
+    # lock or start any collector.
+    if "--console-helper" in sys.argv:
+        import multiprocessing
+        multiprocessing.freeze_support()
+        sys.exit(console.console_helper_main())
 
     app.config.AUTO_RELOAD = False
     app.config.TOUCHUP = False

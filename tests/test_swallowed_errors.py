@@ -47,7 +47,21 @@ TREE = ast.parse(SRC)
 # disposal and are not: a frame pipe that cannot be put in binary mode would
 # corrupt every frame silently, and a helper that will not terminate is a
 # process screenshotting a desktop with nobody watching.
-KNOWN_SWALLOWED_MAX = 86
+# 87-89: the console path adds three, one per boundary, each replacing
+# several. `console._close_fd` releases a descriptor whose only failure mode
+# is already being closed - the state being asked for. `_ws_notify`, once in
+# the agent and once in the server, tells a browser why a console is closing;
+# every caller is on its way to closing the socket and has logged the reason
+# locally, so a browser that has gone away cannot be told anything. Four
+# separate try/excepts saying that is how a real error ends up hidden among
+# them. Everything else on that path reports: a pty that will not resize, a
+# write that fails, a session group that will not die.
+# 90: `console._helper_log`. The console helper runs with `hStdError = None`
+# and moves its own stdout off the frame pipe, so a file beside the executable
+# is the only channel it has - which makes this the logger of last resort, and
+# there is by construction nowhere left to report its own failure to. The
+# frame stream is not an option: it belongs to the session.
+KNOWN_SWALLOWED_MAX = 90
 
 
 def _bare_pass_handlers():

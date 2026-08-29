@@ -9,6 +9,10 @@ sanic
 sanic-cors
 cryptography
 pywin32; platform_system == 'Windows'
+# ConPTY, for the interactive console. Without it the Windows agent can only
+# offer a pipe-backed shell - no echo, no line editing, no full-screen
+# programs - which looks like a terminal and behaves like a broken one.
+pywinpty; platform_system == 'Windows'
 docker
 watchdog
 mss
