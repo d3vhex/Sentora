@@ -31,6 +31,39 @@ import requests
 
 DEFAULT_TIMEOUT = 30
 
+# A 5xx from abuse.ch is usually the far end being busy for a moment, and one
+# attempt turned that into "this feed is broken" on the operator's screen.
+# Three attempts over a few seconds, and only for the failures that are worth
+# repeating - a 403 will be a 403 again, and retrying it just makes the
+# refresh slower.
+RETRY_ATTEMPTS = 3
+RETRY_BACKOFF_S = (1, 3)
+
+
+def _get_with_retry(url: str, headers: dict):
+    """Fetch a feed, retrying a server-side failure but not a client-side one."""
+    import time
+
+    last_exception = None
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            resp = requests.get(url, headers=headers, timeout=DEFAULT_TIMEOUT)
+            if resp.status_code < 500:
+                return resp
+            last_exception = None
+        except requests.RequestException as e:
+            # A timeout or a dropped connection is the same kind of transient
+            # as a 503, and is worth the same retry.
+            last_exception = e
+            resp = None
+
+        if attempt < len(RETRY_BACKOFF_S):
+            time.sleep(RETRY_BACKOFF_S[attempt])
+
+    if last_exception is not None:
+        raise last_exception
+    return resp
+
 # Indicators not re-seen in a refresh for this long are pruned. Threat intel
 # goes stale: an IP that hosted a C2 last quarter is usually someone else's
 # now, and keeping it produces false positives forever.
@@ -194,11 +227,23 @@ def fetch_all() -> tuple[list[Indicator], list[str]]:
     for name in enabled_feeds():
         url, parser = FEEDS[name]
         try:
-            resp = requests.get(url, headers=headers, timeout=DEFAULT_TIMEOUT)
+            resp = _get_with_retry(url, headers)
             if resp.status_code in (401, 403):
                 errors.append(
                     f"{name}: {resp.status_code} — this feed now requires a key. "
                     f"Set THREAT_INTEL_AUTH_KEY (free account at abuse.ch)."
+                )
+                continue
+            if resp.status_code >= 500:
+                # Distinguished from the 401 above, because the two ask
+                # different things of whoever reads it. A 5xx is the far end
+                # being busy - abuse.ch returns 503 under load routinely - and
+                # there is nothing to configure. Saying so stops it reading as
+                # a fault on this side.
+                errors.append(
+                    f"{name}: HTTP {resp.status_code} after {RETRY_ATTEMPTS} "
+                    f"attempts — the feed is unavailable right now, nothing to "
+                    f"fix here. Its existing indicators are kept."
                 )
                 continue
             if resp.status_code != 200:

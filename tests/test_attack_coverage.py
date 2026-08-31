@@ -174,9 +174,15 @@ def test_the_column_exists_in_every_schema(schema, column):
 
 def test_existing_deployments_get_the_column():
     """CREATE TABLE IF NOT EXISTS leaves an existing table alone, so without a
-    migration the column only appears on installations made after today."""
-    server = (ROOT / "db" / "init.sql").read_text(encoding="utf-8")
-    assert "ALTER TABLE siem_events ADD COLUMN techniques" in server
+    migration the column only appears on installations made after today.
+
+    On the server the migration lives in `_migrate_siem_events` rather than in
+    init.sql, because that file is re-executed on every ingest: as a bare
+    ALTER it failed with a duplicate-column error every time and took a
+    metadata lock on siem_events to do it.
+    """
+    server = (ROOT / "server.py").read_text(encoding="utf-8")
+    assert "ADD COLUMN techniques VARCHAR(255) NULL" in server
 
     agent = (ROOT / "Sentora" / "db" / "init.sql").read_text(encoding="utf-8")
     assert "ADD COLUMN IF NOT EXISTS techniques" in agent

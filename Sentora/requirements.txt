@@ -17,3 +17,6 @@ docker
 watchdog
 mss
 Pillow
+# The channel the agent opens to the server (modules/link.py). Synchronous,
+# because the agent's other loops are threads rather than an event loop.
+websocket-client

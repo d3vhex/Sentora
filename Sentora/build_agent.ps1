@@ -178,6 +178,8 @@ $hiddenImports = @(
     "modules.agent_paths",
     "modules.screen_capture",
     "modules.console",
+    "modules.link",
+    "websocket",
     "winpty",
     "winpty.ptyprocess",
     "modules.db"

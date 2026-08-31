@@ -157,13 +157,41 @@ def _source(rel: str) -> str:
     return (ROOT / rel).read_text(encoding="utf-8")
 
 
-def test_the_agent_handlers_no_longer_walk_up_from_dunder_file():
-    main = _source("Sentora/main.py")
-    handlers = main[main.index('@app.route("/config/<cfg_type>"'):]
-    handlers = handlers[:handlers.index("def _ws_authorized")]
-    assert "agent_paths.config_path" in handlers
-    assert "agent_paths.writable_config_path" in handlers
-    assert "os.path.dirname(os.path.abspath(__file__))" not in handlers
+def _command(name: str) -> str:
+    """One command function's statements, by AST.
+
+    Not a slice between two markers: the bodies moved out of the route
+    handlers into `cmd_*` functions so the channel could call the same code,
+    and a slice would then have been reading whatever happened to sit between
+    the markers instead.
+    """
+    import ast
+
+    tree = ast.parse(_source("Sentora/main.py"))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return ast.unparse(node)
+    raise AssertionError(f"{name} not found in main.py")
+
+
+def test_the_config_commands_no_longer_walk_up_from_dunder_file():
+    assert "agent_paths.config_path" in _command("cmd_get_config")
+    assert "agent_paths.writable_config_path" in _command("cmd_set_config")
+    for name in ("cmd_get_config", "cmd_set_config"):
+        assert "os.path.dirname(os.path.abspath(__file__))" not in _command(name)
+
+
+def test_the_route_and_the_channel_run_the_same_code():
+    """Two implementations of "write the rules file" would drift, and the one
+    that drifted would be reachable only in the deployments that had already
+    moved to the channel - so the bug would appear on exactly the hosts nobody
+    was still watching the old path on."""
+    for handler, command in (("get_config", "cmd_get_config"),
+                             ("set_config", "cmd_set_config")):
+        assert command in _command(handler)
+    dispatch = _command("dispatch_channel_request")
+    assert "cmd_get_config" in dispatch
+    assert "cmd_set_config" in dispatch
 
 
 def test_the_reader_resolves_at_use_not_at_import():
