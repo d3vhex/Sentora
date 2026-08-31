@@ -1,0 +1,48 @@
+title: SSH Server Configuration Weakened
+id: 6a1e8b37-5c92-4d40-8f76-2b4d9e0c1a83
+status: stable
+description: >
+    Root login re-enabled, empty passwords accepted, or an
+    AuthorizedKeysCommand pointed at a script the attacker controls. Each one
+    turns the SSH daemon itself into the backdoor - no new binary, no new
+    service, and the change is a single line in a file that legitimately gets
+    edited.
+
+    AuthorizedKeysCommand is the subtle one. The key is not stored anywhere on
+    disk, so a review of authorized_keys files finds nothing, and the command
+    can hand out whatever key it likes.
+references:
+    - https://attack.mitre.org/techniques/T1098/004/
+    - https://attack.mitre.org/techniques/T1556/
+author: Sentora
+date: 2026/09/01
+logsource:
+    product: linux
+detection:
+    cmd_sshd_config:
+        CommandLine|contains:
+            - 'sshd_config'
+            - '/etc/ssh/'
+    cmd_weakening:
+        CommandLine|contains:
+            - 'permitrootlogin yes'
+            - 'permitemptypasswords yes'
+            - 'authorizedkeyscommand'
+            - 'passwordauthentication yes'
+    msg_sshd_config:
+        Message|contains: 'sshd_config'
+    msg_weakening:
+        Message|contains:
+            - 'permitrootlogin yes'
+            - 'permitemptypasswords yes'
+            - 'authorizedkeyscommand'
+    condition: (cmd_sshd_config and cmd_weakening) or (msg_sshd_config and msg_weakening)
+falsepositives:
+    - A configuration management run that owns this file, in which case the
+      change is expected and the tool is identifiable
+level: high
+tags:
+    - attack.persistence
+    - attack.defense_evasion
+    - attack.t1098.004
+    - attack.t1556

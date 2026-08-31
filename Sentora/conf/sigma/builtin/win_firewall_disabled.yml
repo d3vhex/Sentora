@@ -1,0 +1,44 @@
+title: Windows Firewall Turned Off
+id: 3f6c1e58-9a24-4b73-8d0f-1c7e5a2b9d63
+status: stable
+description: >
+    Turning the host firewall off across all profiles is done before something
+    needs to listen, or before something needs to reach out on a port the
+    policy blocks. It is a step with a purpose, and the purpose comes next.
+
+    Scoped to disabling. Adding a rule is ordinary administration and is not
+    matched here; setting every profile to off is not.
+references:
+    - https://attack.mitre.org/techniques/T1562/004/
+author: Sentora
+date: 2026/09/01
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    netsh_advfirewall_off:
+        CommandLine|contains|all:
+            - 'advfirewall'
+            - 'state off'
+    netsh_legacy_off:
+        CommandLine|contains|all:
+            - 'netsh firewall'
+            - 'opmode'
+            - 'disable'
+    powershell_off:
+        CommandLine|contains|all:
+            - 'set-netfirewallprofile'
+            - '-enabled'
+            - 'false'
+    service_off:
+        CommandLine|contains|all:
+            - 'mpssvc'
+            - 'stop'
+    condition: 1 of them
+falsepositives:
+    - A build or imaging step, which should be on a machine that is not yet
+      in service
+level: high
+tags:
+    - attack.defense_evasion
+    - attack.t1562.004

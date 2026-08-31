@@ -1,0 +1,49 @@
+title: Domain Enumerated From An Endpoint
+id: 8e4a7d92-6c31-4f58-b209-5a3f8c1e7b40
+status: experimental
+description: >
+    Asking a workstation who the domain admins are, where the domain
+    controllers are, and which domains it trusts. Every one of these commands
+    is documented, built in, and unremarkable on an administrator's machine -
+    and on a finance user's laptop, run twenty seconds apart, they are the
+    first thing an operator does after landing.
+
+    Deliberately `medium`. The single event is weak evidence and this rule
+    will fire on real work; its value is in what it sits next to. Read it
+    alongside the account, the host, and how many of these ran in a row.
+references:
+    - https://attack.mitre.org/techniques/T1087/002/
+    - https://attack.mitre.org/techniques/T1482/
+author: Sentora
+date: 2026/09/01
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    net_domain_group:
+        CommandLine|contains|all:
+            - 'net group'
+            - '/domain'
+    net_domain_admins:
+        CommandLine|contains: 'domain admins'
+    nltest_discovery:
+        CommandLine|contains|all:
+            - 'nltest'
+            - '/d'
+    dsquery_used:
+        CommandLine|contains: 'dsquery'
+    powershell_ad_dump:
+        CommandLine|contains:
+            - 'get-adcomputer'
+            - 'get-addomain'
+            - 'get-domainuser'
+            - 'get-netgroupmember'
+    condition: 1 of them
+falsepositives:
+    - Administrators, scripts and inventory tools, on the hosts where that is
+      normal. Which hosts those are is the question worth answering once.
+level: medium
+tags:
+    - attack.discovery
+    - attack.t1087.002
+    - attack.t1482

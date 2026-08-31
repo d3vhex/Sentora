@@ -1,0 +1,54 @@
+title: Office Application Spawned A Command Interpreter
+id: 5f2b8c14-7d93-4a26-b0e1-9c4d7a3f6e28
+status: stable
+description: >
+    A document opened, and the program that opened it started a shell. This is
+    what a macro-enabled attachment looks like from the endpoint, and it is
+    the highest-value process-lineage detection there is: Word has no business
+    launching PowerShell, and the person who opened the invoice does not know
+    that it did.
+
+    Needs the parent process, which means Sysmon event 1 or a 4688 with parent
+    recording enabled. On an estate without either, this rule cannot fire -
+    worth knowing when reading a coverage report, because it will still be
+    counted as covering the technique.
+references:
+    - https://attack.mitre.org/techniques/T1566/001/
+    - https://attack.mitre.org/techniques/T1059/
+author: Sentora
+date: 2026/09/01
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    office_parent:
+        ParentImage|endswith:
+            - '\winword.exe'
+            - '\excel.exe'
+            - '\powerpnt.exe'
+            - '\outlook.exe'
+            - '\msaccess.exe'
+            - '\visio.exe'
+    interpreter_child:
+        Image|endswith:
+            - '\cmd.exe'
+            - '\powershell.exe'
+            - '\pwsh.exe'
+            - '\wscript.exe'
+            - '\cscript.exe'
+            - '\mshta.exe'
+            - '\rundll32.exe'
+            - '\regsvr32.exe'
+            - '\bitsadmin.exe'
+            - '\certutil.exe'
+    condition: office_parent and interpreter_child
+falsepositives:
+    - A macro-driven line-of-business spreadsheet that shells out on purpose.
+      These exist, they are always the same document, and they are worth an
+      exception rather than a muted rule.
+level: critical
+tags:
+    - attack.initial_access
+    - attack.execution
+    - attack.t1566.001
+    - attack.t1059

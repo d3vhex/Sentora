@@ -177,6 +177,11 @@ $hiddenImports = @(
     "modules.screen_capture",
     "modules.console",
     "modules.link",
+    # `modules.link` is itself a hidden import, so PyInstaller never walks its
+    # imports statically - and this is the one it needs. Left out, the binary
+    # builds cleanly and dies on the first channel connect, which is the worst
+    # place to find it.
+    "modules.version",
     "websocket",
     "winpty",
     "winpty.ptyprocess",

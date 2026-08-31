@@ -1,0 +1,57 @@
+title: System Logs Truncated Or Removed
+id: 9a2c5f38-7e41-4b06-8d95-3f6a1c4e2b78
+status: stable
+description: >
+    Shell history is the amateur's cleanup. The system logs are the one that
+    matters: wtmp holds who logged in, auth.log holds how, and the audit
+    directory holds what the kernel was told to record about both.
+
+    Truncation is covered as well as deletion, and that is the point. A
+    missing log file is noticed by the next person who looks; a file that
+    still exists and is zero bytes usually is not, because everything about
+    the host still looks correctly configured.
+references:
+    - https://attack.mitre.org/techniques/T1070/002/
+author: Sentora
+date: 2026/09/01
+logsource:
+    product: linux
+detection:
+    cmd_logfile:
+        CommandLine|contains:
+            - '/var/log/wtmp'
+            - '/var/log/btmp'
+            - '/var/log/lastlog'
+            - '/var/log/auth.log'
+            - '/var/log/secure'
+            - '/var/log/audit/'
+            - '/var/log/syslog'
+    cmd_destructive:
+        CommandLine|contains:
+            - 'rm '
+            - 'shred'
+            - 'truncate'
+            - '> /var/log'
+    cmd_vacuum:
+        CommandLine|contains|all:
+            - 'journalctl'
+            - '--vacuum'
+    msg_logfile:
+        Message|contains:
+            - '/var/log/wtmp'
+            - '/var/log/auth.log'
+            - '/var/log/audit/'
+    msg_destructive:
+        Message|contains:
+            - 'rm '
+            - 'shred'
+            - 'truncate'
+    condition: (cmd_logfile and cmd_destructive) or cmd_vacuum
+        or (msg_logfile and msg_destructive)
+falsepositives:
+    - Log rotation configured to remove rather than compress, which is worth
+      knowing about either way
+level: high
+tags:
+    - attack.defense_evasion
+    - attack.t1070.002

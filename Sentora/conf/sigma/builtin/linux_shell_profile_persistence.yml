@@ -1,0 +1,53 @@
+title: Startup Code Added To A Shell Profile
+id: 2b9f6c04-4d18-4a72-9e35-8c1b7a0e3d59
+status: stable
+description: >
+    A line appended to .bashrc, .profile or /etc/profile.d runs every time
+    somebody opens a shell. It needs no privileges beyond writing to the
+    user's own home, it survives reboots, and it is nowhere near the places a
+    persistence check usually looks - cron, systemd, rc.local.
+
+    The user-level version is quieter still: it only needs the account that
+    was already compromised, and it re-establishes access on the next login
+    without touching anything root owns.
+references:
+    - https://attack.mitre.org/techniques/T1546/004/
+author: Sentora
+date: 2026/09/01
+logsource:
+    product: linux
+detection:
+    cmd_profile_file:
+        CommandLine|contains:
+            - '.bashrc'
+            - '.bash_profile'
+            - '.bash_login'
+            - '.zshrc'
+            - '/etc/profile'
+            - '/etc/bash.bashrc'
+    cmd_writing:
+        CommandLine|contains:
+            - 'echo'
+            - 'tee'
+            - '>>'
+            - 'curl'
+            - 'wget'
+    msg_profile_file:
+        Message|contains:
+            - '.bashrc'
+            - '/etc/profile'
+            - '.zshrc'
+    msg_writing:
+        Message|contains:
+            - 'echo'
+            - 'tee'
+            - '>>'
+    condition: (cmd_profile_file and cmd_writing) or (msg_profile_file and msg_writing)
+falsepositives:
+    - Provisioning that sets up a developer's environment, which happens once
+      per host and looks identical every time
+level: high
+tags:
+    - attack.persistence
+    - attack.privilege_escalation
+    - attack.t1546.004

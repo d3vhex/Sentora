@@ -18,6 +18,9 @@ throwaway database in a test without starting a server.
 
 from __future__ import annotations
 
+import asyncio
+import time
+
 import mysql.connector
 
 from security import session as session_store
@@ -38,13 +41,86 @@ def set_defaults(*, conn_factory, alert_template):
     DEFAULT_ALERT_TEMPLATE = alert_template
 
 
+DB_WAIT_S = 60
+
+#: Tables the platform cannot serve a single request without. Checked after
+#: the migrations, because "every migration reported an error" and "the
+#: database is fine" look identical from here otherwise.
+REQUIRED_TABLES = ("users", "sessions")
+
+
+async def _wait_for_database(timeout: float = DB_WAIT_S) -> bool:
+    """Block until userdb answers, or give up and say so.
+
+    These migrations run from `main_process_start`, which fires before any
+    worker exists and long before the connection pool is built. Under compose
+    the database container starts alongside the app, so they raced it - all
+    five failed, each printed its own line, and the server started anyway.
+    """
+    deadline = time.monotonic() + timeout
+    delay, last = 1.0, None
+    while True:
+        try:
+            with sync_mysql_conn("userdb") as conn:
+                conn.cursor().close()
+            return True
+        except Exception as e:
+            last = e
+            if time.monotonic() >= deadline:
+                print(f"[Schema] Database unreachable after {timeout:.0f}s: "
+                      f"{last}. Migrations will not run, and this server will "
+                      f"answer every login with an authentication failure.",
+                      flush=True)
+                return False
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 8.0)
+
+
 async def run_all():
-    """Every migration, in the order app.py ran them."""
+    """Every migration, in the order app.py ran them.
+
+    Waits for the database first, and checks afterwards that the tables it was
+    supposed to create are there.
+
+    The check is not belt and braces. Each migration below catches its own
+    exceptions - correctly, because one failing must not stop the rest - and
+    the result was that a database that was simply not up yet produced five
+    tidy error lines and a server that started. `sessions` was never created,
+    so every login authenticated correctly and then failed to issue a session,
+    which the login handler read as "not a local user" and answered 401. A
+    correct password, told it was wrong, because of a table.
+    """
+    if not await _wait_for_database():
+        return
+
     await init_hub_db()
     await init_enrollment_tables()
     await init_password_policy()
     await init_session_table()
     await init_email_templates_table()
+
+    missing = _missing_required_tables()
+    if missing:
+        print(f"[Schema] FATAL: {', '.join(missing)} missing after migration. "
+              f"Logins will fail as though the password were wrong. The "
+              f"errors above say why.", flush=True)
+
+
+def _missing_required_tables() -> list[str]:
+    try:
+        with sync_mysql_conn("userdb") as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = DATABASE()")
+                present = {str(r[0]).lower() for r in cur.fetchall()}
+            finally:
+                cur.close()
+        return [t for t in REQUIRED_TABLES if t not in present]
+    except Exception as e:
+        print(f"[Schema] could not verify the schema: {e}", flush=True)
+        return []
 
 
 async def init_hub_db():
@@ -165,16 +241,25 @@ async def init_enrollment_tables():
                 # reason should be visible, not indistinguishable from
                 # "already applied".
                 cur.execute("""
-                    SELECT COUNT(*) FROM information_schema.COLUMNS
+                    SELECT column_name FROM information_schema.COLUMNS
                     WHERE TABLE_SCHEMA = DATABASE()
                       AND TABLE_NAME = 'agent_identities'
-                      AND COLUMN_NAME = 'display_name'
                 """)
-                if not cur.fetchone()[0]:
-                    cur.execute(
-                        "ALTER TABLE agent_identities "
-                        "ADD COLUMN display_name VARCHAR(128) NULL AFTER agent_name")
-                    print("[Enrollment] Added agent_identities.display_name.")
+                present = {str(r[0]).lower() for r in cur.fetchall()}
+                pending = [ddl for column, ddl in (
+                    ("display_name",
+                     "ADD COLUMN display_name VARCHAR(128) NULL AFTER agent_name"),
+                    # What the agent reported on its last handshake. NULL means
+                    # it sent no version header, which is itself the answer:
+                    # it predates version reporting.
+                    ("agent_version",
+                     "ADD COLUMN agent_version VARCHAR(48) NULL"),
+                ) if column not in present]
+                if pending:
+                    cur.execute("SET SESSION lock_wait_timeout = 3")
+                    cur.execute(f"ALTER TABLE agent_identities {', '.join(pending)}")
+                    print(f"[Enrollment] agent_identities gained "
+                          f"{len(pending)} column(s).")
 
                 conn.commit()
             finally:

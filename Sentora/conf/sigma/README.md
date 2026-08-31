@@ -10,7 +10,7 @@ addresses.
 
 ## What ships in `builtin/`
 
-A baseline of 23 rules covering 23 ATT&CK techniques. It exists because the
+A baseline of 37 rules covering 38 ATT&CK techniques. It exists because the
 alternative was worse: this directory was empty by design, on the argument
 that a detection nobody reviewed is not an improvement — which is true, and
 which produced zero ATT&CK coverage on every install and a coverage page with

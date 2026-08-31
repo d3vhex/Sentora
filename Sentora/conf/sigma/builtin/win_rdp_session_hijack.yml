@@ -1,0 +1,33 @@
+title: Another User's RDP Session Attached
+id: 5d8b3a16-2f74-4c90-8e51-9b6a0d3f7c25
+status: stable
+description: >
+    `tscon` connects a terminal session to a different terminal. Run as
+    SYSTEM, it does that without a password - so an administrator who can
+    start a service can walk into any logged-on user's desktop, already
+    authenticated, with their tokens and their mapped drives.
+
+    There is no maintenance reason to attach somebody else's session to your
+    own. The legitimate use of tscon is reconnecting to your own disconnected
+    session, which does not need /dest.
+references:
+    - https://attack.mitre.org/techniques/T1563/002/
+author: Sentora
+date: 2026/09/01
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    tscon_redirect:
+        CommandLine|contains|all:
+            - 'tscon'
+            - '/dest:'
+    condition: tscon_redirect
+falsepositives:
+    - A helpdesk tool that moves a session deliberately, which should be
+      recognisable by the account that ran it
+level: critical
+tags:
+    - attack.lateral_movement
+    - attack.defense_evasion
+    - attack.t1563.002

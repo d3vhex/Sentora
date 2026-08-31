@@ -44,6 +44,8 @@ import struct
 import threading
 import time
 
+from modules.version import AGENT_VERSION
+
 # Stream framing, duplicated from `core/agent_link.py` rather than imported.
 #
 # The agent ships as a standalone binary and `core/` is optional in it -
@@ -172,13 +174,20 @@ class AgentLinkClient:
         idle_timeouts = (websocket.WebSocketTimeoutException, socket.timeout)
 
         url = self.channel_url()
+        # The version rides the handshake rather than a frame after it, so the
+        # server has it at the moment it registers the link. A `hello` frame
+        # would leave a window where the agent is connected and unidentified -
+        # short, but it is the window a reconnect storm lives in, and the
+        # version is most wanted exactly when something is going wrong.
         ws = websocket.create_connection(
-            url, header=[f"X-Agent-Key: {self.agent_key}"],
+            url,
+            header=[f"X-Agent-Key: {self.agent_key}",
+                    f"X-Agent-Version: {AGENT_VERSION}"],
             timeout=PING_INTERVAL_S)
         self._ws = ws
         self.connected = True
         self.last_error = ""
-        print(f"[link] connected to {url}", flush=True)
+        print(f"[link] connected to {url} as {AGENT_VERSION}", flush=True)
 
         last_ping = time.monotonic()
         try:

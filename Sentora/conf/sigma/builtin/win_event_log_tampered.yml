@@ -1,0 +1,43 @@
+title: Windows Event Log Cleared Or Stopped From The Command Line
+id: 4b9e6c27-8a35-4d19-b740-2e5f9a1c3d86
+status: stable
+description: >
+    The companion to event 1102. That event says the log was cleared, and it
+    is written into the log being cleared - so it survives only because
+    Windows writes it first. This catches the command instead, and catches the
+    case 1102 cannot: the log service stopped or disabled, so that nothing is
+    recorded at all rather than the record being removed afterwards.
+
+    Stopping EventLog is the louder half. Clearing a log has a thin
+    administrative excuse; turning off the thing that writes them has none.
+references:
+    - https://attack.mitre.org/techniques/T1070/001/
+    - https://attack.mitre.org/techniques/T1562/002/
+author: Sentora
+date: 2026/09/01
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    wevtutil_clear:
+        CommandLine|contains|all:
+            - 'wevtutil'
+            - ' cl '
+    powershell_clear:
+        CommandLine|contains: 'clear-eventlog'
+    service_stopped:
+        CommandLine|contains|all:
+            - 'eventlog'
+            - 'stop'
+    service_disabled:
+        CommandLine|contains|all:
+            - 'eventlog'
+            - 'start= disabled'
+    condition: 1 of them
+falsepositives:
+    - A build image being sanitised before capture
+level: critical
+tags:
+    - attack.defense_evasion
+    - attack.t1070.001
+    - attack.t1562.002
