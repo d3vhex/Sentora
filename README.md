@@ -23,7 +23,7 @@ phone-home. If you want a smarter model and have the RAM, swap it in `.env`.
 - **Collects telemetry** from Windows and Linux agents over a single TCP
   channel. SIEM events, alerts, FIM, packages, network connections,
   open ports, Docker activity, screen frames.
-- **Detects with Sigma rules, on the endpoint.** 23 rules covering 23 MITRE
+- **Detects with Sigma rules, on the endpoint.** 37 rules covering 38 MITRE
   ATT&CK techniques ship in `conf/sigma/builtin/`; drop community rulesets in
   beside them. Sigma matches *named fields* rather than text, so
   `Image|endswith: '\vssadmin.exe'` cannot be defeated by the word "vssadmin"
@@ -47,7 +47,7 @@ phone-home. If you want a smarter model and have the RAM, swap it in `.env`.
   that is the more competent attack, since spraying wide and shallow stays
   under both per-account lockout and per-host thresholds.
 
-  Total coverage with Sigma: 27 techniques. Every window fires once rather than
+  Total coverage with Sigma: 42 techniques. Every window fires once rather than
   once per event, and every counter is bounded — a counter keyed on an
   attacker-supplied username is a memory exhaustion primitive, not a detection.
 - **Maps detections to MITRE ATT&CK, from the rules themselves.** Rules carry

@@ -1,0 +1,43 @@
+title: AMSI Disabled From Within PowerShell
+id: 2c8f4a63-9d17-4e52-a06b-3f7c1e8d5920
+status: stable
+description: >
+    The Antimalware Scan Interface is what lets Defender see PowerShell after
+    it has been decoded. Setting `amsiInitFailed` to true, or reflecting over
+    `AmsiUtils`, turns that off for the rest of the session - and everything
+    that runs afterwards runs unseen.
+
+    There is no benign reason for a script to reach into AMSI's internals, so
+    this is one of the few PowerShell detections with essentially no false
+    positive. Its weakness is the opposite one: the exact strings are what
+    every bypass changes first, so it catches the copied version and not the
+    written-from-scratch one. Worth having anyway - most of them are copied.
+
+    Reachable through script block logging (4104), where what gets recorded is
+    the decoded text. That means this fires on the payload rather than on the
+    launcher, and catches it even when the command line was base64.
+references:
+    - https://attack.mitre.org/techniques/T1562/001/
+author: Sentora
+date: 2026/09/01
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    amsi_internals:
+        CommandLine|contains:
+            - 'amsiinitfailed'
+            - 'amsiutils'
+            - 'amsiscanbuffer'
+            - 'amsicontext'
+    script_scanning_off:
+        CommandLine|contains|all:
+            - 'set-mppreference'
+            - 'disablescriptscanning'
+    condition: 1 of them
+falsepositives:
+    - Security research on the host itself, which is worth confirming
+level: critical
+tags:
+    - attack.defense_evasion
+    - attack.t1562.001

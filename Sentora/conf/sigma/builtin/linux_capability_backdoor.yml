@@ -1,0 +1,46 @@
+title: Elevating Capability Granted To An Interpreter
+id: 1e7b4d29-3c60-4a85-9f18-6b2d5e0a7c34
+status: stable
+description: >
+    Capabilities are the finer-grained replacement for the suid bit, and they
+    are the quieter one. A search for suid binaries is in most hardening
+    checklists; `getcap -r /` is in almost none. `cap_setuid+ep` on python or
+    perl is a root shell for anybody who can run it, and the file's mode looks
+    entirely ordinary.
+
+    The companion to the suid rule, catching the same intent through the
+    mechanism nobody looks at.
+references:
+    - https://attack.mitre.org/techniques/T1548/001/
+author: Sentora
+date: 2026/09/01
+logsource:
+    product: linux
+detection:
+    cmd_setcap:
+        CommandLine|contains: 'setcap'
+    cmd_dangerous_cap:
+        CommandLine|contains:
+            - 'cap_setuid'
+            - 'cap_dac_override'
+            - 'cap_dac_read_search'
+            - 'cap_sys_admin'
+            - 'cap_sys_ptrace'
+            - 'cap_sys_module'
+    msg_setcap:
+        Message|contains: 'setcap'
+    msg_dangerous_cap:
+        Message|contains:
+            - 'cap_setuid'
+            - 'cap_sys_admin'
+            - 'cap_sys_module'
+    condition: (cmd_setcap and cmd_dangerous_cap) or (msg_setcap and msg_dangerous_cap)
+falsepositives:
+    - A package granting a capability to its own binary during installation,
+      which is why the capability list here is the dangerous ones rather than
+      all of them
+level: high
+tags:
+    - attack.privilege_escalation
+    - attack.persistence
+    - attack.t1548.001

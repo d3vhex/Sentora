@@ -1,0 +1,43 @@
+title: WMI Event Subscription Created
+id: 7c2e9f41-8b53-4a17-9d06-4e8b3c1a5f79
+status: stable
+description: >
+    Persistence with no file and no registry key. A filter says when to fire,
+    a consumer says what to run, and a binding ties them together - all of it
+    living in the WMI repository, where a file scan does not look and an
+    autoruns listing does not show it.
+
+    It survives reboots, runs as SYSTEM, and can be triggered by something as
+    ordinary as a user logging on. Nothing routine creates one: this is
+    written by tooling that means to stay.
+references:
+    - https://attack.mitre.org/techniques/T1546/003/
+author: Sentora
+date: 2026/09/01
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    subscription_class:
+        CommandLine|contains:
+            - '__eventfilter'
+            - 'commandlineeventconsumer'
+            - 'activescripteventconsumer'
+            - '__filtertoconsumerbinding'
+    wmic_subscription:
+        CommandLine|contains|all:
+            - 'wmic'
+            - 'root\subscription'
+    powershell_subscription:
+        CommandLine|contains|all:
+            - 'set-wmiinstance'
+            - 'subscription'
+    condition: 1 of them
+falsepositives:
+    - A management product that genuinely uses WMI subscriptions. There are a
+      few, they are installed once, and the binding is worth reading.
+level: critical
+tags:
+    - attack.persistence
+    - attack.privilege_escalation
+    - attack.t1546.003

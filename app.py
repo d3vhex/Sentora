@@ -115,6 +115,7 @@ from core import config_validation
 from core import login_guard
 from core import netloc
 from core import threat_feeds
+from core import version as product_version
 # Installer templating: pure string generation, extracted so app.py is not
 # also 420 lines of PowerShell. See core/installers.py.
 from core.installers import _render_linux_install, _render_windows_install
@@ -175,8 +176,27 @@ ENCRYPTED_FIELDS_MAP = {
 from core import schema_init  # noqa: E402
 
 
-@app.listener("main_process_start")
+@app.before_server_start
 async def setup_hub(app):
+    """Create and migrate the schema the platform cannot run without.
+
+    `before_server_start`, not `main_process_start`. That listener only fires
+    when Sanic runs a multi-process manager, and `app.run(single_process=True)`
+    - which is what `WORKERS=1` selects, and what the compose file asks for -
+    has no such manager. So nothing here ran at all: no `users`, no
+    `sessions`, no enrolment tables.
+
+    The symptom was three layers away from the cause. Password checks go
+    through the synchronous connector and kept working, so `/login`
+    authenticated the operator, failed to write a session into a table that
+    did not exist, and the handler's own `except` read that as "not a local
+    user" and answered 401. A correct password, told it was wrong, because a
+    startup hook was registered for a process model this server does not use.
+
+    Every migration is idempotent and cheap on a database that is already
+    correct, so running it per worker rather than once is not worth a second
+    process model to arrange.
+    """
     schema_init.set_defaults(conn_factory=sync_mysql_conn,
                              alert_template=DEFAULT_ALERT_TEMPLATE)
     await schema_init.run_all()
@@ -1398,6 +1418,43 @@ async def authenticate(request):
     return None
 
 
+async def _record_agent_version(agent: str, reported: str | None) -> None:
+    """Remember what this agent said it was, on every connect.
+
+    On connect rather than on enrolment, because the thing worth knowing is
+    what is *running* - an agent enrolled a year ago and upgraded twice since
+    would otherwise be recorded as whatever it was the day it first appeared.
+
+    NULL is a real answer here and not a gap: it means the agent sent no
+    version header at all, so it predates version reporting. That is a
+    different fact from "old but known", and the console needs to tell them
+    apart - one is a fleet member to upgrade, the other is one nobody can even
+    name.
+
+    Failing to write this must never fail the handshake. A version is a
+    diagnosis; losing it costs a line in the console, and refusing the channel
+    over it would cost the endpoint.
+    """
+    hyphen, underscore, _ = _agent_name_forms(agent)
+    candidates = [n for n in dict.fromkeys([agent, hyphen, underscore]) if n]
+    try:
+        cnx = await connect_userdb()
+        cur = await cnx.cursor()
+        try:
+            placeholders = ",".join(["%s"] * len(candidates))
+            await cur.execute(
+                f"UPDATE agent_identities SET agent_version = %s "
+                f"WHERE agent_name IN ({placeholders})",
+                [reported] + candidates,
+            )
+            await cnx.commit()
+        finally:
+            await cur.close()
+            await cnx.close()
+    except Exception as e:
+        print(f"[agent-link] could not record {agent}'s version: {e}", flush=True)
+
+
 def _handler_qualname(handler) -> str:
     """The name a route's handler was registered under, through any wrapping.
 
@@ -2166,18 +2223,65 @@ class _NoOpBootstrapClient:
 bootstrap_client = _NoOpBootstrapClient()
 
 
+DB_POOL_WAIT_S = 60
+
+
 @app.before_server_start
 async def setup_db_pool(app):
+    """Build the connection pool, waiting for the database to come up.
+
+    This used to try exactly once. Under compose the app and the database
+    start together and `db` is routinely not accepting connections yet, so
+    `create_pool` raised, `app.ctx.db_pool` was never set - and the worker
+    carried on serving requests.
+
+    What that produced is worse than a crash, because password checks go
+    through the synchronous connector and kept working. `/login` printed
+
+        [+] Local login successful for user: admin
+
+    then failed issuing the session, was caught by the handler's own broad
+    `except`, fell through to the LDAP path, and answered 401. An operator
+    with the correct password was told it was wrong, by a server reporting
+    itself healthy, with the reason written only into a database table.
+
+    So: wait, and if the database is genuinely not there, refuse to start. A
+    platform whose entire job is storing telemetry has nothing useful to do
+    without one, and failing to start is the only failure mode an operator
+    can actually see.
+    """
     print(f"[*] Initializing database connection pool to {DB_HOST}...")
-    app.ctx.db_pool = await aiomysql.create_pool(
-        host=DB_HOST,
-        port=DB_PORT,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        db='userdb',
-        autocommit=True,
-        minsize=5,
-        maxsize=20
+    deadline = time.monotonic() + DB_POOL_WAIT_S
+    delay = 1.0
+    last_error = None
+    while True:
+        try:
+            app.ctx.db_pool = await aiomysql.create_pool(
+                host=DB_HOST,
+                port=DB_PORT,
+                user=DB_USER,
+                password=DB_PASSWORD,
+                db='userdb',
+                autocommit=True,
+                minsize=5,
+                maxsize=20
+            )
+            print("[*] Database connection pool ready.")
+            return
+        except Exception as e:
+            last_error = e
+            if time.monotonic() >= deadline:
+                break
+            print(f"[*] Database not ready ({e}); retrying in {delay:.0f}s", flush=True)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 8.0)
+
+    print(f"[!] Could not reach the database at {DB_HOST}:{DB_PORT} after "
+          f"{DB_POOL_WAIT_S}s: {last_error}", flush=True)
+    raise RuntimeError(
+        f"database unreachable at {DB_HOST}:{DB_PORT} after {DB_POOL_WAIT_S}s "
+        f"({last_error}). Refusing to start: serving without a pool means "
+        f"logins fail as 'invalid password' and agents report into nothing."
     )
 
 @app.exception(Exception)
@@ -4910,11 +5014,35 @@ async def login(request):
                 await log_login_attempt(username, "local", "success", "", ip)
 
                 print(f"[+] Local login successful for user: {username}")
-                user_perms = await get_user_permissions(user_id)
-                raw_token = await _issue_session(
-                    request, user_id=user_id, username=db_username,
-                    role=db_role, auth_type="local",
-                )
+                # Past this point the credentials are correct, so nothing may
+                # fall through to LDAP.
+                #
+                # It used to. The whole local branch sat inside one `try`
+                # whose `except` means "not a local user, try the directory",
+                # so a failure *after* the password matched - issuing the
+                # session, reading permissions - was caught by it, the LDAP
+                # path was tried, and the operator got 401. With a working
+                # database this never happened. With a pool that failed to
+                # build at startup it happened every time, and told the person
+                # with the right password that it was wrong.
+                try:
+                    user_perms = await get_user_permissions(user_id)
+                    raw_token = await _issue_session(
+                        request, user_id=user_id, username=db_username,
+                        role=db_role, auth_type="local",
+                    )
+                except Exception as e:
+                    print(f"[!] {username} authenticated but the session could "
+                          f"not be created: {e}", flush=True)
+                    await log_login_attempt(username, "local", "failure",
+                                            f"authenticated, session failed: {e}", ip)
+                    return response.json({
+                        "status": "error",
+                        "message": "Your password was accepted, but this server "
+                                   "could not start a session. This is a server "
+                                   "fault, not a credential one - check that it "
+                                   "can reach its database.",
+                    }, status=503)
                 resp = response.json({
                     "status": "success",
                     "message": "Login successful (local).",
@@ -5868,6 +5996,40 @@ async def db_status(request):
         return sanic_json({"error": f"Database connection failed: {e}"}, status=500)
 
 
+def _agent_versions() -> dict:
+    """agent_name -> the version it reported on its last handshake.
+
+    Keyed under both spellings, for the same reason `_agent_display_names` is:
+    callers arrive with the database-derived name, whose hyphens
+    `server._sanitize_db_name` has already flattened. Keying only on the
+    stored name would leave every hyphenated host looking un-versioned - which
+    reads exactly like an agent too old to report one, and is the mistake this
+    codebase has now made in five places.
+
+    Empty on any failure. This runs on the agents list, and a fleet that
+    cannot be listed because a version column is missing is a worse outcome
+    than a fleet listed without versions.
+    """
+    try:
+        with sync_mysql_conn("userdb") as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT agent_name, agent_version "
+                            "FROM agent_identities WHERE agent_version IS NOT NULL")
+                versions: dict = {}
+                for stored, reported in cur.fetchall():
+                    hyphen, underscore, _ = _agent_name_forms(stored)
+                    for form in (stored, hyphen, underscore):
+                        if form:
+                            versions[form] = reported
+                return versions
+            finally:
+                cur.close()
+    except Exception as e:
+        print(f"[!] could not read agent versions: {e}", flush=True)
+        return {}
+
+
 def _agent_display_names() -> dict:
     """agent_name -> display_name, for the agents that have one.
 
@@ -6022,10 +6184,18 @@ async def list_agents(request):
         # already fans out a connection per host, and the names live together
         # in userdb.
         names = await asyncio.to_thread(_agent_display_names)
+        versions = await asyncio.to_thread(_agent_versions)
         for detail in agent_details:
             detail["display_name"] = names.get(detail["name"]) or None
+            reported = versions.get(detail["name"])
+            state, why = product_version.agent_support(reported)
+            detail["agent_version"] = reported
+            detail["version_state"] = state
+            detail["version_detail"] = why
 
-        return sanic_json({"agents": agent_details})
+        return sanic_json({"agents": agent_details,
+                           "server_version": product_version.SERVER_VERSION,
+                           "current_agent_version": product_version.CURRENT_AGENT_VERSION})
     except Exception as e:
         return sanic_json({"error": f"Database error while listing agents: {e}"}, status=500)
 
@@ -9093,14 +9263,30 @@ async def agent_link_socket(request, ws):
         else:
             await ws.send(pyjson.dumps(frame))
 
+    # The version rides the handshake, so it is known before the link is
+    # registered rather than after a frame that may never arrive. An agent old
+    # enough to send no header is itself the answer to "how old is it".
+    reported = (request.headers.get("X-Agent-Version") or "").strip()
+    state, detail = product_version.agent_support(reported)
+    await _record_agent_version(agent, reported if
+                                product_version.is_valid_version(reported) else None)
+
     link = agent_link.AgentLink(agent, send)
     replaced = AGENT_LINKS.register(link)
     if replaced is not None:
         # Usually a drop the agent noticed before we did. Failing whatever was
         # in flight on the old socket beats leaving it to time out.
         replaced.close("replaced by a new connection from the same agent")
-    print(f"[agent-link] {agent} connected from {_client_ip(request)}", flush=True)
-    await audit_log(request, "AGENT_LINK_OPEN", agent, "agent opened a channel")
+    print(f"[agent-link] {agent} connected from {_client_ip(request)} "
+          f"[{state}: {detail}]", flush=True)
+    if state == "unsupported":
+        # Loud, and still connected. Turning it away would leave it
+        # permanently unreachable and unupgradeable, because there is no
+        # second route to an endpoint any more.
+        print(f"[agent-link] {agent} is running an unsupported agent. "
+              f"Rebuild and reinstall it.", flush=True)
+    await audit_log(request, "AGENT_LINK_OPEN", agent,
+                    f"agent opened a channel ({state}: {detail})")
 
     reason = "the agent disconnected"
     try:
@@ -9377,7 +9563,21 @@ async def serve_index(request, path=""):
 
 @app.route("/health")
 async def health_check(request):
-    return sanic_json({"status": "healthy", "timestamp": datetime.now().isoformat()})
+    """Liveness, and what is running.
+
+    The version is here because this is the one endpoint that answers without
+    a session, which makes it the only thing a deploy script or a load
+    balancer can ask. `current_agent_version` is what a fleet should be on;
+    the installer reads it so a freshly generated deployment does not have to
+    be told separately.
+    """
+    return sanic_json({
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "server_version": product_version.SERVER_VERSION,
+        "current_agent_version": product_version.CURRENT_AGENT_VERSION,
+        "min_agent_version": product_version.MIN_AGENT_VERSION,
+    })
 
 if __name__ == "__main__":
     app.config.AUTO_RELOAD = False

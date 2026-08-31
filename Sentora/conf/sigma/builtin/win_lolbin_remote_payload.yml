@@ -1,0 +1,58 @@
+title: Signed Windows Binary Fetching A Remote Payload
+id: 91c4e7a2-3b58-4d61-8f07-2a6c5e9d4b13
+status: stable
+description: >
+    certutil, bitsadmin, mshta and regsvr32 are signed by Microsoft, present
+    on every host, and all of them will fetch and run something from a URL.
+    That combination is the whole reason they are reached for: the download
+    does not look like a download, and application allow-listing does not stop
+    a binary Windows shipped itself.
+
+    The rule is on the pairing - one of those binaries together with a remote
+    location - rather than on the binaries, which all have ordinary uses.
+    certutil -decode and regsvr32 with scrobj.dll are the two that need no
+    URL: the first is how a payload arrives as text and leaves as an
+    executable, the second runs script straight out of a file.
+references:
+    - https://attack.mitre.org/techniques/T1105/
+    - https://attack.mitre.org/techniques/T1218/
+author: Sentora
+date: 2026/09/01
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    certutil_download:
+        CommandLine|contains|all:
+            - 'certutil'
+            - '-urlcache'
+    certutil_decode:
+        CommandLine|contains|all:
+            - 'certutil'
+            - '-decode'
+    bitsadmin_transfer:
+        CommandLine|contains|all:
+            - 'bitsadmin'
+            - '/transfer'
+    mshta_runs:
+        CommandLine|contains: 'mshta'
+    regsvr32_scrobj:
+        CommandLine|contains|all:
+            - 'regsvr32'
+            - 'scrobj.dll'
+    remote_location:
+        CommandLine|contains:
+            - 'http://'
+            - 'https://'
+            - 'ftp://'
+    condition: certutil_decode or regsvr32_scrobj or
+        ((certutil_download or bitsadmin_transfer or mshta_runs) and remote_location)
+falsepositives:
+    - certutil against an internal PKI URL, which is its actual purpose
+    - A software deployment tool driving bitsadmin
+level: high
+tags:
+    - attack.command_and_control
+    - attack.defense_evasion
+    - attack.t1105
+    - attack.t1218

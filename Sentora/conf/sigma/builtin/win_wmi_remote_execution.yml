@@ -1,0 +1,45 @@
+title: Process Created On Another Host Over WMI
+id: 3a7d9e15-6c82-4b40-9d3f-8e1a2c7b5f64
+status: stable
+description: >
+    WMI will start a process on a remote machine, needs nothing installed at
+    the far end, and leaves no service behind the way PsExec does. It is the
+    quiet way across an estate, and it is built in.
+
+    An administrator does this too, which is why the account and the number of
+    distinct destinations matter more than the single event. What makes it
+    worth recording at all is that on most estates it is rare.
+references:
+    - https://attack.mitre.org/techniques/T1047/
+author: Sentora
+date: 2026/09/01
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    wmic_remote:
+        CommandLine|contains|all:
+            - 'wmic'
+            - '/node:'
+    wmic_process_create:
+        CommandLine|contains|all:
+            - 'process'
+            - 'call'
+            - 'create'
+    powershell_wmi_remote:
+        CommandLine|contains|all:
+            - '-computername'
+            - 'invoke-wmimethod'
+    powershell_cim_remote:
+        CommandLine|contains|all:
+            - '-computername'
+            - 'invoke-cimmethod'
+    condition: (wmic_remote and wmic_process_create) or powershell_wmi_remote
+        or powershell_cim_remote
+falsepositives:
+    - Inventory and patching tools that drive WMI across the estate
+level: high
+tags:
+    - attack.lateral_movement
+    - attack.execution
+    - attack.t1047

@@ -1,0 +1,80 @@
+# Ordinary activity that no rule may fire on, ever.
+#
+# The per-rule `ignores` in the other files are each rule arguing with its own
+# near miss. This is the floor underneath all of them: a shared set of things
+# that happen thousands of times a day on a healthy host.
+#
+# It catches the failure a per-rule sample cannot. A rule broadened to
+# `CommandLine|contains: bash` still passes its own tests - it fires on its
+# positive and not on its one negative - and then pages on every shell on the
+# estate. This list is what that rule hits on the way in.
+#
+# Adding to it is cheap and always right: the cost of a false positive here is
+# a muted rule, and a muted rule is worse than an absent one because the
+# console still counts it as coverage.
+
+events:
+  - name: an empty event
+    event: {}
+
+  - name: a shell prompt and nothing else
+    event:
+      CommandLine: /bin/bash
+
+  - name: package updates
+    event:
+      Image: /usr/bin/apt-get
+      CommandLine: apt-get -y install nginx
+
+  - name: a routine service restart
+    event:
+      Image: /usr/bin/systemctl
+      CommandLine: systemctl restart nginx.service
+
+  - name: reading a log
+    event:
+      Image: /usr/bin/tail
+      CommandLine: tail -n 200 -f /var/log/nginx/access.log
+
+  - name: a deploy over ssh
+    event:
+      Image: /usr/bin/ssh
+      CommandLine: ssh deploy@app-01.internal /srv/app/bin/release
+
+  - name: a scheduled backup
+    event:
+      Image: /usr/bin/rsync
+      CommandLine: rsync -az --delete /srv/data/ backup-01:/srv/data/
+
+  - name: a developer checking their own key
+    event:
+      Image: /usr/bin/ssh-keygen
+      CommandLine: ssh-keygen -lf /home/deploy/.ssh/id_ed25519.pub
+
+  - name: an ordinary windows logon
+    event:
+      EventID: 4624
+      Channel: Security
+      TargetUserName: deploy
+      LogonType: 3
+
+  - name: windows update installing a service
+    event:
+      EventID: 7045
+      ServiceName: TrustedInstaller
+      ImagePath: C:\Windows\servicing\TrustedInstaller.exe
+
+  - name: a signed powershell module import
+    event:
+      Image: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+      CommandLine: powershell.exe -NoProfile -Command Import-Module ActiveDirectory
+
+  - name: an administrator opening a console
+    event:
+      Image: C:\Windows\System32\cmd.exe
+      CommandLine: cmd.exe /c dir C:\Users
+
+  - name: office saving a document
+    event:
+      Image: C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE
+      CommandLine: '"WINWORD.EXE" /n "C:\Users\deploy\Documents\report.docx"'

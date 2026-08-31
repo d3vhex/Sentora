@@ -34,6 +34,33 @@ SCRIPT = ROOT / "Sentora" / "build_agent.sh"
 TEXT = SCRIPT.read_text(encoding="utf-8")
 
 
+def _assert_bash_accepted(result, what: str) -> None:
+    """Fail on a syntax error; skip when bash never ran the script.
+
+    On Windows the `bash` on PATH is usually the WSL shim, and when the WSL
+    virtual machine will not start it exits non-zero having never read stdin -
+    writing its own complaint to *stdout*, in the system language, with stderr
+    empty:
+
+        b'S\\x00a\\x00n\\x00a\\x00l\\x00 \\x00m\\x00a\\x00k\\x00i\\x00n\\x00e...'
+        (UTF-16LE: "Sanal makine ... CONNECTION_TIMEOUT")
+
+    Read as a failure that says `assert 1 == 0`, which is a broken build
+    script - and it took a real bash error to tell them apart. A syntax error
+    always names itself on stderr; an unrunnable shell leaves it empty. The
+    distinction matters more than the convenience: a test that reports the
+    environment as the code is a test that gets ignored.
+    """
+    if result.returncode == 0:
+        return
+    stderr = result.stderr.decode("utf-8", "replace").strip()
+    if not stderr:
+        noise = result.stdout.decode("utf-16-le", "replace").strip() \
+            or result.stdout.decode("utf-8", "replace").strip()
+        pytest.skip(f"bash did not run: {noise[:200] or 'no output'}")
+    raise AssertionError(f"{what} is not valid bash:\n{stderr}")
+
+
 def test_the_script_is_valid_bash():
     """`set -euo pipefail` plus a syntax error is a script that fails on line
     one with no output at all.
@@ -54,7 +81,7 @@ def test_the_script_is_valid_bash():
     # the pipe.
     result = subprocess.run(["bash", "-n"], input=SCRIPT.read_bytes(),
                             capture_output=True)
-    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    _assert_bash_accepted(result, SCRIPT.name)
 
 
 @pytest.mark.parametrize("package", [
@@ -193,3 +220,56 @@ def test_powershell_scripts_are_not_forced_to_lf():
     text = (ROOT / ".gitattributes").read_text(encoding="utf-8")
     ps1 = next(l for l in text.splitlines() if l.startswith("*.ps1"))
     assert "crlf" in ps1
+
+
+# --------------------------------------------------------------------------
+# The two builds must ship the same agent
+# --------------------------------------------------------------------------
+#
+# Windows and Linux have separate build scripts with separately maintained
+# hidden-import lists. PyInstaller does not walk the imports of a module that
+# is itself a hidden import, so anything reached only from one of those has to
+# be listed too - and it has to be listed in *both*.
+#
+# The failure is quiet in the worst way: the binary builds cleanly, ships, and
+# dies at the moment the missing import is first executed. `modules.version`
+# is reached only from `modules.link`, so leaving it out of one script would
+# produce an agent that installs fine and dies on its first channel connect,
+# on one platform only.
+
+PS1 = ROOT / "Sentora" / "build_agent.ps1"
+
+
+def _hidden_imports(text: str) -> set[str]:
+    import re
+
+    found = set(re.findall(r"--hidden-import\s+([\w.]+)", text))
+    # The PowerShell script keeps them in an array of quoted strings.
+    block = re.search(r"\$hiddenImports\s*=\s*@\((.*?)\)", text, re.S)
+    if block:
+        found |= set(re.findall(r'"([\w.]+)"', block.group(1)))
+    return found
+
+
+def test_both_builds_declare_the_same_agent_modules():
+    linux = _hidden_imports(SCRIPT.read_text(encoding="utf-8"))
+    windows = _hidden_imports(PS1.read_text(encoding="utf-8"))
+    assert linux, "no hidden imports found in build_agent.sh; the scan is broken"
+
+    # Windows-only packages are expected to be one-sided.
+    windows_only = {"winpty", "winpty.ptyprocess"}
+    linux_only = {"mss.linux"}
+
+    missing_from_windows = {m for m in linux if m.startswith("modules.")} - windows
+    missing_from_linux = {m for m in windows if m.startswith("modules.")} - linux
+    assert not missing_from_windows,         f"build_agent.ps1 does not bundle {sorted(missing_from_windows)}"
+    assert not missing_from_linux,         f"build_agent.sh does not bundle {sorted(missing_from_linux)}"
+    assert windows_only <= windows
+    assert linux_only <= linux
+
+
+def test_the_version_module_is_bundled():
+    """Reached only from `modules.link`, which is itself a hidden import, so
+    PyInstaller never finds it on its own."""
+    for script in (SCRIPT, PS1):
+        assert "modules.version" in _hidden_imports(script.read_text(encoding="utf-8")),             f"{script.name} would build an agent that cannot report its version"

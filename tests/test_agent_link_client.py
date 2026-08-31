@@ -22,6 +22,17 @@ MODULE = ROOT / "Sentora" / "modules" / "link.py"
 
 
 def _load():
+    """Load link.py the way the agent does, not the way a test finds it easy.
+
+    `Sentora/` goes on the path first because the module imports
+    `modules.version`, which is how every other agent module imports its
+    siblings. Loading it by path alone would work only as long as it never
+    imported one - and the day it did, the failure would look like a bug in
+    the module rather than in this fixture.
+    """
+    agent_root = str(ROOT / "Sentora")
+    if agent_root not in sys.path:
+        sys.path.insert(0, agent_root)
     spec = importlib.util.spec_from_file_location("_link_under_test", MODULE)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
