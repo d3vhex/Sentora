@@ -283,18 +283,19 @@ def test_the_agents_database_is_not_published_to_the_world():
 
 
 # --------------------------------------------------------------------------
-# The server has to be able to reach the agent it just installed
+# The installer closes the agent port instead of opening it
 # --------------------------------------------------------------------------
 #
-# The agent listens on 0.0.0.0:9099 and the server calls it there for config
-# reads, SOAR dispatch and the screen stream. Windows blocks inbound
-# connections to a program that has not been allowed, and the prompt that
-# normally asks cannot appear: the agent runs as SYSTEM in session 0, which
-# has no desktop to show it on.
+# The agent used to listen on 0.0.0.0:9099 and the server called it there for
+# config reads, SOAR dispatch and the screen stream, so both installers opened
+# an inbound hole for it. Windows blocks inbound connections to a program that
+# has not been allowed, and the prompt that normally asks cannot appear for a
+# SYSTEM process in session 0 - so the port stayed shut with nothing saying so,
+# and every call in returned `Connection refused` against a listening process.
 #
-# So the port stayed shut with nothing anywhere saying so, and every call in
-# returned `Connection refused` against a process that was listening - which
-# reads as a broken agent rather than a closed port.
+# The agent now opens the connection itself and the server answers over it.
+# Nothing reaches in, the listener binds to loopback, and the rule has nothing
+# left to permit.
 
 def _windows_script() -> str:
     from core import installers
@@ -302,35 +303,27 @@ def _windows_script() -> str:
         "http://sentora.example", "10.0.0.1", "t" * 64)
 
 
-def test_the_windows_installer_opens_the_agent_port():
+def test_the_windows_installer_opens_no_inbound_rule():
+    """An open management port on every endpoint, kept alive by history."""
     script = _windows_script()
-    assert "New-NetFirewallRule" in script
-    assert "9099" in script
+    assert "New-NetFirewallRule" not in script
 
 
-def test_the_rule_is_scoped_rather_than_wide_open():
-    """The listener requires X-Agent-Key on every route, but a firewall rule
-    is a second thing that has to be wrong before an endpoint's management API
-    is reachable from a coffee shop network."""
+def test_the_windows_installer_removes_an_older_one():
+    """Not creating the rule is not enough: a host installed by an earlier
+    build still has the hole, and an upgrade that steps over it leaves the
+    port open on nothing but the fact that it used to be needed."""
     script = _windows_script()
-    assert "-Protocol TCP" in script
-    assert "-Direction Inbound" in script
-    # Scoped by remote address, not by profile. Windows classifies the
-    # Hyper-V / WSL adapter that Docker Desktop's traffic arrives on as
-    # Public, so a `-Profile Domain,Private` rule does not apply to exactly
-    # the case it was added for - and sits there looking correct.
-    assert "-RemoteAddress" in script
-    for net in ("LocalSubnet", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"):
-        assert net in script, f"{net} missing from the rule's scope"
-    assert "0.0.0.0/0" not in script, "the rule must not be open to any address"
+    assert "Remove-NetFirewallRule" in script
+    assert "Sentora Agent API" in script
 
 
-def test_a_failed_rule_is_reported_not_swallowed():
-    """Telemetry is agent-initiated and keeps flowing either way. What breaks
-    is the server calling in, so the difference between "the agent is down"
-    and "the port is shut" has to be visible at install time."""
+def test_a_failed_removal_is_reported_not_swallowed():
+    """Nothing breaks if it fails, which is exactly why it has to be said out
+    loud - the host is left more open than this build intends, and only
+    someone reading that line will know to close it."""
     script = _windows_script()
-    assert "Could not add the firewall rule" in script
+    assert "Could not remove the old firewall rule" in script
 
 
 def test_uninstall_removes_the_rule():
@@ -342,13 +335,12 @@ def test_uninstall_removes_the_rule():
 
 
 # --------------------------------------------------------------------------
-# The same asymmetry on Linux
+# The same on Linux
 # --------------------------------------------------------------------------
 #
-# The Windows installer opens 9099 because the port stayed shut and every
-# server-to-agent call came back `Connection refused` against a listening
-# process. A Linux host running ufw has the identical failure and the
-# installer said nothing about it. The asymmetry was an accident.
+# Both installers opened the port and both now close it. The asymmetry that
+# existed before - Windows opening it while a ufw host silently dropped every
+# call - was an accident, and so would be fixing only one of them now.
 
 def _linux_script() -> str:
     from core import installers
@@ -356,33 +348,33 @@ def _linux_script() -> str:
         "http://sentora.example", "10.0.0.1", "t" * 64)
 
 
-def test_the_linux_installer_opens_the_agent_port():
+def test_the_linux_installer_opens_no_inbound_rule():
     script = _linux_script()
-    assert "ufw allow from" in script
-    assert "9099" in script
+    assert "ufw allow from" not in script
+
+
+def test_the_linux_installer_removes_an_older_one():
+    """Same reason as Windows: the hole outlives the need for it."""
+    script = _linux_script()
+    assert "ufw delete allow from" in script
+    for net in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"):
+        assert net in script, f"{net} would be left allowed"
 
 
 def test_it_only_touches_a_firewall_that_is_running():
-    """Adding rules to an inactive ufw enables nothing, and running `ufw` on a
-    host that does not use it is noise in someone else's configuration."""
+    """Running `ufw` on a host that does not use it is noise in someone
+    else's configuration - and `ufw status` on an inactive firewall says
+    nothing useful to grep."""
     script = _linux_script()
     assert "command -v ufw" in script
     assert "Status: active" in script
 
 
-def test_the_linux_rule_is_scoped_to_private_networks():
+def test_a_rule_left_behind_is_reported_not_assumed():
+    """A rule this installer did not add can still be allowing 9099. Nothing
+    breaks, so nothing else will ever mention it."""
     script = _linux_script()
-    for net in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"):
-        assert net in script, f"{net} missing from the ufw scope"
-    assert "ufw allow 9099" not in script, "the rule must not be open to any address"
-
-
-def test_a_firewall_failure_is_reported_not_assumed():
-    """Telemetry is agent-initiated and keeps flowing either way. What breaks
-    is the server calling in, so the difference between "the agent is down"
-    and "the port is shut" has to be visible at install time."""
-    script = _linux_script()
-    assert "Could not confirm the ufw rule" in script
+    assert "Inbound 9099 is still allowed" in script
 
 
 def test_the_installer_scripts_stay_lf_only():

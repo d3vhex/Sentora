@@ -330,6 +330,65 @@ def purge_ai_cache(agent: str) -> int:
     except Exception:
         return 0
 
+def _bring_table_up_to_date(cursor, table: str, *, columns=(), indexes=(),
+                            modify=()) -> None:
+    """Apply only the DDL this table is actually missing.
+
+    These migrations exist because `CREATE TABLE IF NOT EXISTS` leaves an
+    older table exactly as it is, so a worker that has run before never gains
+    a new column. That part was right. What was wrong is where they ran: on
+    every cache write and every results write, unconditionally, seventeen
+    statements at a time, each one failing with a duplicate-column error
+    behind `except Exception: pass`.
+
+    Silence made it look free. It is not. MySQL takes a metadata lock for an
+    ALTER whether or not the statement changes anything, and a lock taken at
+    write frequency queues behind any open transaction on the table - at
+    which point it blocks every reader that arrives after it. That is the
+    failure that took `/automations/pending` down, and `db/init.sql` had the
+    same shape until the guarded `_migrate_*` functions replaced it.
+
+    information_schema costs nothing and takes no lock, so a table that is
+    already correct does nothing at all. What is missing goes in one ALTER,
+    because MySQL rebuilds per statement.
+
+    `columns` and `indexes` are (name, ddl) pairs; `modify` is
+    (column, expected_type_fragment, ddl) for a column whose type must change.
+    """
+    cursor.execute(
+        "SELECT column_name, column_type FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = %s", (table,))
+    present = {str(r[0]).lower(): str(r[1]).lower() for r in cursor.fetchall()}
+    if not present:
+        return                      # no table yet; the CREATE above made it right
+
+    cursor.execute(
+        "SELECT index_name FROM information_schema.statistics "
+        "WHERE table_schema = DATABASE() AND table_name = %s", (table,))
+    have_index = {str(r[0]).lower() for r in cursor.fetchall()}
+
+    pending = [ddl for name, ddl in columns if name.lower() not in present]
+    pending += [ddl for name, ddl in indexes if name.lower() not in have_index]
+    pending += [ddl for name, expected, ddl in modify
+                if name.lower() in present
+                and expected.lower() not in present[name.lower()]]
+    if not pending:
+        return
+
+    try:
+        # Never wait on the lock. The next write tries again, and blocking
+        # here stalls whatever is reading the table.
+        cursor.execute("SET SESSION lock_wait_timeout = 3")
+        cursor.execute(f"ALTER TABLE {table} {', '.join(pending)}")
+        print(f"[ai] {table}: applied {len(pending)} pending schema change(s)",
+              flush=True)
+    except Exception as e:
+        # Reported, not swallowed. A column that never appears turns into a
+        # failing INSERT somewhere else entirely, which is how the previous
+        # version of this hid.
+        print(f"[ai] {table}: schema update failed ({e}); will retry", flush=True)
+
+
 # Purging on every write would be a DELETE per inference. Once every N writes
 # keeps the table bounded without that cost.
 _PURGE_EVERY = 50
@@ -358,14 +417,16 @@ def set_ai_cache(agent: str, prompt_hash: str, response: str):
                         INDEX idx_created (created_at)
                     )
                 """)
-                for ddl in (
-                    "ALTER TABLE ai_cache MODIFY COLUMN prompt_hash CHAR(64) NOT NULL",
-                    "ALTER TABLE ai_cache ADD INDEX idx_created (created_at)",
-                ):
-                    try:
-                        cursor.execute(ddl)
-                    except Exception:
-                        pass  # already migrated
+                _bring_table_up_to_date(
+                    cursor, "ai_cache",
+                    indexes=(("idx_created", "ADD INDEX idx_created (created_at)"),),
+                    # CHAR(32) was MD5; the key is SHA-256 with the prompt
+                    # version appended. On a table an older worker created,
+                    # every write would silently truncate and the cache would
+                    # stop matching anything it had stored.
+                    modify=(("prompt_hash", "char(64)",
+                             "MODIFY COLUMN prompt_hash CHAR(64) NOT NULL"),),
+                )  # already migrated
                 cursor.execute(
                     "INSERT INTO ai_cache (prompt_hash, response) VALUES (%s, %s) "
                     "ON DUPLICATE KEY UPDATE response=VALUES(response), created_at=NOW()",
@@ -459,8 +520,14 @@ def save_ai_results(agent: str, results: list):
                         model VARCHAR(64) NULL,
                         prompt_version VARCHAR(16) NULL,
                         payload JSON NULL,
+                        -- In the CREATE as well as in the migration below.
+                        -- The INSERT names this column, so a fresh database
+                        -- was relying on the migration having run first for
+                        -- its very first write to work.
+                        fingerprint CHAR(64) NULL,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         INDEX idx_air_verdict (verdict),
+                        INDEX idx_air_fp (fingerprint),
                         INDEX idx_air_created (created_at)
                     )
                 """)
@@ -471,31 +538,32 @@ def save_ai_results(agent: str, results: list):
                 # used to exist only inside the rendered `critical_summary`
                 # string, so the UI parsed them back out with a regex and no
                 # query could filter on them.
-                for ddl in (
-                    "ALTER TABLE ai_analysis_results ADD COLUMN source_data LONGTEXT NULL",
-                    "ALTER TABLE ai_analysis_results ADD COLUMN proposed_action VARCHAR(64) NULL",
-                    "ALTER TABLE ai_analysis_results ADD COLUMN proposed_target VARCHAR(512) NULL",
-                    "ALTER TABLE ai_analysis_results ADD COLUMN shadow_status VARCHAR(16) NULL",
-                    "ALTER TABLE ai_analysis_results ADD COLUMN shadow_decided_at DATETIME NULL",
-                    "ALTER TABLE ai_analysis_results ADD COLUMN shadow_decided_by VARCHAR(128) NULL",
-                    "ALTER TABLE ai_analysis_results ADD COLUMN verdict VARCHAR(24) NULL",
-                    "ALTER TABLE ai_analysis_results ADD COLUMN severity VARCHAR(16) NULL",
-                    "ALTER TABLE ai_analysis_results ADD COLUMN confidence DECIMAL(4,3) NULL",
-                    "ALTER TABLE ai_analysis_results ADD COLUMN model VARCHAR(64) NULL",
-                    "ALTER TABLE ai_analysis_results ADD COLUMN prompt_version VARCHAR(16) NULL",
-                    "ALTER TABLE ai_analysis_results ADD COLUMN payload JSON NULL",
-                    # Links a verdict back to the ai_dedup counter, so repeats
-                    # of the same event attach to this insight instead of
-                    # producing another inference.
-                    "ALTER TABLE ai_analysis_results ADD COLUMN fingerprint CHAR(64) NULL",
-                    "ALTER TABLE ai_analysis_results ADD INDEX idx_air_fp (fingerprint)",
-                    "ALTER TABLE ai_analysis_results ADD INDEX idx_air_verdict (verdict)",
-                    "ALTER TABLE ai_analysis_results ADD INDEX idx_air_created (created_at)",
-                ):
-                    try:
-                        cursor.execute(ddl)
-                    except Exception:
-                        pass
+                _bring_table_up_to_date(
+                    cursor, "ai_analysis_results",
+                    columns=(
+                        ("source_data", "ADD COLUMN source_data LONGTEXT NULL"),
+                        ("proposed_action", "ADD COLUMN proposed_action VARCHAR(64) NULL"),
+                        ("proposed_target", "ADD COLUMN proposed_target VARCHAR(512) NULL"),
+                        ("shadow_status", "ADD COLUMN shadow_status VARCHAR(16) NULL"),
+                        ("shadow_decided_at", "ADD COLUMN shadow_decided_at DATETIME NULL"),
+                        ("shadow_decided_by", "ADD COLUMN shadow_decided_by VARCHAR(128) NULL"),
+                        ("verdict", "ADD COLUMN verdict VARCHAR(24) NULL"),
+                        ("severity", "ADD COLUMN severity VARCHAR(16) NULL"),
+                        ("confidence", "ADD COLUMN confidence DECIMAL(4,3) NULL"),
+                        ("model", "ADD COLUMN model VARCHAR(64) NULL"),
+                        ("prompt_version", "ADD COLUMN prompt_version VARCHAR(16) NULL"),
+                        ("payload", "ADD COLUMN payload JSON NULL"),
+                        # Links a verdict back to the ai_dedup counter, so
+                        # repeats of the same event attach to this insight
+                        # instead of producing another inference.
+                        ("fingerprint", "ADD COLUMN fingerprint CHAR(64) NULL"),
+                    ),
+                    indexes=(
+                        ("idx_air_fp", "ADD INDEX idx_air_fp (fingerprint)"),
+                        ("idx_air_verdict", "ADD INDEX idx_air_verdict (verdict)"),
+                        ("idx_air_created", "ADD INDEX idx_air_created (created_at)"),
+                    ),
+                )
                 for res in results:
                     cursor.execute(
                         """
