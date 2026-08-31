@@ -161,33 +161,33 @@ else
   exit 1
 fi
 
-# ── let the server reach the agent's API ─────────────────────────────────────
-# The agent listens on 0.0.0.0:9099 and the server calls it there for config
-# reads, SOAR dispatch and the screen stream. A host running ufw drops that,
-# and the symptom is a `Connection refused` against a process that is plainly
-# listening - which reads as a broken agent rather than a closed port.
+# ── close the inbound rule, don't open one ───────────────────────────────────
+# This used to open inbound 9099 from private networks, because the server
+# reached the agent by dialling that port and a host running ufw dropped the
+# call - a `Connection refused` against a process that is plainly listening,
+# which reads as a broken agent rather than a closed port.
 #
-# Only when a firewall is actually active: adding rules to an inactive ufw
-# quietly enables nothing, and running `ufw allow` on a host that does not use
-# ufw is noise in someone else's configuration.
+# The agent now opens the connection instead and the server answers over it,
+# so nothing needs to reach in, and the listener binds to loopback.
 #
-# Scoped to private networks. The listener requires X-Agent-Key on every
-# route, but a firewall rule is a second thing that has to be wrong before an
-# endpoint's management API is reachable from anywhere.
+# The rule is deleted rather than merely not created. A host installed by an
+# earlier build still has it, and an upgrade that leaves it behind keeps an
+# open management port alive on nothing but history.
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-  echo "[*] ufw is active - allowing inbound 9099 from private networks..."
+  removed=0
   for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
-    ufw allow from "$net" to any port 9099 proto tcp >/dev/null 2>&1 || true
+    if ufw status | grep -q "9099.*$net"; then
+      ufw delete allow from "$net" to any port 9099 proto tcp >/dev/null 2>&1 && removed=1
+    fi
   done
+  if [ "$removed" = "1" ]; then
+    echo "[+] Firewall: removed the inbound rule for 9099 - the agent dials out now."
+  fi
   if ufw status | grep -q "9099"; then
-    echo "[+] Firewall: inbound TCP 9099 allowed from private networks."
-  else
-    # Not fatal - telemetry is agent-initiated and keeps flowing. What breaks
-    # is the server calling in, so this has to be visible rather than assumed.
-    echo "[!] Could not confirm the ufw rule for 9099."
-    echo "    The agent will still send telemetry, but the server cannot reach"
-    echo "    it for config, SOAR or the screen stream. Add it by hand:"
-    echo "    ufw allow from 192.168.0.0/16 to any port 9099 proto tcp"
+    # Nothing breaks, but the host is left more open than this build intends,
+    # and only someone reading this line will know to close it.
+    echo "[!] Inbound 9099 is still allowed by a rule this installer did not add."
+    echo "    Close it by hand:  ufw status numbered  then  ufw delete <n>"
   fi
 fi
 
@@ -479,52 +479,34 @@ def _render_windows_install(server_url: str, server_ip: str, token: str) -> str:
         $exePath  = Join-Path $InstallDir "main.exe"
         $workDir  = $InstallDir
 
-        # Let the server reach the agent's API.
+        # Take the inbound rule away rather than adding one.
         #
-        # The agent listens on 0.0.0.0:9099 and the server calls it there for
-        # config reads, SOAR dispatch and the screen stream. Windows blocks
-        # inbound connections to a program that has not been allowed, and the
-        # prompt that would normally ask cannot appear here: the agent runs as
-        # SYSTEM in session 0, which has no desktop to show it on. So the port
-        # stayed shut with nothing anywhere saying so - every server-to-agent
-        # call came back `Connection refused` against a process that was
-        # listening, which reads as a broken agent rather than a closed port.
+        # This used to open TCP 9099 from private networks, because the server
+        # reached the agent by dialling that port. Windows blocks inbound
+        # connections to a program that has not been allowed, and the prompt
+        # that would normally ask cannot appear for a SYSTEM process in
+        # session 0 - so the port stayed shut with nothing saying so, and
+        # every server-to-agent call came back `Connection refused` against a
+        # process that was plainly listening.
         #
-        # Scoped by remote address, not by network profile.
-        #
-        # `-Profile Domain,Private` is the obvious way to write this and it
-        # does not work where it is most needed: Windows classifies the
-        # Hyper-V / WSL virtual adapter - the one Docker Desktop's traffic
-        # arrives on - as Public. A profile-scoped rule therefore does not
-        # apply to it, and the port stays shut with a rule sitting there
-        # looking correct.
-        #
-        # Remote address is the property actually being reasoned about, and it
-        # does not depend on how Windows happened to classify an adapter. The
-        # listener requires X-Agent-Key on every route regardless; this is the
-        # second thing that has to be wrong before an endpoint's management API
-        # is reachable from a coffee shop network.
-        $agentPort = 9099
+        # The agent now opens the connection and the server answers over it,
+        # so the rule has nothing left to permit. Removing it matters more
+        # than not creating it: a host installed by an earlier build still has
+        # the hole, and an upgrade that leaves it behind is an open management
+        # port kept alive by nothing but history.
         try {{
-            Get-NetFirewallRule -DisplayName "Sentora Agent API" -ErrorAction SilentlyContinue |
-                Remove-NetFirewallRule -ErrorAction SilentlyContinue
-            New-NetFirewallRule -DisplayName "Sentora Agent API" `
-                -Direction Inbound -Action Allow -Protocol TCP `
-                -LocalPort $agentPort -Profile Any `
-                -RemoteAddress LocalSubnet,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16 `
-                -Program $exePath `
-                -Description "Lets the Sentora server reach this agent's API." | Out-Null
-            Write-Host "[+] Firewall: inbound TCP $agentPort allowed from private networks." -ForegroundColor Green
+            $existing = Get-NetFirewallRule -DisplayName "Sentora Agent API" -ErrorAction SilentlyContinue
+            if ($existing) {{
+                $existing | Remove-NetFirewallRule -ErrorAction Stop
+                Write-Host "[+] Firewall: removed the inbound rule for TCP 9099 — the agent dials out now." -ForegroundColor Green
+            }}
         }} catch {{
-            # Not fatal: telemetry is agent-initiated and keeps flowing. What
-            # breaks is the server calling *in*, so this must be visible rather
-            # than swallowed - it is the difference between "the agent is down"
-            # and "the port is shut".
-            Write-Host "[!] Could not add the firewall rule: $($_.Exception.Message)" -ForegroundColor Yellow
-            Write-Host "    The agent will still send telemetry, but the server" -ForegroundColor Yellow
-            Write-Host "    cannot reach it for config, SOAR or the screen stream." -ForegroundColor Yellow
-            Write-Host "    Add it by hand:" -ForegroundColor Yellow
-            Write-Host "    New-NetFirewallRule -DisplayName 'Sentora Agent API' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $agentPort -Profile Any -RemoteAddress LocalSubnet,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16" -ForegroundColor Yellow
+            # Worth saying out loud. Nothing breaks, but the host is left more
+            # open than this build intends and only someone reading this line
+            # will know to close it.
+            Write-Host "[!] Could not remove the old firewall rule: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "    Inbound TCP 9099 may still be allowed. Remove it by hand:" -ForegroundColor Yellow
+            Write-Host "    Get-NetFirewallRule -DisplayName 'Sentora Agent API' | Remove-NetFirewallRule" -ForegroundColor Yellow
         }}
 
         # Remove legacy sc.exe service if it exists from a previous install
