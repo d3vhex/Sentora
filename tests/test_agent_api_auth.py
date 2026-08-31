@@ -1,138 +1,181 @@
-"""Every route on the agent's listener requires a key, and self-destruct
-requires this agent's own key.
+"""The agent has no inbound surface at all, and the channel that replaced it
+is authenticated with this agent's own key.
 
-The agent runs as SYSTEM or root. It binds loopback now, but it bound
-0.0.0.0:9099 when these were written and `AGENT_BIND` can put it back there,
-so the routes have to hold on their own. Three had no authentication at all:
+This file used to test the agent's HTTP listener. Three of its routes had no
+authentication whatsoever:
 
     curl -X POST http://<endpoint>:9099/self_destruct
 
-removed the EDR from the host. Tamper resistance is the property a security
-agent exists to have, and this was the first step of any intrusion reduced to
-one request from anywhere on the network.
+removed the EDR from the host, and `/soar/execute` with
+`{"action": "run_cmd", ...}` was remote code execution as SYSTEM, fleet-wide,
+because a permissive branch accepted any non-empty key whenever
+AGENT_MASTER_SECRET was unset - which nothing in this repository ever set.
 
-Every other route was reachable too. `_is_permissive_auth` accepted any
-non-empty `X-Agent-Key` whenever `AGENT_MASTER_SECRET` was unset on the host,
-and nothing in this repository ever set it - not the installer, not the
-scheduled task, not the systemd unit. So `/soar/execute` with
-`{"action":"run_cmd"}` was fleet-wide unauthenticated RCE, and `/config`
-could switch detection off first.
+Those were fixed by authenticating the routes. The listener is now gone
+instead, which is the stronger version of the same fix: there is no port to
+knock on, no firewall rule to get right, and no key check that can regress.
 
-These parse main.py rather than importing it: the module starts collectors and
-opens a database on import.
+What has to be pinned is that it stays gone, and that the properties those
+route checks carried now hold on the channel - which is authenticated once,
+on the server, when the agent dials in.
 """
-from __future__ import annotations
 
 import ast
 import pathlib
 
 import pytest
 
-MAIN = pathlib.Path(__file__).resolve().parent.parent / "Sentora" / "main.py"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+MAIN = ROOT / "Sentora" / "main.py"
+APP = ROOT / "app.py"
 SRC = MAIN.read_text(encoding="utf-8")
 TREE = ast.parse(SRC)
 
 
-def _routes():
-    out = {}
+
+def _code_only(path) -> str:
+    """A Python file's code, with comments and docstrings removed.
+
+    These assertions are "this construct is gone", and the note left behind
+    when something is removed almost always names what it replaced - so
+    matching the raw file reads the explanation as the code. That has caught
+    us out repeatedly, always the same way.
+    """
+    tree = ast.parse(pathlib.Path(path).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.FunctionDef,
+                                 ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        body = node.body
+        if (body and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            del body[0]
+    return ast.unparse(tree)
+
+
+# The notes left where the listener was name every construct removed with it.
+CODE = _code_only(MAIN)
+
+
+# --------------------------------------------------------------------------
+# There is nothing listening
+# --------------------------------------------------------------------------
+
+def test_the_agent_serves_no_routes():
+    routes = []
     for node in ast.walk(TREE):
         if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
             continue
         for dec in node.decorator_list:
             d = ast.unparse(dec)
-            if ".route(" in d or ".post(" in d or ".get(" in d or ".websocket(" in d:
-                out[node.name] = (d, node)
-                break
-    return out
-
-
-ROUTES = _routes()
-
-# /health answers liveness without a key and discloses nothing without one.
-UNAUTHENTICATED_BY_DESIGN = {"health"}
-
-
-def test_the_scan_sees_the_routes():
-    assert len(ROUTES) >= 7, f"only found {sorted(ROUTES)}; the scan is broken"
-
-
-@pytest.mark.parametrize("name", sorted(set(ROUTES) - UNAUTHENTICATED_BY_DESIGN))
-def test_every_route_authenticates(name):
-    _decorator, node = ROUTES[name]
-    body = ast.unparse(node)
-    assert "_check_auth_header" in body or "_ws_authorized" in body, (
-        f"{name} has no authentication, so it is open to anything on the host "
-        f"and to the network wherever AGENT_BIND is set wide"
+            if any(m in d for m in (".route(", ".post(", ".get(", ".websocket(")):
+                routes.append(node.name)
+    assert not routes, (
+        f"{sorted(routes)} are reachable on the endpoint; the whole point is "
+        f"that nothing is"
     )
 
 
-def test_the_listener_binds_to_loopback_by_default():
-    """The port was on 0.0.0.0 because the server dialled it. It does not any
-    more - every route here has a channel equivalent - so an open management
-    API on every endpoint is exposure with nothing left to justify it.
-
-    `AGENT_BIND` is still the way back, which is what makes this a default
-    rather than a removal.
-    """
-    source = MAIN.read_text(encoding="utf-8")
-    assert 'os.getenv("AGENT_BIND", "127.0.0.1")' in source, (
-        "the agent still offers its management API to the network by default"
-    )
+def test_the_agent_serves_nothing():
+    for gone in ("app.run(", "AGENT_BIND", "Sanic("):
+        assert gone not in CODE, f"{gone} is back; the endpoint is listening again"
 
 
-def test_binding_wide_is_called_out_at_startup():
-    """Someone who sets it should not have to infer what they have done.
+def test_the_only_socket_left_is_the_instance_mutex():
+    """Not "no socket at all" - the claim has to be exact, because it is a
+    security claim. `acquire_single_instance_lock` binds 127.0.0.1:9098 and
+    never accepts on it: the bind failing is the whole signal, and it exists
+    because the installer's watchdog task would otherwise start a second
+    agent every fifteen minutes."""
+    tree = ast.parse(CODE)
+    binds = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Attribute) and n.attr == "bind"]
+    assert len(binds) == 1, f"{len(binds)} sockets are bound, expected the mutex only"
 
-    Matched against the source rather than the AST: the message is written as
-    adjacent f-string literals, so no single constant holds the sentence.
-    """
-    source = MAIN.read_text(encoding="utf-8")
-    assert "[!] Agent API on" in source, (
-        "binding to the network is announced the same way as binding to "
-        "loopback, so nothing distinguishes them in the log"
-    )
-    assert "exposure without a purpose" in source
+    lock = next(ast.unparse(n) for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef)
+                and n.name == "acquire_single_instance_lock")
+    assert "'127.0.0.1'" in lock, "the mutex socket is not confined to loopback"
+    assert "accept" not in lock, "a mutex that accepts connections is a service"
 
 
-def test_self_destruct_requires_this_agents_own_key():
-    """Not the fleet-wide master secret.
+def test_the_web_stack_is_out_of_the_binary():
+    """A dependency that ships is a dependency that can be reached. Leaving
+    sanic in the build would keep the attack surface in the binary even with
+    no route pointing at it."""
+    for build in ("build_agent.ps1", "build_agent.sh"):
+        text = (ROOT / "Sentora" / build).read_text(encoding="utf-8")
+        code = "\n".join(l for l in text.splitlines()
+                         if not l.strip().startswith("#"))
+        assert "sanic" not in code, f"{build} still bundles sanic"
+    requirements = (ROOT / "Sentora" / "requirements.txt").read_text(encoding="utf-8")
+    assert "sanic" not in requirements
 
-    The server holds the per-agent key and sends it first, so nothing
-    legitimate breaks - but a leaked master secret can no longer uninstall
-    every endpoint at once.
-    """
-    body = ast.unparse(ROUTES["self_destruct"][1])
-    assert "enrolment_key_only=True" in body
+
+def test_no_inbound_auth_remains_to_regress():
+    """These guarded the listener. Keeping them without it would leave a
+    check that looks load-bearing and protects nothing."""
+    for gone in ("_check_auth_header", "_ws_authorized", "_accepted_auth_tokens"):
+        assert f"def {gone}" not in CODE
 
 
 def test_permissive_auth_is_gone():
     """It accepted any non-empty key and was on by default."""
-    assert "def _is_permissive_auth" not in SRC
-    fn = next(n for n in ast.walk(TREE)
-              if isinstance(n, ast.FunctionDef) and n.name == "_check_auth_header")
-    body = ast.unparse(fn)
-    assert "permissive" not in body.lower()
+    assert "_is_permissive_auth" not in CODE
 
 
-def test_auth_comparison_is_timing_safe():
-    fn = next(n for n in ast.walk(TREE)
-              if isinstance(n, ast.FunctionDef) and n.name == "_timing_safe_in")
-    assert "compare_digest" in ast.unparse(fn)
+# --------------------------------------------------------------------------
+# What the route checks used to carry, the channel carries now
+# --------------------------------------------------------------------------
+
+def _app_function(name: str) -> str:
+    tree = ast.parse(APP.read_text(encoding="utf-8"))
+    return next(ast.unparse(n) for n in ast.walk(tree)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and n.name == name)
 
 
-def test_an_empty_key_is_never_accepted():
-    """`accepted` can legitimately be empty before enrolment completes; an
-    empty header must not match an empty set."""
-    fn = next(n for n in ast.walk(TREE)
-              if isinstance(n, ast.FunctionDef) and n.name == "_check_auth_header")
-    body = ast.unparse(fn)
-    assert "if srv_key and accepted" in body
+def test_the_channel_refuses_the_fleet_wide_secret():
+    """`/self_destruct` rides this channel, so a leaked master key must not be
+    able to open one against every endpoint at once. The route this replaces
+    said the same thing with `enrolment_key_only=True`."""
+    code = _app_function("_validate_agent_auth_sync")
+    assert "agent_identities" in code
+    assert "agent_key=%s" in code
+    assert "revoked_at IS NULL" in code, "a revoked identity could still dial in"
 
 
-def test_health_discloses_nothing_without_a_key():
-    """It used to hand out the SIEM server address, port and API base to
-    anyone on the network - a map of the security infrastructure."""
-    body = ast.unparse(ROUTES["health"][1])
-    assert "_check_auth_header" in body
-    # the unauthenticated branch returns before the detail dict
-    assert body.index("_check_auth_header") < body.index("SERVER_IP")
+def test_an_unauthenticated_channel_is_closed_not_served():
+    code = _app_function("agent_link_socket")
+    assert "_validate_agent_auth_sync" in code
+    assert code.index("_validate_agent_auth_sync") < code.index("AgentLink("), \
+        "the link is registered before the caller is identified"
+    assert "1008" in code, "an unauthorised socket should be closed, not left open"
+
+
+def test_the_master_secret_is_not_accepted_as_an_agent():
+    """`*` is what the wider validator returns for the fleet key. Treating it
+    as an agent name would register one link standing for every endpoint."""
+    code = _app_function("agent_link_socket")
+    assert "agent == '*'" in code or 'agent == "*"' in code
+
+
+@pytest.mark.parametrize("command", ["/self_destruct", "/restart", "/soar/execute"])
+def test_the_destructive_commands_only_exist_behind_the_channel(command):
+    """They are dispatched, not routed. The dispatcher is only reachable from
+    a socket that has already been identified."""
+    dispatch = next(
+        ast.unparse(n) for n in ast.walk(TREE)
+        if isinstance(n, ast.FunctionDef) and n.name == "dispatch_channel_request")
+    assert command in dispatch
+
+
+def test_health_no_longer_hands_out_a_map_of_the_infrastructure():
+    """It used to return the SIEM server address, port and API base to anyone
+    on the network without a key. Now the only caller that can ask is one that
+    already authenticated to open a channel."""
+    dispatch = next(
+        ast.unparse(n) for n in ast.walk(TREE)
+        if isinstance(n, ast.FunctionDef) and n.name == "dispatch_channel_request")
+    assert "/health" in dispatch

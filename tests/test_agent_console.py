@@ -15,6 +15,7 @@ The PTY itself only exists on Linux, so its behaviour is exercised there and
 the module's shape - framing, limits, refusals - is checked everywhere.
 """
 
+import ast
 import importlib.util
 import json
 import os
@@ -169,11 +170,41 @@ def test_a_dead_shell_says_why(console):
     assert "argv was" in drain, "the reason should name what was launched"
 
 
+def _code_only(path) -> str:
+    """A Python file's code, with comments and docstrings removed.
+
+    These assertions are "this construct is gone", and the note left behind
+    when something is removed almost always names what it replaced - so
+    matching the raw file reads the explanation as the code. That has caught
+    us out repeatedly, always the same way.
+    """
+    tree = ast.parse(pathlib.Path(path).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.FunctionDef,
+                                 ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        body = node.body
+        if (body and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            del body[0]
+    return ast.unparse(tree)
+
+
+def _console_stream() -> str:
+    """`_ConsoleStream` from the agent, which is the whole console now.
+
+    There was a `/console/ws` route beside it doing the same job over the
+    agent's own listener. The listener is gone; this is the only path.
+    """
+    import ast
+    tree = ast.parse((ROOT / "Sentora" / "main.py").read_text(encoding="utf-8"))
+    return next(ast.unparse(n) for n in ast.walk(tree)
+                if isinstance(n, ast.ClassDef) and n.name == "_ConsoleStream")
+
+
 def test_the_reason_reaches_the_browser():
-    main = (ROOT / "Sentora" / "main.py").read_text(encoding="utf-8")
-    block = main[main.index('@app.websocket("/console/ws")'):]
-    block = block[:block.index('@app.websocket("/screen/ws")')]
-    assert "exit_reason" in block
+    assert "exit_reason" in _console_stream()
 
 
 def test_the_shell_does_not_start_in_the_system_profile():
@@ -320,7 +351,7 @@ def test_the_agent_routes_the_helper_flag_before_anything_starts():
     """It must not take the single-instance lock or start a collector."""
     main = (ROOT / "Sentora" / "main.py").read_text(encoding="utf-8")
     block = main[main.index('if "--console-helper" in sys.argv:'):]
-    block = block[:block.index("app.config.AUTO_RELOAD")]
+    block = block[:block.rindex("    main()")]
     assert "console_helper_main" in block
 
 
@@ -443,9 +474,9 @@ def test_a_real_terminal_says_so_without_a_warning(console):
 
 
 def test_the_mode_is_sent_before_any_output():
-    main = (ROOT / "Sentora" / "main.py").read_text(encoding="utf-8")
-    block = main[main.index('@app.websocket("/console/ws")'):]
-    block = block[:block.index('@app.websocket("/screen/ws")')]
+    """A pipe-backed shell renders nothing as you type, so the browser has to
+    know which it is driving before the first keystroke rather than after."""
+    block = _console_stream()
     assert "encode_mode" in block
     assert block.index("encode_mode") < block.index("encode_output")
 
@@ -660,22 +691,38 @@ def _source(rel: str) -> str:
     return (ROOT / rel).read_text(encoding="utf-8")
 
 
-def test_the_agent_endpoint_requires_authentication():
-    main = _source("Sentora/main.py")
-    block = main[main.index('@app.websocket("/console/ws")'):]
-    block = block[:block.index('@app.websocket("/screen/ws")')]
-    assert "_ws_authorized(request)" in block
-    assert "1008" in block, "an unauthorised console must be refused, not opened"
+def test_there_is_no_console_endpoint_to_authenticate():
+    """`/console/ws` took an `X-Agent-Key` or a `?key=` on the query string,
+    because a browser cannot set headers on a handshake - a secret in proxy
+    access logs and browser history, guarding a root shell on port 9099.
+
+    It is not better-authenticated now. It does not exist. A console is only
+    reachable through a channel the agent opened and the server already
+    identified.
+    """
+    code = _code_only(ROOT / "Sentora" / "main.py")
+    assert "/console/ws" not in code
+    assert "_ws_authorized" not in code
+
+    stream = next(ast.unparse(n) for n in ast.walk(ast.parse(code))
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == "open_channel_stream")
+    assert "_ConsoleStream()" in stream
 
 
 def test_the_agent_always_tears_the_session_down():
     """Every exit path. A shell left running with nobody attached is the worst
-    outcome this endpoint has."""
-    main = _source("Sentora/main.py")
-    block = main[main.index('@app.websocket("/console/ws")'):]
-    block = block[:block.index('@app.websocket("/screen/ws")')]
-    assert "finally:" in block
-    assert "close_active" in block
+    outcome the console has - one per host, so the next request is refused as
+    a duplicate of a session nobody can reach."""
+    assert "close_active" in _console_stream()
+
+    # link.py drives it, and it must close from a `finally` - the pump ends
+    # when the shell exits on its own just as often as when the viewer leaves.
+    link = (ROOT / "Sentora" / "modules" / "link.py").read_text(encoding="utf-8")
+    opener = link[link.index("def _open_stream"):]
+    opener = opener[:opener.index("def _close_stream")]
+    assert "finally:" in opener
+    assert "_close_stream" in opener
 
 
 def test_the_proxy_is_gated_by_the_permission_that_governs_run_cmd():
@@ -688,18 +735,29 @@ def test_the_proxy_is_gated_by_the_permission_that_governs_run_cmd():
     assert 'require_permission("manage_soar")' in block
 
 
+def _console_proxy_body() -> str:
+    app = _source("app.py")
+    block = app[app.index("async def console_proxy"):]
+    return block[:block.index("async def _relay_channel_stream")]
+
+
 def test_opening_a_console_is_audited():
     """Audited on open rather than on close: a session that ends because the
     server died would otherwise leave no record that it happened."""
-    app = _source("app.py")
-    block = app[app.index("async def console_proxy"):]
-    block = block[:block.index("async def _console_relay")]
-    assert "CONSOLE_OPEN" in block
+    assert "CONSOLE_OPEN" in _console_proxy_body()
 
 
-def test_the_proxy_tries_every_known_address():
-    app = _source("app.py")
-    block = app[app.index("async def console_proxy"):]
-    block = block[:block.index("async def _console_relay")]
-    assert "_agent_http_bases" in block
-    assert "for base in bases" in block
+def test_the_proxy_goes_only_by_the_channel():
+    """It used to walk every address the agent might be at and open a
+    websocket to `/console/ws` on port 9099. That needed an inbound path to
+    the endpoint, which is what the channel exists to stop needing."""
+    block = _console_proxy_body()
+    assert "_relay_channel_stream" in block
+    for gone in ("_agent_http_bases", "for base in bases", "_console_relay"):
+        assert gone not in block, f"{gone} is still in the console path"
+
+
+def test_an_agent_with_no_channel_is_told_so_rather_than_timing_out():
+    """A shell is the one place an operator will sit and wait. Dialling
+    addresses nobody listens on spent that wait on a foregone conclusion."""
+    assert "_no_channel_message" in _console_proxy_body()

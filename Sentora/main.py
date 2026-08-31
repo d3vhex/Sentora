@@ -16,11 +16,6 @@ import re
 from datetime import datetime, timedelta
 import ipaddress
 
-from sanic import Sanic
-from sanic_cors import CORS
-from sanic.request import Request
-from sanic.response import json as sanic_json, text as sanic_text
-
 from modules.db import insert_record, fetch_unsent, mark_sent, fetch_one
 import modules.enc_db as enc_db
 import modules.screen_capture as screen_capture
@@ -261,45 +256,34 @@ class ServerBootstrapClient:
 
 
 def _apply_fernet_key_to_enc_db(key: str) -> None:
-    """Install the Fernet key into enc_db, whichever API it exposes.
+    """Install the Fernet key into enc_db.
 
-    The setter has been named three ways across versions; trying each in turn
-    is what keeps an older agent working after a server upgrade.
+    This used to try six APIs in turn - `set_fernet_key`, then `setattr` for
+    four possible attribute names, then `set_encrypt_key`, then a `_fernet_cache`
+    dict - on the stated grounds that "the setter has been named three ways
+    across versions". It cannot have been: `modules.enc_db` is imported from
+    the agent's own package and PyInstaller bundles both into one binary, so
+    there is no version either of them can be skewed against.
+
+    Only the first rung was ever real. The rest were shapes that report
+    success without doing anything - `setattr` in particular always succeeds,
+    so a vestigial attribute would have absorbed the key and returned, leaving
+    telemetry encrypted with a key the server does not hold and nothing
+    anywhere saying so.
+
+    Called by the refresher thread, `/reload_auth`, the SOAR handler and
+    bootstrap, all four of which catch and report. A missing setter is a
+    broken build, and raising is how they get to say so.
     """
-    if hasattr(enc_db, "set_fernet_key") and callable(enc_db.set_fernet_key):
-        enc_db.set_fernet_key(key)
-        return
-    for attr in ("FERNET_KEY", "fernet_key", "_fernet_key", "current_fernet_key"):
-        if hasattr(enc_db, attr):
-            setattr(enc_db, attr, key)
-            return
-    if hasattr(enc_db, "set_encrypt_key") and callable(enc_db.set_encrypt_key):
-        enc_db.set_encrypt_key(key)
-        return
-    if hasattr(enc_db, "_fernet_cache"):
-        try:
-            enc_db._fernet_cache["key"] = key  # type: ignore[attr-defined]
-            return
-        except Exception:
-            pass
-    print("[!] Warning: Could not apply Fernet key to enc_db via known hooks. Ensure enc_db exposes a setter.")
+    enc_db.set_fernet_key(key)
 
 
-def _is_valid_ipv4(ip: str) -> bool:
-    parts = str(ip).split(".")
-    if len(parts) != 4:
-        return False
-    try:
-        return all(0 <= int(p) <= 255 for p in parts)
-    except Exception:
-        return False
-
-
-_USER_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
-
-
-def _is_valid_username(u: str) -> bool:
-    return bool(_USER_RE.match(str(u or "")))
+# `_is_valid_ipv4` and `_is_valid_username` were here, validating SOAR targets
+# arriving on the agent's own HTTP routes. The routes are gone, and the
+# validation the agent still performs lives where the action does -
+# `SoarExecutor` and `UserAccountManager` each carry their own, checked
+# against the target they are about to act on rather than against a request
+# body.
 
 
 def _is_private_ip(ip: str) -> bool:
@@ -331,9 +315,6 @@ class FernetKeyRefresher(threading.Thread):
                 self._stop.wait(self.refresh_sec)
 
 
-
-app = Sanic("Sentora_Agent")
-CORS(app)
 
 AGENT_NAME = None
 SERVER_IP = None
@@ -867,67 +848,6 @@ def soar_events_loop(interval_sec: int = 30):
         time.sleep(interval_sec)
 
 
-
-@app.get("/health")
-async def health(request):
-    """Liveness. Unauthenticated on purpose, but no longer a disclosure.
-
-    It used to return the agent name, the SIEM server's address and port, the
-    automations API base and the full OS string to anyone who asked. That is a
-    map of the security infrastructure, handed out by every endpoint on the
-    network - which host to attack next, and what it reports to.
-
-    A liveness probe needs to answer "is it up". Everything else is behind the
-    same key as the rest of the API.
-    """
-    if not _check_auth_header(request):
-        return sanic_json({"status": "ok"})
-    return sanic_json({
-        "agent": AGENT_NAME,
-        "server": SERVER_IP,
-        "ingest_port": SERVER_PORT,
-        "api_base": AUTOMATIONS_API_URL,
-        "automations_mode": AUTOMATIONS_MODE,
-        "os": OS_INFO,
-        "status": "ok"
-    })
-
-
-@app.post("/self_destruct")
-async def self_destruct(request: Request):
-    """Uninstall this agent. Irreversible.
-
-    This had no authentication at all, on a listener bound to 0.0.0.0:9099.
-    One unauthenticated POST from anywhere on the network removed the EDR from
-    the host, which makes it the first step of any competent intrusion rather
-    than an administrative feature. Tamper resistance is the property a
-    security agent exists to have.
-
-    `enrolment_key_only`: the fleet-wide master secret is not enough. The
-    server holds this agent's own key and uses it first, so nothing legitimate
-    breaks, but a leaked master secret can no longer wipe every endpoint at
-    once.
-    """
-    if not _check_auth_header(request, enrolment_key_only=True):
-        print("[!] REJECTED unauthenticated self-destruct request from "
-              f"{request.ip}", flush=True)
-        return sanic_json({"ok": False, "error": "unauthorized"}, status=401)
-
-    print(f"[!] Self-destruct authorised, requested by {request.ip}", flush=True)
-
-    # Remove the autostart here, in the request, rather than in the background
-    # thread - because this is the half whose outcome the caller can still be
-    # told. Once the process exits there is nobody left to report anything, so
-    # the old handler answered "Destruction initiated" and the console
-    # rendered that as completed whether or not anything was uninstalled.
-    #
-    # It is also the half that decides the rest: with the watchdog still armed
-    # the agent comes back, and deleting files first would only make it come
-    # back damaged.
-    body, status = await asyncio.to_thread(cmd_self_destruct)
-    return sanic_json(body, status=status)
-
-
 def cmd_self_destruct() -> tuple[dict, int]:
     """Uninstall this agent. Shared with the channel - see cmd_get_config.
 
@@ -957,43 +877,54 @@ def cmd_self_destruct() -> tuple[dict, int]:
     }, 200
 
 
-@app.post("/restart")
-async def restart_agent(request):
-    """Restart the agent process. Also had no authentication.
-
-    Less destructive than self-destruct and still worth having: an unauthorised
-    caller could restart the agent in a loop, which is a denial of the
-    telemetry the platform depends on, and every restart is a window with no
-    collection.
-    """
-    if not _check_auth_header(request):
-        return sanic_json({"ok": False, "error": "unauthorized"}, status=401)
-    body, status = cmd_restart()
-    return sanic_json(body, status=status)
-
-
 def cmd_restart() -> tuple[dict, int]:
     """Relaunch this process. Shared with the channel - see cmd_get_config."""
     def restart():
         old_pid = os.getpid()
         print(f"[*] Restarting agent. Old PID: {old_pid}", flush=True)
 
-        python = sys.executable
-        args = [python] + sys.argv
+        # A frozen build re-executes *itself*: `sys.executable` is the binary
+        # and `sys.argv[0]` is that same path. `[sys.executable] + sys.argv`
+        # therefore handed the new process its own path as a positional
+        # argument - and `_parse_args` uses `parse_args`, not
+        # `parse_known_args`, so argparse answered `unrecognized arguments`
+        # and exited 2 before the agent started. This process then exited a
+        # second later regardless, so Restart was a stop button. The watchdog
+        # task firing fifteen minutes on is what made it look merely slow.
+        argv = sys.argv[1:] if getattr(sys, "frozen", False) else sys.argv
+        args = [sys.executable] + argv
         env = os.environ.copy()
         env["OLD_AGENT_PID"] = str(old_pid)
 
+        try:
+            child = subprocess.Popen(args, env=env, close_fds=True)
+        except Exception as e:
+            print(f"[!] Restart aborted: could not launch {args[0]}: {e}",
+                  flush=True)
+            return
+
+        # Never stand down until the replacement is standing up.
+        #
+        # The old code exited on a timer, so a child that died immediately -
+        # a bad argv, a missing config, a DLL it could not load - was
+        # indistinguishable from a clean handover. Both left the host with no
+        # agent; only one of them said so. The healthy path does not reach the
+        # exit below at all, because the new process kills this one by
+        # OLD_AGENT_PID as soon as it starts.
+        time.sleep(2)
+        if child.poll() is not None:
+            print(f"[!] Restart aborted: the replacement exited "
+                  f"{child.returncode} immediately. Staying up rather than "
+                  f"leaving this host unmonitored.", flush=True)
+            return
+
+        print("[*] Replacement is up; this process is exiting.", flush=True)
         if platform.system() == "Windows":
-            subprocess.Popen(args, env=env, close_fds=True)
-            try:
-                app.stop()
-            except Exception as e:
-                print(f"[!] Error stopping app: {e}", flush=True)
-            time.sleep(1)
+            # `app.stop()` was here, to shut the HTTP listener down first.
+            # There is no listener now, and `os._exit` takes the threads with
+            # it, which is the whole of what has to stop.
             os._exit(0)
         else:
-            subprocess.Popen(args, env=env, close_fds=True)
-            time.sleep(1)
             os.kill(old_pid, signal.SIGTERM)
 
     threading.Thread(target=restart, daemon=True).start()
@@ -1008,18 +939,6 @@ def cmd_reload_auth() -> tuple[dict, int]:
         return {"ok": True, "message": "Fernet key reloaded"}, 200
     except Exception as e:
         return {"ok": False, "error": str(e)}, 500
-
-
-@app.post("/reload_auth")
-async def reload_auth(request):
-    """Re-fetch the telemetry encryption key. Also had no authentication.
-
-    An unauthorised caller could force a bootstrap round-trip on demand.
-    """
-    if not _check_auth_header(request):
-        return sanic_json({"ok": False, "error": "unauthorized"}, status=401)
-    body, status = cmd_reload_auth()
-    return sanic_json(body, status=status)
 
 
 # Directories that must never be the target of an uninstall, whatever the
@@ -1754,79 +1673,28 @@ def _load_identity_from_config(path: str) -> dict:
     return cfg
 
 
-def _accepted_auth_tokens() -> set:
-    """Both the per-agent enrollment key (AGENT_SHARED_SECRET runtime
-    global, set from cfg.agent_key after registration) AND the server's
-    master shared secret (env AGENT_MASTER_SECRET / AGENT_SHARED_SECRET)
-    are valid for inbound server→agent calls. Tracking both means the
-    server doesn't need to know which mode the agent is in.
-    """
-    keys = set()
-    if AGENT_SHARED_SECRET:
-        keys.add(AGENT_SHARED_SECRET)
-    for env_var in ("AGENT_MASTER_SECRET", "AGENT_SHARED_SECRET"):
-        v = os.getenv(env_var, "").strip()
-        if v:
-            keys.add(v)
-    return keys
-
-
-# `_is_permissive_auth` was here, and it accepted ANY non-empty X-Agent-Key
-# whenever AGENT_MASTER_SECRET was unset on the host.
+# Inbound authentication used to live here - `_accepted_auth_tokens`,
+# `_timing_safe_in`, `_check_auth_header`, `_ws_authorized`. All of it is gone
+# with the listener it guarded. The agent no longer accepts a connection from
+# anyone; it opens one, and `modules/link` presents this agent's key to the
+# server rather than checking anyone else's.
 #
-# Nothing in this repository ever set that variable - not the installer, not
-# the scheduled task, not the systemd unit - so every default installation ran
-# permissively. `curl -H 'X-Agent-Key: a' .../soar/execute` with
-# `{"action":"run_cmd", ...}` was unauthenticated remote code execution as
-# SYSTEM, fleet-wide, and `/config/rules.yaml` let the same caller switch
-# detection off first.
+# Worth keeping the reason it mattered. `_is_permissive_auth` sat in that
+# check and accepted ANY non-empty X-Agent-Key whenever AGENT_MASTER_SECRET
+# was unset on the host - and nothing in this repository ever set it, not the
+# installer, not the scheduled task, not the systemd unit. So every default
+# installation ran permissively, and
+#
+#     curl -H 'X-Agent-Key: a' http://<endpoint>:9099/soar/execute
+#
+# with `{"action": "run_cmd", ...}` was unauthenticated remote code execution
+# as SYSTEM, fleet-wide, with `/config/rules.yaml` available to the same
+# caller to switch detection off first.
 #
 # The mode existed so server→agent calls would not fail during rollout. That
-# trade is on the wrong side: an EDR that fails open is worse than no EDR,
-# because the console reports that the endpoint is protected.
-#
-# It is also unnecessary. `_get_agent_keys` on the server tries the per-agent
-# enrolment key from `agent_identities` FIRST, and that key is exactly what
-# `_accepted_auth_tokens` holds. The fallback path was covering a case the
-# server does not produce.
-
-
-def _timing_safe_in(candidate: str, accepted: set) -> bool:
-    """Compare against every accepted key without an early exit.
-
-    `key in set` compares with ==, which returns as soon as bytes differ. Over
-    a network that difference is mostly noise, but the fix costs nothing.
-    """
-    import hmac
-    matched = False
-    for known in accepted:
-        if hmac.compare_digest(candidate, known):
-            matched = True
-    return matched
-
-
-def _check_auth_header(request, *, enrolment_key_only: bool = False) -> bool:
-    """Authorise an inbound server→agent call.
-
-    `enrolment_key_only` narrows the accepted set to this agent's own key,
-    excluding the fleet-wide master secret. Used for the destructive
-    endpoints: a leaked master secret should not be able to wipe every
-    endpoint at once, and the server has the per-agent key for anything it is
-    legitimately entitled to do.
-    """
-    srv_key = (request.headers.get("X-Agent-Key") or "").strip()
-    accepted = {AGENT_SHARED_SECRET} - {None, ""} if enrolment_key_only \
-        else _accepted_auth_tokens()
-
-    if srv_key and accepted and _timing_safe_in(srv_key, accepted):
-        return True
-
-    accepted_fps = sorted(k[:6] + "…" for k in accepted) if accepted else []
-    srv_fp = (srv_key[:6] + "…") if srv_key else "<empty>"
-    scope = "enrolment-key-only" if enrolment_key_only else "any-accepted"
-    print(f"[auth] reject ({scope}) — sent={srv_fp}, accepted={accepted_fps}",
-          flush=True)
-    return False
+# trade is on the wrong side - an EDR that fails open is worse than no EDR,
+# because the console reports the endpoint as protected - and the answer in
+# the end was not a better check on that port. It was not having the port.
 
 
 def cmd_soar_execute(data: dict) -> tuple[dict, int]:
@@ -1964,14 +1832,6 @@ def cmd_soar_execute(data: dict) -> tuple[dict, int]:
     }, http_status)
 
 
-@app.post("/soar/execute")
-async def soar_execute(request: Request):
-    if not _check_auth_header(request):
-        return sanic_json({"ok": False, "error": "unauthorized"}, status=401)
-    body, status = cmd_soar_execute(request.json or {})
-    return sanic_json(body, status=status)
-
-
 # ---------------------------------------------------------------------------
 # Commands, once
 # ---------------------------------------------------------------------------
@@ -2036,7 +1896,8 @@ def dispatch_channel_request(method: str, path: str, body) -> tuple[dict, int]:
     No authentication here. The channel was authenticated once, when the agent
     opened it with its own key, and only the server is on the other end - so
     there is no second party to check. That is the difference from the HTTP
-    routes, where anything that can reach port 9099 can knock.
+    routes this replaced, where anything that could reach port 9099 could
+    knock and the check had to be right on every one of them.
     """
     body = body if isinstance(body, dict) else {}
 
@@ -2070,324 +1931,12 @@ def dispatch_channel_request(method: str, path: str, body) -> tuple[dict, int]:
             "error": f"this agent does not implement {method} {path}"}, 501
 
 
-@app.route("/config/<cfg_type>", methods=["GET"])
-async def get_config(request, cfg_type):
-    if not _check_auth_header(request):
-        return sanic_json({"ok": False, "error": "unauthorized"}, status=401)
-    body, status = cmd_get_config(cfg_type)
-    return sanic_json(body, status=status)
 
-
-@app.route("/config/<cfg_type>", methods=["POST"])
-async def set_config(request, cfg_type):
-    if not _check_auth_header(request):
-        return sanic_json({"ok": False, "error": "unauthorized"}, status=401)
-    data = request.json or {}
-    body, status = cmd_set_config(cfg_type, data.get("content"))
-    return sanic_json(body, status=status)
-
-
-
-def _ws_authorized(request) -> bool:
-    """WebSocket auth: header X-Agent-Key, or `?key=` when a header is impossible.
-
-    Browsers cannot set headers on a WebSocket handshake, so the query string
-    is the only option for the screen viewer. It is a worse place for a
-    secret - it reaches proxy access logs and browser history - but the
-    alternative was the permissive branch that used to sit at the bottom of
-    this function, which accepted any non-empty value and made a live screen
-    stream available to anyone who could reach port 9099.
-    """
-    if _check_auth_header(request):
-        return True
-    qkey = (request.args.get("key") or "").strip() if hasattr(request, "args") else ""
-    if not qkey:
-        return False
-    return _timing_safe_in(qkey, _accepted_auth_tokens())
-
-
-async def _ws_notify(ws, payload: str) -> None:
-    """Tell the browser something, if it is still listening.
-
-    The one swallow on the console path. Every caller is on its way to closing
-    the socket and has already logged the reason locally, so a browser that
-    has gone away cannot be told anything and nothing is lost by the failure.
-    The alternative - four separate try/excepts saying the same thing - is how
-    a genuine error ends up hidden among them.
-    """
-    try:
-        await ws.send(payload)
-    except Exception:
-        pass
-
-
-@app.websocket("/console/ws")
-async def console_stream(request, ws):
-    """An interactive shell on this host.
-
-    The screen stream is the wrong tool for the machines that matter: a
-    headless server has no desktop and never will. What an operator wanted
-    from it was a console, and this is that.
-
-    Authentication is the same as every other route here. It is worth being
-    plain about what this grants: a shell as whoever the agent runs as, which
-    is root or SYSTEM. `ActionType.RUN_CMD` already grants exactly that
-    through /soar/execute, so this adds no capability - but it is the most
-    dangerous interface in the product and the limits in modules/console are
-    part of it, not decoration.
-    """
-    if not _ws_authorized(request):
-        await ws.close(code=1008, reason="unauthorized")
-        return
-
-    try:
-        session = await asyncio.to_thread(console.open_session)
-    except console.ConsoleUnavailable as e:
-        print(f"[console] refused: {e}", flush=True)
-        await _ws_notify(ws, console.encode_error(str(e)))
-        await ws.close(code=1011, reason="no console")
-        return
-    except Exception as e:
-        print(f"[console] could not start: {e}", flush=True)
-        await _ws_notify(ws, console.encode_error(f"could not start a shell: {e}"))
-        await ws.close(code=1011, reason="console failed")
-        return
-
-    print(f"[console] session opened for {request.ip} ({' '.join(session.argv)}, "
-          f"mode={getattr(session, 'mode', 'pty')})", flush=True)
-    # Before any output: the browser has to know whether it is driving a
-    # terminal or a pipe before the first keystroke, not after.
-    await _ws_notify(ws, console.encode_mode(session))
-    reason = "closed"
-
-    async def pump_output():
-        """Shell -> browser. Also enforces the timeouts.
-
-        Enforced here rather than in the browser because a tab that was closed
-        cannot time anything out, and an abandoned root shell is exactly the
-        case that matters.
-        """
-        nonlocal reason
-        while True:
-            expired = session.expired()
-            if expired:
-                reason = expired
-                await _ws_notify(ws, console.encode_exit(None, expired))
-                return
-            data = await asyncio.to_thread(session.read, 0.2)
-            if data is None:
-                # Whatever the session worked out, not a generic sentence. A
-                # shell that died on startup and one the operator typed `exit`
-                # into look identical without this.
-                reason = getattr(session, "exit_reason", "") or "the shell exited"
-                await _ws_notify(ws, console.encode_exit(session.proc.poll(), reason))
-                return
-            if data:
-                try:
-                    await ws.send(console.encode_output(data))
-                except Exception:
-                    reason = "the browser went away"
-                    return
-
-    async def pump_input():
-        """Browser -> shell."""
-        nonlocal reason
-        while True:
-            try:
-                raw = await ws.recv()
-            except Exception:
-                reason = "the browser went away"
-                return
-            if raw is None:
-                reason = "the browser went away"
-                return
-            kind, payload = console.decode_input(raw)
-            if kind == "input":
-                session.write(payload["data"])
-            elif kind == "resize":
-                session.resize(payload["cols"], payload["rows"])
-
-    try:
-        done, pending = await asyncio.wait(
-            [asyncio.create_task(pump_output()), asyncio.create_task(pump_input())],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for task in pending:
-            task.cancel()
-    finally:
-        # Always, on every exit path. The shell and everything it started go
-        # with the session - a backgrounded job that outlives the console has
-        # nothing left pointing at who ran it.
-        console.close_active(reason)
-        print(f"[console] session closed for {request.ip}: {reason}", flush=True)
-
-
-@app.websocket("/screen/ws")
-async def screen_stream(request, ws):
-    """Continuous JPEG screen-frame stream.
-
-    Two ways to produce frames, and which one applies is a property of the
-    session this process is in rather than of the request:
-
-      direct   an interactive session can capture its own desktop.
-      helper   a service in session 0 cannot see any desktop, so it launches
-               a helper into the logged-in user's session and relays what
-               that captures. See modules/screen_capture.
-
-    The direct path used to be the only one, which meant the Windows agent -
-    always a service, always session 0 - connected successfully and then sent
-    nothing at all. A stream that opens and stays black is the hardest kind of
-    failure to attribute, so every branch below that cannot produce frames
-    says why before it closes.
-    """
-    if not _ws_authorized(request):
-        await ws.close(code=1008, reason="unauthorized")
-        return
-
-    try:
-        fps = max(1, min(int(request.args.get("fps", 10)), 30))
-    except Exception:
-        fps = 10
-    try:
-        quality = max(20, min(int(request.args.get("q", 60)), 95))
-    except Exception:
-        quality = 60
-    try:
-        max_width = max(320, min(int(request.args.get("w", 1280)), 2560))
-    except Exception:
-        max_width = 1280
-
-    if screen_capture.in_session_zero():
-        await _stream_via_helper(ws, fps, quality, max_width)
-    else:
-        await _stream_directly(ws, fps, quality, max_width)
-
-
-async def _stream_via_helper(ws, fps: int, quality: int, max_width: int) -> None:
-    """Relay frames captured by a helper in the interactive session."""
-    print(f"[screen] session 0 - launching helper fps={fps} q={quality} w={max_width}",
-          flush=True)
-    try:
-        stream = await asyncio.to_thread(
-            screen_capture.spawn_helper, fps, quality, max_width)
-    except screen_capture.CaptureUnavailable as e:
-        print(f"[screen] helper unavailable: {e}", flush=True)
-        try:
-            await ws.send(json.dumps({"error": f"no screen available - {e}"}))
-        except Exception:
-            pass
-        await ws.close(code=1011, reason="no display")
-        return
-    except Exception as e:
-        print(f"[screen] helper launch failed: {e}", flush=True)
-        try:
-            await ws.send(json.dumps({"error": f"capture helper failed to start - {e}"}))
-        except Exception:
-            pass
-        await ws.close(code=1011, reason="helper failed")
-        return
-
-    sent_any = False
-    try:
-        while True:
-            frame = await asyncio.to_thread(stream.read_frame)
-            if frame is None:
-                break
-            try:
-                await ws.send(frame)
-            except Exception:
-                break
-            sent_any = True
-    except Exception as e:
-        print(f"[screen] helper relay error: {e}", flush=True)
-    finally:
-        stream.close()
-        if not sent_any:
-            # The helper started and produced nothing. Most often the session
-            # ended, or the desktop in view is one a user process may not read
-            # - the lock screen and UAC prompts live on the secure desktop.
-            try:
-                await ws.send(json.dumps({
-                    "error": "the capture helper started but produced no frames - "
-                             "the session may have ended, or the desktop in view "
-                             "is the lock screen, which cannot be captured."
-                }))
-            except Exception:
-                pass
-        print(f"[screen] helper stream end (frames sent: {sent_any})", flush=True)
-
-
-async def _stream_directly(ws, fps: int, quality: int, max_width: int) -> None:
-    """Capture this process's own desktop. Valid outside session 0."""
-    try:
-        import mss as _mss
-    except ImportError:
-        await ws.send(json.dumps({"error": "mss_not_installed"}))
-        await ws.close(code=1011, reason="missing dep")
-        return
-    try:
-        from PIL import Image
-        import io as _io
-    except ImportError:
-        await ws.send(json.dumps({"error": "pillow_not_installed"}))
-        await ws.close(code=1011, reason="missing dep")
-        return
-
-    frame_interval = 1.0 / fps
-    print(f"[screen] stream start fps={fps} q={quality} w={max_width}", flush=True)
-
-    # Opening the capture is its own failure, and the common one on a server.
-    #
-    # A headless Linux host has no X display, so `mss.mss()` raises before a
-    # single frame exists. That used to fall into the generic handler below:
-    # the agent logged it, the socket closed with no explanation, and the
-    # console showed "Connected" beside a broken image - which reads as a
-    # broken feature rather than as a machine with no screen.
-    try:
-        capture = _mss.mss()
-    except Exception as e:
-        detail = str(e) or type(e).__name__
-        if platform.system() != "Windows" and not os.environ.get("DISPLAY"):
-            detail = screen_capture.describe_unavailable()
-        print(f"[screen] cannot open a capture: {detail}", flush=True)
-        try:
-            await ws.send(json.dumps({"error": f"no screen available - {detail}"}))
-        except Exception:
-            # The socket is being closed on the next line either way, and the
-            # reason has already been logged. A browser that has gone away
-            # cannot be told anything.
-            pass
-        await ws.close(code=1011, reason="no display")
-        return
-
-    try:
-        with capture as sct:
-            if not sct.monitors:
-                await ws.send(json.dumps({"error": "no monitors detected"}))
-                await ws.close(code=1011, reason="no monitors")
-                return
-            monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-            while True:
-                t0 = asyncio.get_event_loop().time()
-                shot = sct.grab(monitor)
-                img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-                if img.width > max_width:
-                    ratio = max_width / img.width
-                    img = img.resize((max_width, int(img.height * ratio)))
-                buf = _io.BytesIO()
-                img.save(buf, format="JPEG", quality=quality, optimize=False)
-                try:
-                    await ws.send(buf.getvalue())
-                except Exception:
-                    break
-                elapsed = asyncio.get_event_loop().time() - t0
-                if elapsed < frame_interval:
-                    await asyncio.sleep(frame_interval - elapsed)
-    except Exception as e:
-        print(f"[screen] stream error: {e}", flush=True)
-    finally:
-        print("[screen] stream end", flush=True)
-
+# `_stream_via_helper` and `_stream_directly` were here: the two capture
+# paths the removed `/screen/ws` route chose between, each pumping frames
+# straight into a websocket. `_ScreenStream` makes the same choice and
+# hands frames back through `read`, so the channel has one thing to pump
+# rather than a second implementation to keep in step.
 
 def main():
     global AGENT_NAME, SERVER_IP, SERVER_PORT, AGENT_SHARED_SECRET, AUTOMATIONS_API_URL, AUTOMATIONS_MODE
@@ -2488,14 +2037,6 @@ def main():
         print("[*] Exiting...")
 
 
-@app.listener('before_server_start')
-async def start_agent(app, loop):
-    def start_main():
-        main()
-    t = threading.Thread(target=start_main, daemon=True)
-    t.start()
-
-
 if __name__ == "__main__":
     # The capture helper is this same binary re-entered with a flag, so it has
     # to branch before anything else starts: the helper must not take the
@@ -2515,47 +2056,22 @@ if __name__ == "__main__":
         multiprocessing.freeze_support()
         sys.exit(console.console_helper_main())
 
-    app.config.AUTO_RELOAD = False
-    app.config.TOUCHUP = False
     import multiprocessing
     multiprocessing.freeze_support()
 
-    # Loopback by default. The condition this waited on has been met.
+    # No listener. The agent opens a connection; nothing dials it.
     #
-    # This listener existed because the server reached agents by dialling this
-    # port, so binding it to loopback would have stopped SOAR dispatch, config
-    # reads, the screen stream and the console across the fleet. The note here
-    # said that needed a transport to replace it - "an outbound
-    # agent-initiated channel, or mTLS through a broker" - and the channel is
-    # now that transport. Every route this app serves has a channel
-    # equivalent: /health, /self_destruct, /restart, /reload_auth,
-    # /soar/execute and /config/<type> go through `dispatch_channel_request`,
-    # and /console/ws and /screen/ws through `open_channel_stream`. Nothing
-    # the server asks of an agent needs an open port on the endpoint.
+    # This used to be `app.run()` on 0.0.0.0:9099, with the collectors started
+    # from a `before_server_start` hook - so an HTTP server nobody needed was
+    # what kept the process alive and running. It existed because the server
+    # reached agents by dialling that port, and everything painful about this
+    # codebase followed from that one decision: an address to guess behind
+    # NAT, a firewall rule Windows cannot prompt for as a service in session
+    # 0, `ufw` on Linux, and a management API with /self_destruct on it
+    # listening on every endpoint in the fleet.
     #
-    # It stays bound rather than removed so a host can still be worked on from
-    # its own console, and so `AGENT_BIND=0.0.0.0` remains the way back if a
-    # deployment finds something the channel does not carry. Setting it is a
-    # deliberate act with a warning attached, which is the difference between
-    # an escape hatch and a default.
-    bind_host = os.getenv("AGENT_BIND", "127.0.0.1")
-    bind_port = int(os.getenv("AGENT_PORT", "9099"))
-    if bind_host == "127.0.0.1":
-        print(f"[*] Agent API on {bind_host}:{bind_port} — loopback only. "
-              f"The server reaches this agent over the channel it opens.",
-              flush=True)
-    else:
-        print(f"[!] Agent API on {bind_host}:{bind_port} — reachable from the "
-              f"network. Every route requires X-Agent-Key, but the channel "
-              f"already carries everything the server asks for, so this port "
-              f"is exposure without a purpose unless you know why you set it.",
-              flush=True)
-
-    app.run(
-        host=bind_host,
-        port=bind_port,
-        single_process=True,
-        workers=1,
-        access_log=False,
-        auto_reload=False
-    )
+    # `modules/link` now dials the server and `dispatch_channel_request` and
+    # `open_channel_stream` answer over it, which is every route this app
+    # used to serve. `main` starts the collectors and blocks, which is all
+    # Sanic was really providing.
+    main()

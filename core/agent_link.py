@@ -2,9 +2,10 @@
 
 Why
 ---
-Every server-to-agent feature works by the server making an HTTP connection
-*to* the endpoint: config reads, SOAR dispatch, the screen stream, the
-console. That is one design decision, and this is the list of things it cost:
+Every server-to-agent feature used to work by the server making an HTTP
+connection *to* the endpoint: config reads, SOAR dispatch, the screen stream,
+the console. That was one design decision, and this is the list of things it
+cost:
 
   - the agent's own reported address was wrong behind NAT, so we preferred
     the observed one
@@ -13,19 +14,20 @@ console. That is one design decision, and this is the list of things it cost:
   - neither is reachable from a container under Docker Desktop, so
     `host.docker.internal` became a third candidate
   - Windows blocks the inbound port and cannot prompt for it, because the
-    agent is a service in session 0, so the installer adds a firewall rule
+    agent is a service in session 0, so the installer added a firewall rule
   - `ufw` on Linux needed the same
-  - and every endpoint now runs a management API on 0.0.0.0:9099 with
+  - and every endpoint ran a management API on 0.0.0.0:9099 with
     `/self_destruct` on it, which is a thing an EDR adds to a host rather
     than removes
 
 None of those are bugs in each other. They are the same bug, once, in the
 direction of the connection.
 
-An agent-initiated channel removes all of it: a host that can reach the
-server can be managed, and one that cannot was never reachable anyway. There
-is no port to open, no address to guess, and nothing listening on the
-endpoint.
+All of it is gone with the dialling. A host that can reach the server can be
+managed, and one that cannot was never reachable anyway - so there is no port
+to open, no address to guess, and, since the agent's listener was removed
+along with the fallback that needed it, nothing on the endpoint listening at
+all.
 
 What this module is
 -------------------

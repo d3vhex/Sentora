@@ -239,3 +239,94 @@ def test_the_routes_that_prompted_this_stay_gated(name, tree):
     names, fn = routes[name]
     assert ("require_permission" in names
             or "user_has_permission" in ast.unparse(fn)), name
+
+
+# --------------------------------------------------------------------------
+# The audit has to be able to see the routes it audits
+# --------------------------------------------------------------------------
+#
+# `verify_auth_wiring` reads `route.handler.__qualname__`. Sanic wraps a
+# websocket handler in a `functools.partial`, which has no `__qualname__`, so
+# every websocket route fell into the "unresolvable" bucket and the boot-time
+# audit did not cover them:
+#
+#     [Auth] WARNING: 3 route(s) with an unresolvable handler:
+#     ['/agent-link', '/console-proxy/<agent:str>', '/vnc-proxy/<agent:str>']
+#
+# Those three are the agent channel, a root shell on an endpoint, and a live
+# view of its screen. The one category the audit could not see was the one
+# worth seeing, and it announced that in a line which reads like a formatting
+# complaint.
+
+
+def _resolver(tree: ast.Module):
+    """`_handler_qualname`, compiled on its own."""
+    fn = next(n for n in tree.body
+              if isinstance(n, ast.FunctionDef) and n.name == "_handler_qualname")
+    namespace: dict = {}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "<app.py>", "exec"),
+         namespace)
+    return namespace["_handler_qualname"]
+
+
+def test_the_audit_still_runs_at_boot(tree):
+    """It reports the auth posture of every route, and an audit that is not
+    registered reports nothing while looking exactly like one that is.
+
+    Worth its own assertion because the failure is silent and easy to cause:
+    inserting a helper between `@app.before_server_start` and this function
+    hands the decorator to the helper, and both keep parsing fine.
+    """
+    fn = next(n for n in tree.body
+              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+              and n.name == "verify_auth_wiring")
+    assert "app.before_server_start" in _decorator_names(fn), \
+        "verify_auth_wiring is defined but never registered, so no route is audited"
+
+
+def _console_proxy(request, ws, agent):
+    """Stands in for a route handler; only its name is under test."""
+    return None
+
+
+def test_a_partial_wrapped_handler_still_resolves(tree):
+    """Which is exactly how Sanic registers a websocket route."""
+    import functools
+
+    wrapped = functools.partial(_console_proxy, None)
+    assert _resolver(tree)(wrapped).endswith("_console_proxy")
+
+
+def test_a_handler_behind_a_wrapper_still_resolves(tree):
+    """`__wrapped__` is the other convention a decorator leaves behind."""
+    class Wrapper:
+        __wrapped__ = staticmethod(_console_proxy)
+
+    assert _resolver(tree)(Wrapper()).endswith("_console_proxy")
+
+
+def test_an_unresolvable_handler_is_still_reported(tree):
+    """The bucket has to keep working. The point was to empty it honestly,
+    not to stop counting."""
+    assert _resolver(tree)(object()) == ""
+    assert _resolver(tree)(None) == ""
+
+
+def test_the_resolver_cannot_loop_forever(tree):
+    """A handler whose `func` points back at itself would hang the boot
+    audit, which runs before anything is served."""
+    class SelfReferential:
+        pass
+
+    node = SelfReferential()
+    node.func = node
+    assert _resolver(tree)(node) == ""
+
+
+def test_the_agent_channel_is_declared_rather_than_counted_as_session_only(tree):
+    """It is not gated by an operator session and must not be: it is the
+    channel every agent opens, authenticated by agent key against
+    `agent_identities`. Letting it fall into the session-only tally would be
+    a false reassurance in the opposite direction from the one this file
+    exists to prevent."""
+    assert "agent_link_socket" in _literal_set(tree, "_PUBLIC_HANDLERS")
