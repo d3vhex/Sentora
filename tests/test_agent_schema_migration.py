@@ -17,6 +17,21 @@ needs a live postgres.
 """
 from __future__ import annotations
 
+"""A semicolon inside a comment used to cut the statement it was part of.
+
+    agent_name VARCHAR(255) NULL,  -- NULL means global; a value scopes the row
+
+The splitter dropped comment *lines* after cutting the file on `;`, so that
+comment's semicolon split `soar_notification_templates` in half. The table was
+never created on any agent database, and both fragments came back as syntax
+errors on every single ingest - one of them reading
+
+    near 'a value scopes the row to one device'
+
+which is the comment being executed as SQL. Comments are now removed first,
+and the split sees only SQL.
+"""
+
 import ast
 import pathlib
 import re
@@ -57,12 +72,25 @@ def _load_func(path: pathlib.Path, name: str):
     splitters are pure functions over a string, so the function body is
     lifted out and compiled on its own - which keeps this file's promise that
     nothing here needs a live database.
+
+    Helpers the function calls are lifted with it. Compiling the one function
+    alone was fine while the splitters were self-contained; the moment they
+    delegated the comment stripping, calling one raised NameError - a failure
+    of the harness that reads exactly like a failure of the code.
     """
     tree = ast.parse(path.read_text(encoding="utf-8"))
-    fn = next(n for n in tree.body
-              if isinstance(n, ast.FunctionDef) and n.name == name)
+    top = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    wanted, pending = {}, [name]
+    while pending:
+        fname = pending.pop()
+        if fname in wanted:
+            continue
+        wanted[fname] = top[fname]
+        pending += [n.id for n in ast.walk(top[fname])
+                    if isinstance(n, ast.Name) and n.id in top]
     ns: dict = {}
-    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), ns)
+    exec(compile(ast.Module(body=list(wanted.values()), type_ignores=[]),
+                 str(path), "exec"), ns)
     return ns[name]
 
 
@@ -257,3 +285,68 @@ class TestStatementSplitting:
             "-- documented\nCREATE TABLE IF NOT EXISTS t (a int);\n-- banner only\n"
         )
         assert out == ["CREATE TABLE IF NOT EXISTS t (a int)"]
+
+
+def _both_splitters():
+    """The agent's copy and the server's, which must behave identically."""
+    return (_load_func(DB_PY, "_split_statements"),
+            _load_func(ROOT / "server.py", "_split_sql_statements"))
+
+
+class TestSemicolonInsideAComment:
+    """A comment's semicolon must not cut the statement it sits in.
+
+    The previous splitter dropped comment *lines* after cutting the file on
+    `;`, so this line split the table it belongs to in half.
+    """
+
+    SCHEMA = (
+        "CREATE TABLE IF NOT EXISTS templates (\n"
+        "  id INT NOT NULL,\n"
+        "  agent_name VARCHAR(255) NULL,  -- NULL means global; a value scopes it\n"
+        "  name VARCHAR(150) NOT NULL\n"
+        ");\n"
+    )
+
+    def test_the_statement_survives_in_one_piece(self):
+        for split in _both_splitters():
+            out = split(self.SCHEMA)
+            assert len(out) == 1, f"the comment's semicolon split it: {out}"
+            assert "name VARCHAR(150)" in out[0]
+
+    def test_the_comment_tail_is_not_left_as_a_statement(self):
+        """The reported error was `near 'a value scopes the row to one
+        device'` - the tail of a comment handed to the database as SQL."""
+        for split in _both_splitters():
+            for stmt in split(self.SCHEMA):
+                assert "a value scopes" not in stmt
+
+    def test_each_shipped_schema_parses_into_sql_only(self):
+        """Each splitter against the file it is actually given."""
+        agent_split, server_split = _both_splitters()
+        starts = {"CREATE", "ALTER", "INSERT", "DROP", "SET", "USE",
+                  "UPDATE", "DELETE"}
+        for split, schema in ((agent_split, INIT_SQL),
+                              (server_split, ROOT / "db" / "init.sql")):
+            for stmt in split(schema.read_text(encoding="utf-8")):
+                first = stmt.lstrip().split(None, 1)[0].upper()
+                assert first in starts, \
+                    f"{schema.name}: not a statement: {stmt[:80]!r}"
+
+    def test_the_table_that_was_lost_is_created(self):
+        """The comment that carried the semicolon is in the server's schema -
+        db/init.sql, which create_tables_if_not_exist applies to every
+        per-agent database. The agent's own postgres schema has no such
+        comment, so its copy of the splitter carried the trap without ever
+        tripping it."""
+        sql = (ROOT / "db" / "init.sql").read_text(encoding="utf-8")
+        split = _load_func(ROOT / "server.py", "_split_sql_statements")
+        assert any("soar_notification_templates" in s for s in split(sql)), \
+            "the table whose comment carried the semicolon is missing again"
+
+    def test_a_dash_dash_inside_a_string_literal_is_left_alone(self):
+        """Stripping inside a literal would corrupt data, not just a note."""
+        for split in _both_splitters():
+            out = split("INSERT INTO t (a) VALUES ('not -- a comment');\n")
+            assert len(out) == 1
+            assert "-- a comment" in out[0]

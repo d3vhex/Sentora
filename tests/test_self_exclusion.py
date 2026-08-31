@@ -118,6 +118,36 @@ def test_empty_and_missing_input_is_not_ours(extractor):
     assert extractor.is_own_output(line=None or "", entry=None) is False
 
 
+def test_the_exclusion_count_is_reported(extractor):
+    """The number that proves the loop is gone has to be printed somewhere.
+
+    It was not. `excluded=` was missing from the stats line, so the only
+    evidence that self-exclusion was working never reached an operator, and
+    "did this fix anything?" could only be answered by guessing.
+    """
+    import inspect
+
+    source = inspect.getsource(extractor.stats_reporter)
+    assert "excluded=" in source
+    assert "excluded_events" in source
+
+
+def test_exclusions_alone_still_produce_a_report(extractor):
+    """The better the fix works, the quieter the report used to get.
+
+    `is_own_output` increments `excluded_events` and skips the line *before*
+    `events_processed` is touched. The reporter only spoke when `processed`
+    changed, so on the host where the agent's own output was the whole
+    problem, a working fix meant total silence.
+    """
+    import inspect
+
+    source = inspect.getsource(extractor.stats_reporter)
+    assert "last_processed" not in source, \
+        "the report still wakes only on events_processed"
+    assert "moved" in source
+
+
 def test_malformed_journal_entry_does_not_crash(extractor):
     """Journal fields arrive as bytes, ints, or absent depending on the reader."""
     for entry in (

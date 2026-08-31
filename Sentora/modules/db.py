@@ -48,16 +48,60 @@ def _split_statements(sql: str) -> list[str]:
 
     Comment lines are stripped instead, and what remains decides whether
     there is a statement to run.
+
+    The second version of that had its own trap: it stripped comment *lines*
+    after splitting on `;`, so a semicolon *inside* a comment cut the
+    statement it belonged to -
+
+        agent_name VARCHAR(255) NULL,  -- NULL means global; a value scopes …
+
+    That line is in the server's schema, where it left
+    `soar_notification_templates` uncreated and produced two syntax errors on
+    every ingest, one of them the comment text itself. No comment in *this*
+    schema happens to contain a semicolon, so the identical trap sat here
+    unsprung - which is the only reason to fix it in both places rather than
+    just where it went off. Comments now go first, and the split sees only SQL.
+    """
+    return [chunk.strip() for chunk in _strip_comments(sql).split(";")
+            if chunk.strip()]
+
+
+def _strip_comments(sql: str) -> str:
+    """Remove `--` comments, leaving string literals alone.
+
+    Duplicated from `server._strip_sql_comments`: the agent ships standalone
+    and cannot import from the server. `tests/test_agent_schema_migration.py`
+    keeps the two honest.
     """
     out: list[str] = []
-    for chunk in sql.split(";"):
-        body = "\n".join(
-            line for line in chunk.splitlines()
-            if not line.strip().startswith("--")
-        ).strip()
-        if body:
-            out.append(body)
-    return out
+    quote = ""
+    i = 0
+    while i < len(sql):
+        ch = sql[i]
+        if quote:
+            out.append(ch)
+            if ch == "\\" and i + 1 < len(sql):
+                out.append(sql[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in ("'", '"', "`"):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "-" and sql.startswith("--", i):
+            newline = sql.find("\n", i)
+            if newline == -1:
+                break
+            i = newline
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def apply_schema(verbose: bool = True) -> tuple[int, int]:

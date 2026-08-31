@@ -102,22 +102,63 @@ def create_agent_db_if_not_exists(agent: str) -> str:
         conn.close()
     return db_name
 
+def _strip_sql_comments(sql: str) -> str:
+    """Remove `--` comments, leaving string literals alone.
+
+    Before splitting, not after, and that ordering is the whole point. This
+    used to drop whole comment *lines* once the file had already been cut on
+    `;` - so a semicolon inside a comment cut the statement it was part of:
+
+        agent_name VARCHAR(255) NULL,  -- NULL means global; a value scopes …
+
+    `soar_notification_templates` was therefore never created on any agent
+    database. Both halves came back as syntax errors on every ingest, and the
+    one that read `near 'a value scopes the row to one device'` was the
+    comment being executed as SQL.
+
+    Quotes are tracked because `--` can legitimately appear inside a literal,
+    and stripping there would corrupt data rather than a comment.
+    """
+    out: list[str] = []
+    quote = ""
+    i = 0
+    while i < len(sql):
+        ch = sql[i]
+        if quote:
+            out.append(ch)
+            if ch == "\\" and i + 1 < len(sql):        # escaped char
+                out.append(sql[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in ("'", '"', "`"):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "-" and sql.startswith("--", i):
+            newline = sql.find("\n", i)
+            if newline == -1:
+                break
+            i = newline                               # keep the newline
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _split_sql_statements(sql: str) -> list[str]:
-    """Split a schema file into statements, with comment lines removed.
+    """Split a schema file into statements, with comments removed first.
 
     Deliberately duplicated from the agent's `modules/db.py`: the agent ships
     as a standalone binary and cannot import from here. Both had the same
     trap, in different forms - see the note at the call site.
     """
-    out: list[str] = []
-    for chunk in sql.split(';'):
-        body = "\n".join(
-            line for line in chunk.splitlines()
-            if not line.strip().startswith("--")
-        ).strip()
-        if body:
-            out.append(body)
-    return out
+    return [chunk.strip() for chunk in _strip_sql_comments(sql).split(';')
+            if chunk.strip()]
 
 
 AUTOMATION_STATUSES = ("pending", "active", "paused", "completed", "failed", "cancelled")
@@ -166,6 +207,103 @@ def _migrate_automation_status(cursor, db_name: str) -> None:
     except mysql.connector.Error as e:
         print(f"[!] {db_name}: could not widen automations.status ({e}); "
               f"will retry on the next start")
+
+
+def _migrate_soar_actions(cursor, db_name: str) -> None:
+    """Make `expires_at` and `resolved_at` nullable, at most once.
+
+    A pair of MODIFYs at the bottom of init.sql, described there as
+    idempotent. They were - re-running them raised nothing - which is why it
+    took so long to notice they were not free: MySQL takes a metadata lock for
+    a MODIFY whether or not the type changes, and this file runs on every
+    ingest. A waiting DDL blocks every reader that arrives behind it.
+    """
+    cursor.execute(
+        "SELECT column_name, is_nullable FROM information_schema.columns "
+        "WHERE table_schema = %s AND table_name = 'soar_actions' "
+        "AND column_name IN ('expires_at', 'resolved_at')",
+        (db_name,),
+    )
+    rows = cursor.fetchall()
+    if not rows:
+        return                      # no table yet; init.sql creates it correct
+    if all(str(r[1]).upper() == "YES" for r in rows):
+        return                      # already nullable
+
+    try:
+        cursor.execute("SET SESSION lock_wait_timeout = 3")
+        cursor.execute(
+            "ALTER TABLE soar_actions "
+            "MODIFY COLUMN expires_at TIMESTAMP NULL, "
+            "MODIFY COLUMN resolved_at TIMESTAMP NULL"
+        )
+        print(f"[+] {db_name}: soar_actions timestamps made nullable")
+    except mysql.connector.Error as e:
+        print(f"[!] {db_name}: could not relax soar_actions timestamps ({e}); "
+              f"will retry on the next ingest")
+
+
+def _migrate_siem_events(cursor, db_name: str) -> None:
+    """Add `severity` and `techniques` to an older siem_events, at most once.
+
+    These were four bare ALTERs at the bottom of init.sql. On every database
+    that already had them - which is every database, since the CREATE above
+    declares them - each one failed, and create_tables_if_not_exist printed
+
+        [!] SQL Execution Error: 1060 (42S21): Duplicate column name 'severity'
+        [!] SQL Execution Error: 1061 (42000): Duplicate key name 'idx_siem_sev'
+
+    on every ingest. Two costs, and the quieter one is the worse: the noise
+    buried real schema errors in the same log, and each attempt took a
+    metadata lock on siem_events - the table every dashboard query reads -
+    at ingest frequency, which is the shape of failure `_migrate_automation_status`
+    documents above.
+
+    information_schema answers both questions without touching the table, so
+    a database that is already correct does nothing at all.
+    """
+    cursor.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = %s AND table_name = 'siem_events'",
+        (db_name,),
+    )
+    present = {str(r[0]).lower() for r in cursor.fetchall()}
+    if not present:
+        return                      # no table yet; init.sql creates it correct
+
+    cursor.execute(
+        "SELECT index_name FROM information_schema.statistics "
+        "WHERE table_schema = %s AND table_name = 'siem_events'",
+        (db_name,),
+    )
+    indexes = {str(r[0]).lower() for r in cursor.fetchall()}
+
+    pending = []
+    for column, ddl in (
+        ("severity", "ADD COLUMN severity VARCHAR(16) NULL"),
+        ("techniques", "ADD COLUMN techniques VARCHAR(255) NULL"),
+    ):
+        if column not in present:
+            pending.append(ddl)
+    for index, ddl in (
+        ("idx_siem_sev", "ADD KEY idx_siem_sev (severity)"),
+        ("idx_siem_tech", "ADD KEY idx_siem_tech (techniques)"),
+    ):
+        if index not in indexes:
+            pending.append(ddl)
+    if not pending:
+        return
+
+    try:
+        # One ALTER for all of it: MySQL rebuilds the table per statement, and
+        # this is the largest table there is. Never wait on the lock - the
+        # next ingest tries again, and blocking here stalls the readers.
+        cursor.execute("SET SESSION lock_wait_timeout = 3")
+        cursor.execute(f"ALTER TABLE siem_events {', '.join(pending)}")
+        print(f"[+] {db_name}: siem_events migrated ({len(pending)} change(s))")
+    except mysql.connector.Error as e:
+        print(f"[!] {db_name}: could not migrate siem_events ({e}); "
+              f"will retry on the next ingest")
 
 
 # One engine for the whole fleet, built once. The per-host engine lives in the
@@ -273,11 +411,21 @@ def create_tables_if_not_exist(db_name):
             except mysql.connector.Error as e:
                 print(f"[!] SQL Execution Error: {e}")
 
-        # Guarded, and after the CREATEs so the table exists on a fresh DB.
+        # Guarded, and after the CREATEs so the tables exist on a fresh DB.
         try:
             _migrate_automation_status(cursor, db_name)
         except mysql.connector.Error as e:
             print(f"[!] automations.status migration skipped: {e}")
+
+        try:
+            _migrate_siem_events(cursor, db_name)
+        except mysql.connector.Error as e:
+            print(f"[!] siem_events migration skipped: {e}")
+
+        try:
+            _migrate_soar_actions(cursor, db_name)
+        except mysql.connector.Error as e:
+            print(f"[!] soar_actions migration skipped: {e}")
 
         try:
             cursor.execute("""
@@ -290,10 +438,22 @@ def create_tables_if_not_exist(db_name):
                     UNIQUE KEY unique_agent (agent_name)
                 ) ENGINE=InnoDB
             """)
-            try:
-                cursor.execute("ALTER TABLE agent_info ADD COLUMN IF NOT EXISTS os_info VARCHAR(255) NULL")
-            except mysql.connector.Error:
-                pass
+            # MySQL has no ADD COLUMN IF NOT EXISTS - that is MariaDB - so the
+            # guarded form this replaces was a syntax error every time, caught
+            # by a bare `pass`. On a deployment predating os_info the column
+            # was therefore never added, and the OS never showed up for those
+            # agents, with nothing in the log to say why.
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_schema = %s AND table_name = 'agent_info' "
+                "AND column_name = 'os_info'",
+                (db_name,),
+            )
+            if not cursor.fetchone()[0]:
+                cursor.execute("SET SESSION lock_wait_timeout = 3")
+                cursor.execute(
+                    "ALTER TABLE agent_info ADD COLUMN os_info VARCHAR(255) NULL")
+                print(f"[+] {db_name}: agent_info.os_info added")
         except mysql.connector.Error as e:
             print(f"[!] Agent info table creation/alter error: {e}")
 

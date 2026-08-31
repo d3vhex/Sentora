@@ -158,6 +158,13 @@ SESSION_ONLY_HANDLERS = {
     "enroll_agent",
     "list_enrollments",
     "revoke_enrollment",
+    # Not an operator route at all: the peer is an agent, and it authenticates
+    # with `X-Agent-Key` in the first statement of the handler, closing the
+    # socket before anything is registered. An operator permission would be
+    # the wrong check - there is no session here to have one. It also refuses
+    # the fleet-wide secret, which the ordinary agent routes accept, because
+    # this channel carries /self_destruct.
+    "agent_link_socket",
 }
 
 # Named individually so a bulk edit to the list above cannot quietly reopen

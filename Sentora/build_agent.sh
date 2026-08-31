@@ -205,6 +205,8 @@ step "Running PyInstaller..."
     --hidden-import modules.agent_paths \
     --hidden-import modules.screen_capture \
     --hidden-import modules.console \
+    --hidden-import modules.link \
+    --hidden-import websocket \
     --hidden-import modules.db \
     --exclude-module torch \
     --exclude-module torchaudio \
