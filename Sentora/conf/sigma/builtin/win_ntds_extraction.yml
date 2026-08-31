@@ -1,0 +1,34 @@
+title: Active Directory Database Extracted
+id: 8d5a2e70-1c94-4b38-9f62-7a0e3d6c8f41
+status: stable
+description: >
+    NTDS.dit holds every password hash in the domain. Copying it is not a step
+    towards compromise, it is the end of one - and it is done with built-in
+    tools: ntdsutil takes an install-from-media snapshot, or a shadow copy is
+    made and the file read out of it while Windows has the original locked.
+
+    Only meaningful on a domain controller, where it should happen during a
+    planned migration and at no other time. On any other host the file does
+    not exist, so a command naming it is somebody looking in the wrong place -
+    which is also worth knowing.
+references:
+    - https://attack.mitre.org/techniques/T1003/003/
+author: Sentora
+date: 2026/09/01
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    ntdsutil_ifm:
+        CommandLine|contains|all:
+            - 'ntdsutil'
+            - 'ifm'
+    ntds_file:
+        CommandLine|contains: 'ntds.dit'
+    condition: ntdsutil_ifm or ntds_file
+falsepositives:
+    - A planned domain controller migration, which is announced and rare
+level: critical
+tags:
+    - attack.credential_access
+    - attack.t1003.003

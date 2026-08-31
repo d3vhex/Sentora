@@ -177,10 +177,21 @@ LINUX = _render_linux_install("http://example:8000", "203.0.113.1", "TOKEN")
 
 
 def test_the_rendered_linux_installer_is_valid_bash():
+    """The installer is piped straight into `bash` by whoever runs the deploy
+    command, so a syntax error here is a syntax error on their machine."""
+    import shutil
     import subprocess
+
+    if shutil.which("bash") is None:
+        pytest.skip("no bash on PATH")
     result = subprocess.run(["bash", "-n"], input=LINUX.encode("utf-8"),
                             capture_output=True)
-    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    # Shared with test_build_agent_sh, which is where the reasoning lives:
+    # the `bash` on PATH here is usually the WSL shim, and a WSL that will not
+    # start exits non-zero with its own complaint on stdout and stderr empty.
+    # Read as a failure, that says the installer is broken shell.
+    from test_build_agent_sh import _assert_bash_accepted
+    _assert_bash_accepted(result, "the rendered Linux installer")
 
 
 def test_it_has_no_unrendered_format_braces():
