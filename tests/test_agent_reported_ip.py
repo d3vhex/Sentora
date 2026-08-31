@@ -249,9 +249,12 @@ def test_plaintext_and_wrong_key_both_come_back_unchanged():
 # With the server in a container on the agent's own machine it is the other
 # way round: the connection is NAT'd on the way in and arrives from the Docker
 # bridge gateway. The console showed 172.18.0.1 as a Windows host's Primary
-# IP, and every server-to-agent call - config, SOAR dispatch, the screen
-# stream - landed on `Connection refused` against an address that has never
-# had a listener and never will.
+# IP - a router's address given as the identity of a machine.
+#
+# Back when the server dialled agents this was also why config, SOAR dispatch
+# and the screen stream all landed on `Connection refused`. It no longer
+# reaches anything, but the record is still wrong, and a fleet where several
+# hosts share one "Primary IP" is a fleet an operator cannot reason about.
 
 DOCKER_GATEWAY = "172.18.0.1"
 

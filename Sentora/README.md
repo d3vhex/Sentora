@@ -277,10 +277,16 @@ logger automatically, so module-side `print(...)` lines land in
 - The agent runs as root or Administrator by design. Permission audits,
   realtime FIM, firewall rules and many SOAR actions require it. Run it
   on endpoints where you would be comfortable running an EDR.
-- Outbound only. The agent never opens a listening port on the endpoint.
-  The embedded Sanic instance binds to `127.0.0.1` for local control
-  endpoints used by the SOAR `start_vnc` action; nothing accepts
-  external connections.
+- Outbound only, and now literally. The agent serves nothing: it dials the
+  server, keeps that connection, and every command — config, SOAR,
+  restart, uninstall, the screen stream and the console — arrives over it.
+  This claim used to be made about a Sanic listener bound to
+  `0.0.0.0:9099` with `/self_destruct` on it, which is a different claim
+  entirely. The listener is gone, along with the firewall rules the
+  installers used to open for it.
+  The one socket it still binds is `127.0.0.1:9098`, used as a mutex so the
+  installer's watchdog task does not start a second agent every fifteen
+  minutes. It is on loopback and never accepts a connection.
 - No external API calls without an opt-in. OSV is the only network
   dependency for vulnerability checks, and the server can proxy it via
   the air-gap mirror. The agent itself talks to one host: your server.

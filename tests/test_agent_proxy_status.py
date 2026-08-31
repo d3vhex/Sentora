@@ -80,8 +80,9 @@ def test_config_handlers_do_not_relay_a_raw_status(handler):
 
 @pytest.mark.parametrize("handler", ["get_agent_config_proxy", "set_agent_config_proxy"])
 def test_config_handlers_go_through_the_shared_proxy(handler):
-    """`_agent_proxy` is where the address fallback and the status mapping
-    live. A handler that calls the agent directly gets neither."""
+    """`_agent_proxy` is the one place that knows how to reach an agent and
+    how to translate what comes back. A handler that goes around it gets
+    neither, and gets them wrong in its own way."""
     assert "_agent_proxy" in _source(handler)
 
 
@@ -101,31 +102,46 @@ def test_the_third_party_proxy_translates_too():
 def test_an_unreachable_agent_produces_a_reason_not_a_500():
     code = _source("_agent_proxy")
     assert "502" in code
-    assert "Could not reach" in code
-    # The addresses tried are part of the answer: "refused" against an IP that
-    # never had a listener is the confusing case this exists for.
-    assert "tried" in code
+    assert "_no_channel_message" in code
 
 
-def test_the_proxy_tries_every_known_address():
-    """An agent legitimately has two addresses - see `_agent_http_bases`.
-    Failing on the first says nothing about the second."""
+def test_the_proxy_has_no_http_fallback_left():
+    """It used to dial the endpoint on 9099 when the channel was unavailable.
+
+    Nothing that could rescue is lost: the channel is an outbound connection
+    to the same server the agent already posts telemetry to, so any agent
+    reporting at all can open one. The fallback needed an *inbound* path,
+    which is strictly harder - behind NAT or a host firewall it never worked,
+    and making it work meant an authenticated management API with
+    /self_destruct on it, exposed on every endpoint in the fleet.
+    """
     code = _source("_agent_proxy")
-    assert "_agent_http_bases" in code
-    assert "for base in bases" in code
+    for gone in ("_agent_http_bases", "for base in bases", "requests.",
+                 "_try_agent_request"):
+        assert gone not in code, f"{gone} is still in the command path"
 
 
 def test_a_rejected_key_explains_what_to_do():
-    """The operator can act on this one: restart the agent so it re-fetches."""
-    code = _source("_agent_proxy")
+    """The operator can act on this one: restart the agent so it re-fetches.
+
+    A stale key now shows up as a channel that never opens - the server logs
+    `[agent-link] refused a connection` and the agent simply never appears -
+    so the advice moved into the message that explains a missing channel.
+    """
+    code = _source("_no_channel_message")
     assert "bootstrap" in code
+    assert "refused a connection" in code, \
+        "nothing points the operator at the line that names the cause"
 
 
-def test_a_non_json_agent_response_is_not_a_crash():
-    """`resp.json()` on an HTML error page raises, and that used to become a
-    500 whose body was a stack trace."""
-    code = _source("_agent_proxy")
-    assert "non-JSON" in code
+def test_a_missing_channel_is_not_reported_as_being_offline():
+    """Telemetry and commands travel on different connections, so an agent
+    can be reporting normally and still be uncommandable. 'Unreachable' was
+    true of every cause and useful for none."""
+    code = _source("_no_channel_message")
+    assert "look online here" in code
+    assert "predates the channel" in code, \
+        "the most likely cause - an un-upgraded binary - is not named"
 
 
 # --------------------------------------------------------------------------
@@ -140,44 +156,21 @@ def test_a_failed_push_is_not_audited_as_a_config_change():
 
 
 # --------------------------------------------------------------------------
-# Reaching an agent that runs on this machine
+# host.docker.internal outlived the reason it was added
 # --------------------------------------------------------------------------
 #
-# The agent was listening on 0.0.0.0:9099 and every address the server knew
-# was refused, including the right one. Under Docker Desktop the containers
-# live in a Linux VM, so the host's LAN address (192.168.1.26) is reached
-# through a NAT that does not forward back - refused against a machine that is
-# listening.
+# The alias was added so the server could dial an agent running on the
+# container host: under Docker Desktop the containers live in a Linux VM, so
+# the host's LAN address is reached through a NAT that does not forward back,
+# and every address the server knew was refused - including the right one.
 #
-# The signal for this case already existed and was being thrown away: an agent
-# that reaches us from our own bridge gateway is running on the container
-# host. `observed_peer_ip` detects exactly that and discards the gateway as an
-# address, which is right - it cannot be dialled - but it still says where the
-# agent is.
-
-
-def test_the_container_host_is_a_candidate_address():
-    code = _source("_agent_http_bases")
-    assert "host.docker.internal" in code
-    assert "in_container" in code, \
-        "the name is only meaningful from inside a container"
-
-
-def test_the_recorded_addresses_are_tried_first():
-    """On a real deployment - server on its own box, agents on the network -
-    the recorded addresses are correct and this name is not."""
-    code = _source("_agent_http_bases")
-    assert code.index("reported_ip") < code.index("host.docker.internal")
-
-
-def test_loopback_stays_the_last_resort():
-    code = _source("_agent_http_bases")
-    assert code.index("host.docker.internal") < code.rindex("127.0.0.1")
+# Agents are not dialled any more, but the alias is still how this container
+# reaches Ollama on the host, so the compose entry has to stay.
 
 
 def test_compose_defines_the_name_for_plain_docker():
     """Docker Desktop provides it; Linux Docker does not, and without the
-    alias the candidate silently never resolves."""
+    alias the AI endpoint silently never resolves."""
     import yaml
     compose = yaml.safe_load((ROOT / "docker-compose.yaml").read_text(encoding="utf-8"))
     hosts = compose["services"]["app"].get("extra_hosts") or []
@@ -185,36 +178,10 @@ def test_compose_defines_the_name_for_plain_docker():
         "app cannot resolve host.docker.internal on plain Linux Docker"
 
 
-# --------------------------------------------------------------------------
-# The informative error must not be overwritten by the useless one
-# --------------------------------------------------------------------------
-#
-# `_agent_proxy` kept a single `last_detail` and overwrote it per address, so
-# the address that connected and answered 401 - which names the actual
-# problem - was buried under "connection refused" from the loopback fallback
-# tried after it. The operator read the reason for an address that was never
-# going to work, and never saw the one that did.
-
-
-def test_every_address_reports_its_own_outcome():
-    code = _source("_agent_proxy")
-    assert "outcomes" in code
-    assert "outcomes.append" in code
-
-
-def test_a_rejected_key_is_not_lost_behind_a_later_refusal():
-    """Reaching the agent is a different fact from failing to reach it, and it
-    survives whatever the remaining addresses do."""
-    code = _source("_agent_proxy")
-    assert "reached, but the agent rejected" in code
-    # The headline is chosen from what happened, not from the last iteration.
-    assert "if reached:" in code
-
-
-def test_the_headline_distinguishes_the_two_failures():
-    code = _source("_agent_proxy")
-    assert "rejected this server's key" in code
-    assert "Could not reach" in code
+def test_the_alias_is_still_load_bearing():
+    """If nothing used it, the compose entry above would be cargo. The AI
+    default endpoint is what keeps it honest."""
+    assert "host.docker.internal" in (ROOT / "ai" / "utils.py").read_text(encoding="utf-8")
 
 
 # --------------------------------------------------------------------------
@@ -246,7 +213,7 @@ def test_the_two_spellings_of_one_host():
     assert underscore == "DESKTOP_EVS8H9J"
 
 
-@pytest.mark.parametrize("handler", ["_get_agent_keys", "set_agent_display_name",
+@pytest.mark.parametrize("handler", ["_linked_agent", "set_agent_display_name",
                                      "_agent_display_names"])
 def test_identity_lookups_accept_both_spellings(handler):
     assert "_agent_name_forms" in _source(handler), (
@@ -254,19 +221,20 @@ def test_identity_lookups_accept_both_spellings(handler):
         f"for any host whose name contains a hyphen")
 
 
-def test_the_key_lookup_returns_every_match():
-    """Two names can flatten to one spelling. `_try_agent_request` already
-    walks candidate keys, so an ambiguity costs one extra request rather than
-    a wrong answer."""
-    code = _source("_get_agent_keys")
-    assert "fetchall" in code
-    assert "LIMIT 1" not in code
+def test_the_channel_is_found_under_either_spelling():
+    """The lookup this replaces held candidate keys to present when dialling
+    an agent. Nothing dials one now, so the same mismatch turns up one step
+    later: a channel that registered as `DESKTOP-EVS8H9J` and a console
+    asking for `DESKTOP_EVS8H9J` would find no link, and every command would
+    report the agent as having no channel while it sat there connected."""
+    code = _source("_linked_agent")
+    assert "_agent_name_forms" in code
 
 
-def test_the_master_secret_is_still_only_a_fallback():
-    """It is appended after the per-agent keys, never instead of them - the
-    whole failure was reaching for it when the real key existed."""
-    code = _source("_get_agent_keys")
-    # The per-agent keys are collected before the fallback is appended. Read
-    # off the statements, not the docstring, which names both.
-    assert code.index("keys.append(row[0])") < code.index("keys.append(AGENT_SHARED_SECRET)")
+def test_the_master_secret_cannot_stand_for_an_agent():
+    """It used to be a fallback key to try. On the channel it is refused
+    outright - `/self_destruct` rides that connection, and one link standing
+    for every endpoint is not a thing to have."""
+    code = _source("_validate_agent_auth_sync")
+    assert "AGENT_SHARED_SECRET" not in code
+    assert "agent_identities" in code

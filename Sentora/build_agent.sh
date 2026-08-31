@@ -149,8 +149,11 @@ fi
 # CWD, not the specpath. The dest;src separator on Linux is `:`.
 #
 # --collect-all pulls package data + hidden submodules + binaries. Required
-# for sanic (tracerite ships style.css as package data), PIL/mss (native
-# libs the static scanner misses), and sanic plugins.
+# for PIL/mss, whose native libs the static scanner misses.
+#
+# sanic, sanic_cors, sanic_routing, tracerite and html5tagger were here for
+# the agent's HTTP listener. The agent dials the server now and serves
+# nothing, so the whole web stack left the binary with it.
 
 step "Running PyInstaller..."
 "$PY" -m PyInstaller \
@@ -165,11 +168,6 @@ step "Running PyInstaller..."
     --specpath "$SCRIPT_DIR" \
     --add-data "$SCRIPT_DIR/conf:conf" \
     --add-data "$SCRIPT_DIR/modules:modules" \
-    --collect-all sanic \
-    --collect-all sanic_cors \
-    --collect-all sanic_routing \
-    --collect-all tracerite \
-    --collect-all html5tagger \
     --collect-all PIL \
     --collect-all mss \
     --hidden-import cryptography \

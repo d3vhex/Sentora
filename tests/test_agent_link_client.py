@@ -332,6 +332,58 @@ def test_closing_a_stream_tears_down_the_local_session(link):
         assert 7 not in client._streams
 
 
+def test_a_dropped_channel_closes_every_stream(link):
+    """A channel number belongs to one connection.
+
+    The server allocates them per link and builds a fresh registry when the
+    agent reconnects, so a stream left running produced into the new socket
+    under a number nobody had opened:
+
+        [agent-link] DESKTOP-EVS8H9J-3: data for a stream that is gone (ch 1)
+
+    That is the visible half. The costly half is that whatever sat behind the
+    stream kept running - a screen capture went on capturing, and a console
+    went on holding the one shell this host allows, so every later console
+    request was refused as a duplicate of a session nobody was attached to.
+    """
+    console, screen = FakeStream(), FakeStream()
+    client = _client(link)
+    with client._streams_lock:
+        client._streams[1] = console
+        client._streams[2] = screen
+
+    client._close_all_streams("the channel dropped")
+
+    assert console.closed_with == "the channel dropped"
+    assert screen.closed_with == "the channel dropped"
+    with client._streams_lock:
+        assert not client._streams
+
+
+def test_the_session_teardown_is_what_closes_them(link):
+    """In the `finally`, so it runs whether the socket closed cleanly, timed
+    out, or raised - a reconnect happens on all three."""
+    import ast
+    import inspect
+
+    source = inspect.getsource(link.AgentLinkClient._serve_once)
+    tree = ast.parse(source.lstrip())
+    handler = next(n for n in ast.walk(tree) if isinstance(n, ast.Try) and n.finalbody)
+    body = "\n".join(ast.unparse(n) for n in handler.finalbody)
+    assert "_close_all_streams" in body
+    assert body.index("_close_all_streams") < body.index("ws.close"), \
+        "a pump mid-write should find no channel rather than a reconnected one"
+
+
+def test_a_stream_already_torn_down_is_not_announced(link):
+    """The pump's own `finally` tells the server it closed. After
+    `_close_all_streams` there is nothing to tell it about, and saying so on
+    the next connection names a channel that server has never heard of."""
+    client = _client(link)
+    client._close_stream(4, "gone already", tell_server=True)
+    assert client._ws.sent == []
+
+
 def test_the_client_library_is_declared():
     """`import websocket` at runtime with nothing in requirements is a crash
     on the endpoint, found by an operator rather than by a build."""
