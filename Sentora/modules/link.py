@@ -207,6 +207,9 @@ class AgentLinkClient:
         finally:
             self.connected = False
             self._ws = None
+            # Before the socket, so a pump that is mid-write finds no channel
+            # rather than a reconnected one.
+            self._close_all_streams("the channel dropped")
             try:
                 ws.close()
             except Exception as e:
@@ -334,8 +337,35 @@ class AgentLinkClient:
                 stream.close(why)
             except Exception as e:
                 print(f"[link] could not close stream {channel}: {e}", flush=True)
-        if tell_server:
+        # Only announce a stream this end actually had. A pump whose stream
+        # was already torn down by `_close_all_streams` would otherwise send a
+        # close for it on the *next* connection, where the number means
+        # nothing to a server that has built a fresh registry.
+        if tell_server and stream is not None:
             self._send({"t": "close", "ch": channel, "why": why})
+
+    def _close_all_streams(self, why: str) -> None:
+        """End every stream when the session does.
+
+        A channel number belongs to one connection: the server allocates it
+        per link and builds a fresh registry when the agent reconnects.
+        Leaving streams running across a reconnect meant their pumps went on
+        producing into the new socket under numbers nobody had opened -
+
+            [agent-link] DESKTOP-EVS8H9J-3: data for a stream that is gone (ch 1)
+
+        - which is the visible half. The costly half is that whatever was
+        behind them kept running: a screen capture went on capturing, and a
+        console went on holding the one shell this host allows, so every later
+        console request was refused as a duplicate of a session nobody was
+        attached to.
+        """
+        with self._streams_lock:
+            channels = list(self._streams)
+        for channel in channels:
+            self._close_stream(channel, why)
+        if channels:
+            print(f"[link] closed {len(channels)} stream(s): {why}", flush=True)
 
     def _answer(self, frame: dict) -> None:
         request_id = frame.get("id")

@@ -358,29 +358,39 @@ TRUSTED_PROXIES=10.0.0.0/8,192.168.1.5
 
 Leave it empty when the app is reached directly.
 
-### The agent's own API
+### How the server reaches an agent
 
-The agent listens on `127.0.0.1:9099` and runs as SYSTEM or root. Every route
-requires `X-Agent-Key`; `/self_destruct` requires this agent's own enrolment
-key specifically, so a leaked fleet-wide secret cannot uninstall every
-endpoint at once. `/health` answers liveness without a key and discloses
-nothing further without one.
+It does not. The agent opens a WebSocket to the server and keeps it, and every
+server-to-agent request rides that one connection — config, SOAR, restart,
+uninstall, the screen stream and the console. The agent serves nothing, so
+there is nothing on an endpoint to reach, scan or authenticate to.
 
-There is no permissive fallback. An earlier build accepted any non-empty key
-whenever `AGENT_MASTER_SECRET` was unset on the host — which nothing ever set,
-so it was the default everywhere. An EDR that fails open is worse than no EDR,
-because the console reports the endpoint as protected.
+It does bind one socket: `127.0.0.1:9098`, used as a mutex rather than as a
+service. It never accepts a connection — the bind failing is the whole signal,
+and it is on loopback — and it exists because the installer registers a
+watchdog task that launches the agent every fifteen minutes, which without a
+guard would stack up a second agent on every tick.
 
-Nothing reaches in. The agent opens a WebSocket to the server and keeps it,
-and every server-to-agent request rides that connection — config, SOAR,
-restart, uninstall, the screen stream and the console. This is why the agent
-works behind NAT and behind a host firewall, neither of which the previous
-arrangement survived, and why the installers now *remove* the inbound rule for
-9099 rather than adding one.
+The channel is authenticated once, when the agent dials in, against
+`agent_identities` — this agent's own enrolment key, never the fleet-wide
+secret, because `/self_destruct` rides this connection and a leaked master key
+should not uninstall every endpoint at once.
 
-`AGENT_BIND` moves the listener, and `0.0.0.0` is the way back if a deployment
-finds something the channel does not carry. Setting it exposes a management
-API on every endpoint that has it, so the agent says so at startup.
+This is also why the agent works behind NAT and behind a host firewall,
+neither of which the previous arrangement survived, and why the installers
+*remove* the inbound rule for 9099 rather than adding one.
+
+It used to be the other way round. The agent ran a management API on
+`0.0.0.0:9099` as SYSTEM or root, and the server dialled it — which meant an
+address to guess, a Windows firewall rule a session-0 service cannot prompt
+for, a `ufw` rule on Linux, and `/self_destruct` exposed on every endpoint in
+the fleet. Worse, a permissive branch accepted any non-empty `X-Agent-Key`
+whenever `AGENT_MASTER_SECRET` was unset on the host, and nothing in this
+repository ever set it, so every default installation ran that way. An EDR
+that fails open is worse than no EDR, because the console reports the endpoint
+as protected.
+
+That was fixed by authenticating the routes properly. Then the routes went.
 
 ### CORS
 

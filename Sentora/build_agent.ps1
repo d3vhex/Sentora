@@ -77,8 +77,11 @@ if (-not $NoClean) {
 # the CWD (not the specpath). The dest;src separator on Windows is `;`.
 #
 # --collect-all pulls package data + hidden submodules + binaries. Required
-# for sanic (tracerite ships style.css as package data), PIL/mss (native
-# libs the static scanner misses), and sanic plugins.
+# for PIL/mss, whose native libs the static scanner misses.
+#
+# sanic, sanic_cors, sanic_routing, tracerite and html5tagger were here for
+# the agent's HTTP listener. The agent dials the server now and serves
+# nothing, so the whole web stack left the binary with it.
 
 $confPath    = Join-Path $ScriptDir "conf"
 $modulesPath = Join-Path $ScriptDir "modules"
@@ -96,11 +99,6 @@ $addData = @(
 )
 
 $collectAll = @(
-    "sanic",
-    "sanic_cors",
-    "sanic_routing",
-    "tracerite",
-    "html5tagger",
     "PIL",
     "mss"
 )

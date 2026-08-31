@@ -209,6 +209,46 @@ def _migrate_automation_status(cursor, db_name: str) -> None:
               f"will retry on the next start")
 
 
+def _migrate_agent_info(cursor, db_name: str) -> None:
+    """Bring an older agent_info up to what the check-in INSERT writes.
+
+    These were four ALTERs run unconditionally: `os_info` here, written as
+    `ADD COLUMN IF NOT EXISTS` - which is MariaDB, so against MySQL it was a
+    syntax error every time and the column never appeared on any deployment
+    predating it - and hostname, mac_address and reported_ip inside
+    `update_agent_info`, behind `except Exception: pass`, on *every agent
+    check-in*. On a database that already had them, which is all of them,
+    that is three failed statements and three metadata locks per check-in,
+    at whatever rate the fleet reports in.
+    """
+    wanted = (
+        ("reported_ip", "ADD COLUMN reported_ip VARCHAR(45) NULL"),
+        ("os_info", "ADD COLUMN os_info VARCHAR(255) NULL"),
+        ("hostname", "ADD COLUMN hostname VARCHAR(255) NULL"),
+        ("mac_address", "ADD COLUMN mac_address VARCHAR(48) NULL"),
+    )
+    cursor.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = %s AND table_name = 'agent_info'",
+        (db_name,),
+    )
+    present = {str(r[0]).lower() for r in cursor.fetchall()}
+    if not present:
+        return                      # no table yet; the CREATE above made it right
+
+    pending = [ddl for name, ddl in wanted if name not in present]
+    if not pending:
+        return
+
+    try:
+        cursor.execute("SET SESSION lock_wait_timeout = 3")
+        cursor.execute(f"ALTER TABLE agent_info {', '.join(pending)}")
+        print(f"[+] {db_name}: agent_info gained {len(pending)} column(s)")
+    except mysql.connector.Error as e:
+        print(f"[!] {db_name}: could not migrate agent_info ({e}); "
+              f"will retry on the next check-in")
+
+
 def _migrate_soar_actions(cursor, db_name: str) -> None:
     """Make `expires_at` and `resolved_at` nullable, at most once.
 
@@ -428,32 +468,28 @@ def create_tables_if_not_exist(db_name):
             print(f"[!] soar_actions migration skipped: {e}")
 
         try:
+            # Every column update_agent_info's INSERT names is declared here.
+            #
+            # hostname, mac_address and reported_ip used to be added by ALTERs
+            # in that function instead, which meant a fresh database depended
+            # on those running before its first check-in - and once they are
+            # guarded, a guard that correctly does nothing would have broken
+            # it. A migration is for databases that already exist; the CREATE
+            # has to stand on its own.
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS agent_info (
                     id INT AUTO_INCREMENT PRIMARY KEY,
                     agent_name VARCHAR(255) NOT NULL,
                     public_ip VARCHAR(45),
+                    reported_ip VARCHAR(45) NULL,
                     os_info VARCHAR(255) NULL,
+                    hostname VARCHAR(255) NULL,
+                    mac_address VARCHAR(48) NULL,
                     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     UNIQUE KEY unique_agent (agent_name)
                 ) ENGINE=InnoDB
             """)
-            # MySQL has no ADD COLUMN IF NOT EXISTS - that is MariaDB - so the
-            # guarded form this replaces was a syntax error every time, caught
-            # by a bare `pass`. On a deployment predating os_info the column
-            # was therefore never added, and the OS never showed up for those
-            # agents, with nothing in the log to say why.
-            cursor.execute(
-                "SELECT COUNT(*) FROM information_schema.columns "
-                "WHERE table_schema = %s AND table_name = 'agent_info' "
-                "AND column_name = 'os_info'",
-                (db_name,),
-            )
-            if not cursor.fetchone()[0]:
-                cursor.execute("SET SESSION lock_wait_timeout = 3")
-                cursor.execute(
-                    "ALTER TABLE agent_info ADD COLUMN os_info VARCHAR(255) NULL")
-                print(f"[+] {db_name}: agent_info.os_info added")
+            _migrate_agent_info(cursor, db_name)
         except mysql.connector.Error as e:
             print(f"[!] Agent info table creation/alter error: {e}")
 
@@ -500,28 +536,28 @@ def update_agent_info(agent: str, public_ip: str, os_info: str = None, hostname:
         Ours is the one worth showing an operator.
       - Server in Docker on the same machine as the agent: the connection
         arrives from the bridge gateway (172.18.0.1), which is a *router*, not
-        the agent. Calling back to it reaches nothing - the agent's own
-        address is the only usable one.
+        the agent. The agent's own address is the only one that describes a
+        host.
 
-    Overwriting one with the other threw away the address that worked, and
-    server->agent features (VNC, SOAR dispatch) failed with `Connection
-    refused` against an IP that never had a listener on it. Both are kept so
-    the caller can try them in order instead of us guessing here.
+    Both are kept because they answer different questions. This used to be
+    about which one to dial - overwriting one with the other threw away the
+    address that worked, and VNC and SOAR dispatch failed with `Connection
+    refused` against an IP that never had a listener on it. Nothing is dialled
+    now, and the pair is worth more than it was rather than less:
+    `reported_ip` is where the endpoint believes it sits, and `public_ip` is
+    where its packets actually arrive from - the one thing recorded here that
+    a compromised agent cannot forge, because it is a property of the TCP
+    connection rather than of anything the agent said.
     """
     db_name = create_agent_db_if_not_exists(agent)
     create_tables_if_not_exist(db_name)
     conn = connect_db(db_name)
     cursor = conn.cursor()
     try:
-        for col, ddl in (
-            ("hostname", "ALTER TABLE agent_info ADD COLUMN hostname VARCHAR(255) NULL"),
-            ("mac_address", "ALTER TABLE agent_info ADD COLUMN mac_address VARCHAR(48) NULL"),
-            ("reported_ip", "ALTER TABLE agent_info ADD COLUMN reported_ip VARCHAR(45) NULL"),
-        ):
-            try:
-                cursor.execute(ddl)
-            except Exception:
-                pass
+        # The columns are declared in the CREATE and any older table was
+        # migrated by `_migrate_agent_info`, both inside the
+        # `create_tables_if_not_exist` above. Three unconditional ALTERs used
+        # to sit here instead, running on every single check-in.
         cursor.execute("""
             INSERT INTO agent_info (agent_name, public_ip, reported_ip, os_info, hostname, mac_address, last_seen)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
@@ -709,11 +745,10 @@ def _own_gateways() -> set[str]:
 def peer_is_a_local_router(host: str, gateways: set[str]) -> bool:
     """Whether this peer address is a router on our side rather than a host.
 
-    A NAT gateway's address is not the address of anything that answers. When
-    the peer we see is our own default gateway, the connection has been
-    translated on the way in and the source address has been replaced by the
-    router's - so it tells us where the packets entered, not where the agent
-    is.
+    When the peer we see is our own default gateway, the connection has been
+    translated on the way in and the source address replaced by the router's.
+    It tells us where the packets entered our network, not where the agent is,
+    so it is not an answer to "which machine is this".
     """
     return bool(host) and host in gateways
 
@@ -722,14 +757,18 @@ def observed_peer_ip(writer) -> str | None:
     """The address this connection actually came from, when it tells us more
     than the agent already did.
 
+    Two properties, and only the first is why it was written. It is usually
+    the more public address: on a cloud VM the agent sees 172.31.x and we see
+    the elastic IP, and the elastic IP is the one worth showing an operator.
+    The second matters more now - it is the only address here the agent does
+    not supply, so it is the only one a compromised endpoint cannot lie about.
+
     Returns None when the peer is loopback or link-local, because that means
     the agent is on this host or reaching us through something local, and its
     own idea of its address is the better one.
 
     Private ranges are *kept*. On a flat corporate LAN 10.x is the real
-    address of the machine and there is nothing more public to have; the case
-    this exists for is a cloud VM, where the agent sees 172.31.x and the
-    server sees the elastic IP.
+    address of the machine and there is nothing more public to have.
     """
     try:
         peer = writer.get_extra_info("peername")
@@ -761,10 +800,10 @@ def observed_peer_ip(writer) -> str | None:
     # case it was written for. With the server in a container on the agent's
     # own machine it is the other way round: the connection is NAT'd on the
     # way in and arrives from the bridge gateway, 172.18.0.1. That address is
-    # a router. Nothing listens on it, it is not where the agent is, and
-    # recording it overwrote the one address that worked - which is how the
-    # console came to show a Docker gateway as a host's "Primary IP" and every
-    # server-to-agent call landed on `Connection refused`.
+    # a router, not a host, and recording it overwrote the one address that
+    # described a machine - which is how the console came to show a Docker
+    # gateway as a host's "Primary IP", and, back when the server dialled
+    # agents, why every call to that endpoint was refused.
     #
     # Decided from our own routing table, so it needs no configuration and
     # asks nothing outside.

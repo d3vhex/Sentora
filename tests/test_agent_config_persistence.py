@@ -181,14 +181,14 @@ def test_the_config_commands_no_longer_walk_up_from_dunder_file():
         assert "os.path.dirname(os.path.abspath(__file__))" not in _command(name)
 
 
-def test_the_route_and_the_channel_run_the_same_code():
-    """Two implementations of "write the rules file" would drift, and the one
-    that drifted would be reachable only in the deployments that had already
-    moved to the channel - so the bug would appear on exactly the hosts nobody
-    was still watching the old path on."""
-    for handler, command in (("get_config", "cmd_get_config"),
-                             ("set_config", "cmd_set_config")):
-        assert command in _command(handler)
+def test_the_channel_runs_the_shared_command():
+    """There were two callers - an HTTP route and the channel - and two
+    implementations of "write the rules file" would have drifted, with the
+    drifted one reachable only on hosts that had already moved to the channel.
+
+    Sharing `cmd_*` is what made deleting the route a deletion rather than a
+    rewrite: the channel was already running the same code.
+    """
     dispatch = _command("dispatch_channel_request")
     assert "cmd_get_config" in dispatch
     assert "cmd_set_config" in dispatch

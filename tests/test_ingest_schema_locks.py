@@ -41,6 +41,7 @@ MIGRATIONS = {
     "_migrate_automation_status": "automations",
     "_migrate_siem_events": "siem_events",
     "_migrate_soar_actions": "soar_actions",
+    "_migrate_agent_info": "agent_info",
 }
 
 
@@ -126,17 +127,73 @@ def test_soar_actions_timestamps_are_nullable_in_the_create():
         )
 
 
+def test_the_check_in_path_does_not_alter_on_every_call():
+    """`update_agent_info` ran three ALTERs behind `except Exception: pass` on
+    every agent check-in - three failed statements and three metadata locks
+    per report, at whatever rate the fleet checks in."""
+    server = SERVER_PY.read_text(encoding="utf-8")
+    start = server.index("def update_agent_info")
+    body = server[start:server.index("\ndef ", start + 1)]
+    assert "ALTER TABLE" not in body.upper(), (
+        "update_agent_info still migrates its own table on every check-in"
+    )
+
+
+def test_the_columns_the_check_in_writes_are_in_the_create():
+    """hostname, mac_address and reported_ip are named by that INSERT. They
+    used to be added by the ALTERs above, so a fresh database depended on
+    those running first - and a guard that correctly does nothing would then
+    have broken the very first check-in."""
+    server = SERVER_PY.read_text(encoding="utf-8")
+    block = re.search(
+        r"CREATE TABLE IF NOT EXISTS agent_info\s*\((.*?)\n\s*\)", server, re.S)
+    assert block, "agent_info CREATE not found"
+    for column in ("reported_ip", "os_info", "hostname", "mac_address"):
+        assert column in block.group(1), f"{column} is written but never created"
+
+
+def test_the_playbook_routes_do_not_alter_on_every_request():
+    """`ensure_playbooks_table` is called from every playbook route, and both
+    columns are in its CREATE - so the two ALTERs it used to run failed on
+    every request and locked the table to do it."""
+    app = (ROOT / "app.py").read_text(encoding="utf-8")
+    start = app.index("async def ensure_playbooks_table")
+    body = app[start:app.index("\ndef ", start + 1)]
+    assert "information_schema" in body, "the migration is unguarded"
+    assert body.index("information_schema") < body.upper().index("ALTER TABLE"), \
+        "it checks after altering, which is not a guard"
+    assert "lock_wait_timeout" in body
+    assert "except Exception:\n        pass" not in body, \
+        "a migration that fails silently becomes a failing SELECT elsewhere"
+
+
+def _server_code_only() -> str:
+    """server.py with its comments and docstrings removed.
+
+    Both are prose, and the migrations here document the broken DDL they
+    replaced by quoting it. Matching the raw file reads the warning as the
+    thing being warned about.
+    """
+    tree = ast.parse(SERVER_PY.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if not isinstance(body, list) or not body:
+            continue
+        if not isinstance(node, (ast.Module, ast.FunctionDef,
+                                 ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        first = body[0]
+        if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) \
+                and isinstance(first.value.value, str):
+            del body[0]
+    return ast.unparse(tree)
+
+
 def test_os_info_is_not_guarded_with_mariadb_syntax():
     """`ADD COLUMN IF NOT EXISTS` is MariaDB; against MySQL it is a syntax
     error. Behind a bare `except: pass` that meant the column was never added
     on any deployment predating it, silently - the OS column just stayed empty
-    for those agents.
-
-    Comment lines are dropped first: the note left where that call used to be
-    quotes the clause it warns about.
-    """
-    code = "\n".join(l for l in SERVER_PY.read_text(encoding="utf-8").splitlines()
-                     if not l.strip().startswith("#"))
-    assert "ADD COLUMN IF NOT EXISTS" not in code, (
+    for those agents."""
+    assert "ADD COLUMN IF NOT EXISTS" not in _server_code_only(), (
         "MySQL rejects this outright, so the migration never applies"
     )

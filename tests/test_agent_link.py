@@ -555,11 +555,13 @@ def test_noise_from_an_endpoint_does_not_drop_the_channel():
     assert "continue" in code
 
 
-def test_the_proxy_prefers_the_channel():
-    """`_agent_proxy` is the chokepoint every server-to-agent feature already
-    goes through, so preferring the channel here moves all of them at once."""
+def test_the_proxy_goes_only_by_the_channel():
+    """`_agent_proxy` is the chokepoint every server-to-agent feature goes
+    through, so this is where the HTTP fallback lived and where it ended."""
     code = _handler("_agent_proxy")
-    assert code.index("_linked_agent") < code.index("_agent_http_bases")
+    assert "_linked_agent" in code
+    assert "_agent_http_bases" not in code
+    assert "requests." not in code, "the endpoint is not dialled any more"
 
 
 def test_the_channel_is_found_under_either_spelling_of_the_name():
@@ -575,38 +577,72 @@ def test_the_channel_is_found_under_either_spelling_of_the_name():
     assert "_agent_name_forms" in code
 
 
-def test_the_server_only_sends_what_the_agent_implements():
-    """The two lists must not drift.
+def _paths_the_server_sends() -> set[str]:
+    """Every path app.py asks an agent for, taken from the call sites.
 
-    A path the server routes down the channel but the agent has no case for
-    comes back 501 - a perfectly valid answer, so nothing raises and nothing
-    falls back to HTTP. That command would simply stop working, quietly, on
-    every agent new enough to have a channel. `/soar/execute` is the live
-    example: it stays on HTTP precisely because it is not in the dispatcher.
+    Read off the calls rather than a hand-kept list. The list this replaces
+    was a third place to keep in step, and a path missing from it silently
+    kept using the HTTP fallback - which is exactly how /soar/execute sat on
+    HTTP for as long as it did.
     """
-    import re
+    tree = ast.parse((ROOT / "app.py").read_text(encoding="utf-8"))
+    argument = {"_agent_proxy": 2, "_agent_lifecycle_command": 1}
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        index = argument.get(node.func.id)
+        if index is None or len(node.args) <= index:
+            continue
+        arg = node.args[index]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            found.add(arg.value)
+        elif isinstance(arg, ast.JoinedStr):
+            # f"/config/{cfg_type}" - the fixed prefix is what has to exist.
+            first = arg.values[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                found.add(first.value)
+    return found
 
-    server = (ROOT / "app.py").read_text(encoding="utf-8")
-    routed = set(re.findall(
-        r'"(/[a-z_/]+)"',
-        server[server.index("_CHANNEL_PATHS = "):server.index("def _path_moved_to_channel")]))
+
+def test_the_server_only_sends_what_the_agent_implements():
+    """The two sides must not drift, and there is nothing to catch it now.
+
+    A path the server sends down the channel but the agent has no case for
+    comes back 501 - a perfectly valid answer, so nothing raises. While an
+    HTTP fallback existed that was merely a slow path; with the fallback gone
+    the command simply stops working, quietly, on every agent in the fleet.
+    """
+    sent = _paths_the_server_sends()
+    assert sent, "no call sites found - the scan is broken, not the code"
 
     agent_tree = ast.parse((ROOT / "Sentora" / "main.py").read_text(encoding="utf-8"))
     dispatch = next(
         ast.unparse(n) for n in ast.walk(agent_tree)
         if isinstance(n, ast.FunctionDef) and n.name == "dispatch_channel_request")
 
-    for path in routed:
+    for path in sorted(sent):
         assert path in dispatch, (
-            f"the server routes {path} down the channel, but the agent's "
-            f"dispatcher has no case for it - it would answer 501 and the "
-            f"command would stop working with nothing falling back")
+            f"app.py asks agents for {path}, but the agent's dispatcher has "
+            f"no case for it - it answers 501 and the command stops working, "
+            f"with nothing left to fall back to")
 
 
-def test_soar_runs_the_same_code_on_both_transports():
+def test_the_lifecycle_commands_are_among_them():
+    """Restart, reload and uninstall are the ones an operator notices last:
+    they are rare, and a queued row makes a failure look like a delay."""
+    sent = _paths_the_server_sends()
+    for path in ("/restart", "/reload_auth", "/self_destruct"):
+        assert path in sent, f"{path} is not sent from any call site"
+
+def test_soar_runs_the_shared_command():
     """A hundred lines of per-action validation, and two copies of it would
-    drift - with the drifted copy reachable only where the channel is already
-    in use, which is where nobody is still watching the old path."""
+    have drifted - with the drifted copy reachable only where the channel was
+    already in use, which is where nobody was still watching the old path.
+
+    The HTTP route is gone now. Sharing `cmd_soar_execute` first is what let
+    it go without anything being rewritten to replace it.
+    """
     agent = (ROOT / "Sentora" / "main.py").read_text(encoding="utf-8")
     tree = ast.parse(agent)
 
@@ -615,25 +651,18 @@ def test_soar_runs_the_same_code_on_both_transports():
                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
                     and n.name == name)
 
-    assert "cmd_soar_execute" in body("soar_execute")
     assert "cmd_soar_execute" in body("dispatch_channel_request")
-    # The command must not be returning Sanic responses down a JSON channel.
+    # It returns `(body, status)`, not a web framework's response object.
     assert "sanic_json" not in body("cmd_soar_execute")
 
 
-def test_the_console_prefers_the_channel():
-    """A console riding the agent's own connection needs no port open on the
+def test_the_console_rides_the_channel():
+    """A console on the agent's own connection needs no port open on the
     endpoint, which is the entire point of the exercise."""
     code = _handler("console_proxy")
-    assert code.index("_linked_agent") < code.index("_console_relay")
+    assert "_linked_agent" in code
     assert "_relay_channel_stream" in code
-
-
-def test_the_console_still_falls_back_to_a_direct_connection():
-    """Agents are upgraded one at a time; an old binary has no channel."""
-    code = _handler("console_proxy")
-    assert "_console_relay" in code
-    assert "falling back" in code
+    assert "_console_relay" not in code, "the direct websocket fallback is gone"
 
 
 def test_a_channel_stream_is_always_closed_on_the_agent_too():
@@ -666,10 +695,11 @@ def test_an_unknown_stream_kind_is_refused_by_name():
     assert "raise ValueError" in body
 
 
-def test_the_screen_prefers_the_channel_too():
+def test_the_screen_rides_the_channel_too():
     code = _handler("vnc_proxy")
-    assert code.index("_linked_agent") < code.index("_agent_http_bases")
+    assert "_linked_agent" in code
     assert "_relay_channel_stream" in code
+    assert "_screen_relay" not in code, "the direct websocket fallback is gone"
 
 
 def test_a_screen_frame_is_relayed_as_binary():
@@ -890,9 +920,16 @@ def test_the_socket_sends_stream_payloads_as_binary():
     assert send.index("isinstance") < send.index("pyjson.dumps")
 
 
-def test_the_http_fallback_is_still_there():
-    """Agents are upgraded one at a time. An old binary that cannot open a
-    channel has to keep working while the fleet catches up."""
-    code = _handler("_agent_proxy")
-    assert "_agent_http_bases" in code
-    assert "falling back to HTTP" in code
+def test_an_agent_without_a_channel_is_told_why():
+    """The fallback is gone, so this is the whole answer for an agent that
+    cannot be commanded - and "unreachable" was true of every cause and
+    useful for none.
+
+    A binary predating the channel is the live case: it is running, it is
+    reporting telemetry over a separate connection, and it looks online in
+    the console while being completely uncommandable.
+    """
+    code = _handler("_no_channel_message")
+    assert "predates the channel" in code
+    assert "look online here" in code
+    assert "bootstrap" in code, "a stale key is a cause and has a fix"

@@ -5,8 +5,6 @@ psutil
 pandas
 requests
 psycopg2-binary
-sanic
-sanic-cors
 cryptography
 pywin32; platform_system == 'Windows'
 # ConPTY, for the interactive console. Without it the Windows agent can only
