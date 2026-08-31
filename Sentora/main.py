@@ -26,6 +26,7 @@ import modules.enc_db as enc_db
 import modules.screen_capture as screen_capture
 import modules.agent_paths as agent_paths
 import modules.console as console
+import modules.link as link
 
 import logging
 import builtins
@@ -923,24 +924,37 @@ async def self_destruct(request: Request):
     # It is also the half that decides the rest: with the watchdog still armed
     # the agent comes back, and deleting files first would only make it come
     # back damaged.
-    removed, detail = await asyncio.to_thread(disable_autostart)
+    body, status = await asyncio.to_thread(cmd_self_destruct)
+    return sanic_json(body, status=status)
+
+
+def cmd_self_destruct() -> tuple[dict, int]:
+    """Uninstall this agent. Shared with the channel - see cmd_get_config.
+
+    The autostart goes first and synchronously, because it is the half whose
+    outcome the caller can still be told: once the process exits there is
+    nobody left to report anything. It is also the half that decides the rest,
+    since with the watchdog still armed the agent comes back, and deleting
+    files first would only make it come back damaged.
+    """
+    removed, detail = disable_autostart()
     if not removed:
         _uninstall_log(f"REFUSED: could not remove autostart ({detail})")
-        return sanic_json({
+        return {
             "ok": False,
             "status": "failed",
             "error": f"could not remove the agent's autostart, so it would "
                      f"restart after deletion: {detail}. Nothing was deleted "
                      f"and this agent is still installed.",
-        }, status=500)
+        }, 500
 
     threading.Thread(target=perform_destruction, daemon=True).start()
-    return sanic_json({
+    return {
         "ok": True,
         "status": "uninstalling",
         "message": f"Autostart removed ({detail}); files are being deleted "
                    f"and the agent is exiting.",
-    })
+    }, 200
 
 
 @app.post("/restart")
@@ -954,7 +968,12 @@ async def restart_agent(request):
     """
     if not _check_auth_header(request):
         return sanic_json({"ok": False, "error": "unauthorized"}, status=401)
+    body, status = cmd_restart()
+    return sanic_json(body, status=status)
 
+
+def cmd_restart() -> tuple[dict, int]:
+    """Relaunch this process. Shared with the channel - see cmd_get_config."""
     def restart():
         old_pid = os.getpid()
         print(f"[*] Restarting agent. Old PID: {old_pid}", flush=True)
@@ -978,7 +997,17 @@ async def restart_agent(request):
             os.kill(old_pid, signal.SIGTERM)
 
     threading.Thread(target=restart, daemon=True).start()
-    return sanic_json({"status": "Agent restart initiated"})
+    return {"status": "Agent restart initiated"}, 200
+
+
+def cmd_reload_auth() -> tuple[dict, int]:
+    """Re-fetch the telemetry encryption key."""
+    try:
+        fk = _bootstrap_client.get_fernet_key()  # type: ignore
+        _apply_fernet_key_to_enc_db(fk)
+        return {"ok": True, "message": "Fernet key reloaded"}, 200
+    except Exception as e:
+        return {"ok": False, "error": str(e)}, 500
 
 
 @app.post("/reload_auth")
@@ -989,12 +1018,8 @@ async def reload_auth(request):
     """
     if not _check_auth_header(request):
         return sanic_json({"ok": False, "error": "unauthorized"}, status=401)
-    try:
-        fk = _bootstrap_client.get_fernet_key()  # type: ignore
-        _apply_fernet_key_to_enc_db(fk)
-        return sanic_json({"ok": True, "message": "Fernet key reloaded"})
-    except Exception as e:
-        return sanic_json({"ok": False, "error": str(e)}, status=500)
+    body, status = cmd_reload_auth()
+    return sanic_json(body, status=status)
 
 
 # Directories that must never be the target of an uninstall, whatever the
@@ -1415,6 +1440,233 @@ def start_threads():
         daemon=True
     ).start()
 
+    start_server_channel()
+
+
+def open_channel_stream(kind: str, args: dict):
+    """Start a console or a screen for a request that arrived on the channel.
+
+    Returns an object with `read(timeout) -> bytes | None`, `write(data)` and
+    `close(why)` - which is what `modules/console` already produces, and what
+    the screen capture is wrapped to produce below. `modules/link` drives it
+    without knowing what either one is.
+
+    Raising is how a refusal is reported: the caller turns it into the
+    `stream_failed` frame the server is waiting on, so "no console on this
+    host" arrives as a sentence rather than as a stream that opens and never
+    produces a frame.
+    """
+    if kind == "console":
+        return _ConsoleStream()
+    if kind == "screen":
+        return _ScreenStream(args or {})
+    raise ValueError(f"this agent does not serve a {kind!r} stream")
+
+
+class _ConsoleStream:
+    """A console shell, speaking the frame protocol the browser already speaks.
+
+    The direct `/console/ws` handler parses what arrives - `decode_input`
+    turns `{"t":"i","d":"ls\\n"}` into the two characters the shell should
+    receive - and frames what it sends back. Handing the raw session to the
+    channel instead skipped both: every keystroke frame, and the resize the
+    browser sends on connect, went into the shell's stdin *as JSON text*, and
+    nothing ever announced the session mode.
+
+    So the console connected, showed nothing, and eventually died - while the
+    screen, which is bytes either way, worked perfectly. Two transports had
+    grown two behaviours, which is exactly what the shared `cmd_*` functions
+    exist to prevent; this is the same idea for the streaming half.
+    """
+
+    def __init__(self):
+        # `open_session`, not `new_session`: the one-session-per-agent guard
+        # lives in the former, and going round it would have let the channel
+        # open concurrent root shells on one host - the thing the guard exists
+        # to prevent, reintroduced by the new transport.
+        self.session = console.open_session()
+        self.exit_reason = ""
+        self._closed = False
+        # Sent before anything else, the way the direct handler does: the
+        # browser has to know whether it is driving a terminal or a pipe
+        # before the first keystroke, not after.
+        self._pending = [console.encode_mode(self.session)]
+
+    def read(self, timeout: float = 0.2):
+        if self._pending:
+            return self._pending.pop(0).encode("utf-8")
+        if self._closed:
+            return None
+
+        chunk = self.session.read(timeout)
+        if chunk is None:
+            self.exit_reason = (getattr(self.session, "exit_reason", "")
+                                or "the shell exited")
+            self._closed = True
+            # One last frame, so the browser prints why rather than simply
+            # going quiet.
+            return console.encode_exit(
+                self.session.proc.poll(), self.exit_reason).encode("utf-8")
+        if not chunk:
+            return b""
+        return console.encode_output(chunk).encode("utf-8")
+
+    def write(self, data) -> None:
+        if isinstance(data, (bytes, bytearray)):
+            data = bytes(data).decode("utf-8", "replace")
+        kind, payload = console.decode_input(data)
+        if kind == "input":
+            self.session.write(payload["data"])
+        elif kind == "resize":
+            self.session.resize(payload["cols"], payload["rows"])
+
+    def close(self, why: str = "") -> None:
+        # `_closed` decides what this reports, never whether the cleanup runs.
+        # `read` sets it the moment the shell exits on its own, so the early
+        # return this replaces skipped `close_active` on the most ordinary
+        # ending there is - typing `exit`. The module-level session stayed
+        # registered, and because a console is one per host, every later
+        # request was refused as a duplicate of a shell that had already died.
+        # Nothing said so: the server fell back to the direct addresses and
+        # reported those as unreachable instead.
+        self._closed = True
+        self.exit_reason = why or self.exit_reason
+        # Through the module, so the registered session is cleared too.
+        console.close_active(self.exit_reason)
+
+
+class _ScreenStream:
+    """The screen capture, in the shape the channel drives.
+
+    `screen_capture` hands back JPEG frames one at a time; this puts them
+    behind the same `read`/`write`/`close` the console already has, so the
+    channel has one thing to pump rather than two special cases.
+    """
+
+    def __init__(self, args: dict):
+        self.fps = max(1, min(int(args.get("fps", 10)), 30))
+        self.quality = max(20, min(int(args.get("q", 60)), 95))
+        self.width = max(320, min(int(args.get("w", 1280)), 2560))
+        self.exit_reason = ""
+        self._closed = False
+        self._helper = None
+        self._capture = None
+
+        # Same two paths the direct websocket already chooses between: a
+        # helper in the user's session when this process cannot see a desktop,
+        # and `mss` here when it can. Wiring only the first would have made
+        # the channel work on session-0 Windows and silently not on anything
+        # else - including the headless Linux hosts, which have neither.
+        if screen_capture.in_session_zero():
+            self._helper = screen_capture.spawn_helper(
+                self.fps, self.quality, self.width)
+        else:
+            self._capture = _DirectCapture(self.fps, self.quality, self.width)
+
+    def read(self, timeout: float = 0.2):
+        if self._closed:
+            return None
+        if self._helper is not None:
+            return self._helper.read_frame()
+        return self._capture.read()
+
+    def write(self, data) -> None:
+        """Nothing to write to a screen. Said rather than silently ignored."""
+        print("[screen] ignoring input on a one-way stream", flush=True)
+
+    def close(self, why: str = "") -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.exit_reason = why or self.exit_reason
+        for source in (self._helper, self._capture):
+            if source is not None:
+                source.close()
+
+
+class _DirectCapture:
+    """`mss` in this process, one JPEG at a time, paced to the frame rate.
+
+    Opened eagerly so a host with no display says so at `open_stream` time -
+    which becomes the `stream_failed` frame the server is waiting on - rather
+    than connecting successfully and then producing nothing. A stream that
+    opens and stays black is the hardest failure here to attribute; the direct
+    websocket path learned that the slow way.
+    """
+
+    def __init__(self, fps: int, quality: int, width: int):
+        try:
+            import mss as _mss
+            from PIL import Image
+        except ImportError as e:
+            raise screen_capture.CaptureUnavailable(
+                f"the screen stack is missing from this build ({e})")
+
+        self._Image = Image
+        self.interval = 1.0 / fps
+        self.quality = quality
+        self.width = width
+        self._last = 0.0
+
+        try:
+            self._sct = _mss.mss()
+        except Exception as e:
+            detail = str(e) or type(e).__name__
+            if not screen_capture.IS_WINDOWS and not os.environ.get("DISPLAY"):
+                detail = screen_capture.describe_unavailable()
+            raise screen_capture.CaptureUnavailable(f"no screen available - {detail}")
+
+        if not self._sct.monitors:
+            raise screen_capture.CaptureUnavailable("no monitors detected")
+        self._monitor = self._sct.monitors[1] if len(self._sct.monitors) > 1 \
+            else self._sct.monitors[0]
+
+    def read(self):
+        # Paced here rather than by the caller: the channel pumps as fast as
+        # it can, and without this a screen would saturate the link the
+        # commands share.
+        now = time.monotonic()
+        if now - self._last < self.interval:
+            time.sleep(max(0.0, self.interval - (now - self._last)))
+        self._last = time.monotonic()
+
+        import io as _io
+
+        shot = self._sct.grab(self._monitor)
+        img = self._Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        if img.width > self.width:
+            ratio = self.width / img.width
+            img = img.resize((self.width, int(img.height * ratio)))
+        buf = _io.BytesIO()
+        img.save(buf, format="JPEG", quality=self.quality, optimize=False)
+        return buf.getvalue()
+
+    def close(self) -> None:
+        try:
+            self._sct.close()
+        except Exception as e:
+            print(f"[screen] capture would not close: {e}", flush=True)
+
+
+def start_server_channel() -> None:
+    """Open the channel the server answers over, if we know where to reach it.
+
+    Started alongside the collectors rather than in place of the HTTP
+    listener: both are live during the migration, and an agent whose channel
+    cannot be established keeps working exactly as before.
+    """
+    server_url = AUTOMATIONS_API_URL or ""
+    if not server_url or not AGENT_SHARED_SECRET:
+        print("[link] no server URL or key yet; the channel stays closed and "
+              "the server will reach this agent over HTTP.", flush=True)
+        return
+
+    client = link.AgentLinkClient(
+        server_url, AGENT_SHARED_SECRET, dispatch_channel_request,
+        agent_name=AGENT_NAME, open_stream=open_channel_stream)
+    threading.Thread(target=client.run_forever, daemon=True).start()
+    print(f"[link] channel opening to {client.channel_url()}", flush=True)
+
 
 def server_automations_loop(agent_name: str, api_base: str, interval_sec: int = 5):
     while True:
@@ -1576,22 +1828,24 @@ def _check_auth_header(request, *, enrolment_key_only: bool = False) -> bool:
     return False
 
 
-@app.post("/soar/execute")
-async def soar_execute(request: Request):
-    if not _check_auth_header(request):
-        return sanic_json({"ok": False, "error": "unauthorized"}, status=401)
+def cmd_soar_execute(data: dict) -> tuple[dict, int]:
+    """Run one SOAR action here. Shared with the channel - see cmd_get_config.
 
-    data = request.json or {}
+    `data` is the request body either way. The authentication that used to sit
+    at the top belongs to the route: the channel is authenticated once, when
+    the agent opens it, and there is no second party on it to check.
+    """
+    data = data if isinstance(data, dict) else {}
 
     action_raw = data.get("action", "")
     action = str(action_raw).strip().lower()
 
     if not action:
-        return sanic_json({"ok": False, "error": "action is required"}, status=400)
+        return {"ok": False, "error": "action is required"}, 400
 
     allowed_actions = {a.value for a in ActionType}
     if action not in allowed_actions:
-        return sanic_json({"ok": False, "error": f"action not implemented: {action}"}, status=501)
+        return {"ok": False, "error": f"action not implemented: {action}"}, 501
 
     target_raw = data.get("target")
     target_str = str(target_raw).strip() if target_raw is not None else ""
@@ -1614,30 +1868,28 @@ async def soar_execute(request: Request):
 
     if action in (ActionType.BLOCK_IP.value, ActionType.UNBLOCK_IP.value):
         if not FirewallManager._is_valid_ip(target_str):
-            return sanic_json({"ok": False, "error": "invalid IPv4"}, status=400)
+            return {"ok": False, "error": "invalid IPv4"}, 400
         target_for_exec = target_str
 
     elif action in (ActionType.DISABLE_USER.value, ActionType.ENABLE_USER.value):
         if not UserAccountManager._is_valid_username(target_str):
-            return sanic_json({"ok": False, "error": "invalid username"}, status=400)
+            return {"ok": False, "error": "invalid username"}, 400
         target_for_exec = target_str
 
     elif action == ActionType.RUN_CMD.value:
         if not isinstance(target_raw, list) or not target_raw:
-            return sanic_json(
-                {"ok": False, "error": "run_cmd target must be a non-empty list"},
-                status=400,
-            )
+            return ({"ok": False,
+                     "error": "run_cmd target must be a non-empty list"}, 400)
         target_for_exec = target_raw
 
     elif action == ActionType.KILL_PROCESS.value:
         if not target_str:
-            return sanic_json({"ok": False, "error": "process target is required"}, status=400)
+            return {"ok": False, "error": "process target is required"}, 400
         target_for_exec = target_str
 
     elif action == ActionType.RESTART_SERVICE.value:
         if not target_str:
-            return sanic_json({"ok": False, "error": "service name is required"}, status=400)
+            return {"ok": False, "error": "service name is required"}, 400
         target_for_exec = target_str
 
     elif action == ActionType.LOCK_MACHINE.value:
@@ -1645,16 +1897,16 @@ async def soar_execute(request: Request):
 
     elif action == ActionType.QUARANTINE_FILE.value:
         if not target_str:
-            return sanic_json({"ok": False, "error": "file path is required"}, status=400)
+            return {"ok": False, "error": "file path is required"}, 400
         target_for_exec = target_str
 
     elif action == ActionType.TAIL_LOG.value:
         if not target_str:
-            return sanic_json({"ok": False, "error": "log path is required"}, status=400)
+            return {"ok": False, "error": "log path is required"}, 400
         target_for_exec = target_str
 
     else:
-        return sanic_json({"ok": False, "error": f"action not implemented: {action}"}, status=501)
+        return {"ok": False, "error": f"action not implemented: {action}"}, 501
 
     ok, msg, expires_at = _soar.exec_action(
         action=action,
@@ -1702,58 +1954,61 @@ async def soar_execute(request: Request):
     else:
         http_status = 200
 
-    return sanic_json(
-        {
-            "ok": ok,
-            "message": msg or ("done" if ok else "failed"),
-            "soar_action_id": soar_action_id,
-            "status": status,
-            "expires_at": expires_at,
-        },
-        status=http_status,
-    )
+    return ({
+        "ok": ok,
+        "message": msg or ("done" if ok else "failed"),
+        "soar_action_id": soar_action_id,
+        "status": status,
+        "expires_at": expires_at,
+    }, http_status)
 
-@app.route("/config/<cfg_type>", methods=["GET"])
-async def get_config(request, cfg_type):
+
+@app.post("/soar/execute")
+async def soar_execute(request: Request):
     if not _check_auth_header(request):
         return sanic_json({"ok": False, "error": "unauthorized"}, status=401)
+    body, status = cmd_soar_execute(request.json or {})
+    return sanic_json(body, status=status)
 
-    mapping = {
-        "rules": "conf/rules.yaml",
-        "log_paths": "conf/log_paths.yaml",
-        "file_scan": "conf/file_scan.yaml"
-    }
-    if cfg_type not in mapping:
-        return sanic_json({"ok": False, "error": "invalid type"}, status=400)
-    
+
+# ---------------------------------------------------------------------------
+# Commands, once
+# ---------------------------------------------------------------------------
+#
+# The server can now reach this agent two ways: the HTTP listener below, and
+# the channel the agent opens to it (modules/link.py). The command bodies live
+# here so both call the same code.
+#
+# Not tidiness. Two implementations of "write the rules file" would drift, and
+# the one that drifted would be reachable only in the deployments that had
+# already moved to the channel - so the bug would appear on exactly the hosts
+# nobody was still watching the old path on.
+#
+# Each returns `(body, status)`, which is the shape the channel speaks and
+# what `sanic_json` takes.
+
+CONFIG_TYPES = ("rules", "log_paths", "file_scan")
+
+
+def cmd_get_config(cfg_type: str) -> tuple[dict, int]:
+    if cfg_type not in CONFIG_TYPES:
+        return {"ok": False, "error": "invalid type"}, 400
     try:
         # Persistent copy if the operator has ever pushed one, else the copy
         # that shipped inside the build. See modules/agent_paths.
         path = agent_paths.config_path(cfg_type)
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
-        return sanic_json({"ok": True, "content": content, "path": path})
+        return {"ok": True, "content": content, "path": path}, 200
     except Exception as e:
-        return sanic_json({"ok": False, "error": str(e)}, status=500)
+        return {"ok": False, "error": str(e)}, 500
 
-@app.route("/config/<cfg_type>", methods=["POST"])
-async def set_config(request, cfg_type):
-    if not _check_auth_header(request):
-        return sanic_json({"ok": False, "error": "unauthorized"}, status=401)
 
-    mapping = {
-        "rules": "conf/rules.yaml",
-        "log_paths": "conf/log_paths.yaml",
-        "file_scan": "conf/file_scan.yaml"
-    }
-    if cfg_type not in mapping:
-        return sanic_json({"ok": False, "error": "invalid type"}, status=400)
-
-    data = request.json or {}
-    content = data.get("content")
+def cmd_set_config(cfg_type: str, content) -> tuple[dict, int]:
+    if cfg_type not in CONFIG_TYPES:
+        return {"ok": False, "error": "invalid type"}, 400
     if content is None:
-        return sanic_json({"ok": False, "error": "no content"}, status=400)
-
+        return {"ok": False, "error": "no content"}, 400
     try:
         # Beside the executable, never into the PyInstaller extraction
         # directory: that one is deleted when the process exits, so the old
@@ -1761,13 +2016,74 @@ async def set_config(request, cfg_type):
         path = agent_paths.writable_config_path(cfg_type)
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
-        return sanic_json({
+        return {
             "ok": True,
             "message": f"Config written to {path}. It survives a restart.",
             "path": path,
-        })
+        }, 200
     except Exception as e:
-        return sanic_json({"ok": False, "error": str(e)}, status=500)
+        return {"ok": False, "error": str(e)}, 500
+
+
+def dispatch_channel_request(method: str, path: str, body) -> tuple[dict, int]:
+    """Route a request that arrived on the channel to the command it names.
+
+    The paths are the ones the HTTP listener already serves, deliberately: the
+    server sends the same `method` and `path` either way, so nothing on its
+    side has to know which transport it got. See modules/link.
+
+    No authentication here. The channel was authenticated once, when the agent
+    opened it with its own key, and only the server is on the other end - so
+    there is no second party to check. That is the difference from the HTTP
+    routes, where anything that can reach port 9099 can knock.
+    """
+    body = body if isinstance(body, dict) else {}
+
+    if path.startswith("/config/"):
+        cfg_type = path[len("/config/"):].strip("/")
+        if method == "GET":
+            return cmd_get_config(cfg_type)
+        if method == "POST":
+            return cmd_set_config(cfg_type, body.get("content"))
+        return {"ok": False, "error": f"{method} not allowed on {path}"}, 405
+
+    if path == "/restart" and method == "POST":
+        return cmd_restart()
+
+    if path == "/reload_auth" and method == "POST":
+        return cmd_reload_auth()
+
+    if path == "/self_destruct" and method == "POST":
+        return cmd_self_destruct()
+
+    if path == "/soar/execute" and method == "POST":
+        return cmd_soar_execute(body)
+
+    if path == "/health":
+        return {"ok": True, "agent": AGENT_NAME}, 200
+
+    # Named rather than a bare 404: a path the agent does not implement is
+    # usually a server that is newer than this build, and saying so is the
+    # difference between "upgrade the agent" and an afternoon of guessing.
+    return {"ok": False,
+            "error": f"this agent does not implement {method} {path}"}, 501
+
+
+@app.route("/config/<cfg_type>", methods=["GET"])
+async def get_config(request, cfg_type):
+    if not _check_auth_header(request):
+        return sanic_json({"ok": False, "error": "unauthorized"}, status=401)
+    body, status = cmd_get_config(cfg_type)
+    return sanic_json(body, status=status)
+
+
+@app.route("/config/<cfg_type>", methods=["POST"])
+async def set_config(request, cfg_type):
+    if not _check_auth_header(request):
+        return sanic_json({"ok": False, "error": "unauthorized"}, status=401)
+    data = request.json or {}
+    body, status = cmd_set_config(cfg_type, data.get("content"))
+    return sanic_json(body, status=status)
 
 
 

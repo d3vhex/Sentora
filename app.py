@@ -110,6 +110,7 @@ app.static("/vite.svg", "./frontend/dist/vite.svg", name="frontend_logo")
 from ai.utils import load_ai_config, is_critical_log, save_ai_results
 from security import session as session_store
 from security import ssrf
+from core import agent_link
 from core import config_validation
 from core import login_guard
 from core import netloc
@@ -1143,6 +1144,11 @@ _PUBLIC_EXACT_PATHS = {
     "/login", "/logout", "/health",
     "/api/agents/register", "/api/agents/bootstrap",
     "/api/agent/deploy/linux", "/api/agent/deploy/windows",
+    # Agent traffic, not public: the handler authenticates with X-Agent-Key
+    # before it registers anything, and refuses the fleet-wide secret. Listed
+    # here only because the operator session middleware would otherwise reject
+    # the handshake before the handler is ever reached.
+    "/agent-link",
 }
 _AGENT_PATH_SUFFIXES = ("/automations/pending", "/automations/report")
 
@@ -7491,6 +7497,49 @@ def _relayed_status(upstream_status: int) -> int:
     return upstream_status
 
 
+#: Paths the agent's channel dispatcher actually implements.
+#:
+#: Listed rather than assumed, because "the agent has a channel" and "the
+#: agent can serve this over it" are different facts. An unmigrated path sent
+#: down the channel comes back 501 - a perfectly valid answer - and the caller
+#: would *not* fall back to HTTP, because nothing failed. SOAR would simply
+#: stop working, quietly, on every agent new enough to have a channel.
+#:
+#: Every request/response command now goes this way. What is left on its own
+#: socket is the two streams - the console and the screen - which are
+#: long-lived and carry binary at rate; multiplexing those onto this channel
+#: is the remaining piece before the endpoint's listener can go away.
+_CHANNEL_PATHS = ("/config/", "/restart", "/reload_auth", "/self_destruct",
+                  "/soar/execute", "/health")
+
+
+def _path_moved_to_channel(path: str) -> bool:
+    return str(path or "").startswith(_CHANNEL_PATHS)
+
+
+def _linked_agent(agent: str):
+    """The open channel for this agent, under either spelling of its name.
+
+    The channel registers under `agent_identities.agent_name`, which is what
+    the agent enrolled as - `DESKTOP-EVS8H9J`. Callers arrive with the name
+    the console uses, which comes from the database list and has had its
+    hyphens flattened - `DESKTOP_EVS8H9J`.
+
+    Matching exactly would have returned None for every hyphenated host, so
+    every request would have fallen back to HTTP and nothing would have said
+    why: the feature would have looked implemented and never once fired. Same
+    mismatch as `_get_agent_keys`, same fix.
+    """
+    hyphen, underscore, _ = _agent_name_forms(agent)
+    for name in dict.fromkeys([agent, hyphen, underscore]):
+        if not name:
+            continue
+        link = AGENT_LINKS.get(name)
+        if link is not None:
+            return link
+    return None
+
+
 async def _agent_proxy(agent: str, method: str, path: str, json_body=None,
                        timeout: int = 5):
     """Call one path on an agent, trying every address it might be at.
@@ -7500,6 +7549,25 @@ async def _agent_proxy(agent: str, method: str, path: str, json_body=None,
     the world, and the operator needs the reason rather than a stack trace
     turned into a 500 with no body worth reading.
     """
+    # The channel first, when the agent has one open.
+    #
+    # This is the chokepoint every server-to-agent feature already goes
+    # through - config, SOAR dispatch, restart, uninstall - so preferring the
+    # channel here moves all of them at once, and none of the callers has to
+    # know which transport carried the request.
+    #
+    # The HTTP fallback stays for now. Agents are upgraded one at a time, and
+    # an old binary that cannot open a channel must keep working while the
+    # fleet catches up. It is what should eventually be deleted, along with
+    # the listener on the endpoint.
+    link = _linked_agent(agent) if _path_moved_to_channel(path) else None
+    if link is not None:
+        try:
+            return await link.request(method, path, json_body, timeout=timeout)
+        except agent_link.LinkError as e:
+            print(f"[agent-proxy] {agent}: channel failed ({e}); "
+                  f"falling back to HTTP", flush=True)
+
     bases = await _agent_http_bases(agent)
     keys = await _get_agent_keys(agent)
 
@@ -9151,6 +9219,141 @@ async def _relay_upstream_close(ws, upstream) -> None:
               flush=True)
 
 
+#: Agents currently holding a channel open to this worker. See
+#: `core.agent_link` for why this is one worker's view and not the fleet's.
+AGENT_LINKS = agent_link.LinkRegistry()
+
+
+@app.websocket("/agent-link")
+async def agent_link_socket(request, ws):
+    """A channel the agent opens and the server answers over.
+
+    The inverse of every other server-to-agent path here, and the point of it
+    is in `core.agent_link`: a host that can reach the server can be managed,
+    with no port opened on the endpoint and no address to guess.
+
+    Authenticated by `X-Agent-Key` like every other agent route. The
+    fleet-wide secret is refused: this channel carries `/self_destruct` among
+    other things, and a leaked master key should not be able to open one
+    against every endpoint at once.
+    """
+    agent = await asyncio.to_thread(_validate_agent_auth_sync, request)
+    if not agent or agent == "*":
+        print(f"[agent-link] refused a connection from {_client_ip(request)}",
+              flush=True)
+        await ws.close(code=1008, reason="unauthorized")
+        return
+
+    async def send(frame) -> None:
+        """Control as JSON text, stream payloads as binary.
+
+        This serialised everything, so `json.dumps` was handed raw bytes the
+        moment anything wrote *to* a stream and raised - which the relay
+        caught as "the browser hung up". Keystrokes never left the server, and
+        because the browser echoes its own line in pipe mode, the console
+        looked alive while nothing had reached the shell.
+        """
+        if isinstance(frame, (bytes, bytearray)):
+            await ws.send(bytes(frame))
+        else:
+            await ws.send(pyjson.dumps(frame))
+
+    link = agent_link.AgentLink(agent, send)
+    replaced = AGENT_LINKS.register(link)
+    if replaced is not None:
+        # Usually a drop the agent noticed before we did. Failing whatever was
+        # in flight on the old socket beats leaving it to time out.
+        replaced.close("replaced by a new connection from the same agent")
+    print(f"[agent-link] {agent} connected from {_client_ip(request)}", flush=True)
+    await audit_log(request, "AGENT_LINK_OPEN", agent, "agent opened a channel")
+
+    reason = "the agent disconnected"
+    try:
+        while True:
+            raw = await ws.recv()
+            if raw is None:
+                break
+
+            # Binary is a stream payload; the socket keeps the two apart.
+            if isinstance(raw, (bytes, bytearray)):
+                parsed = agent_link.decode_stream_frame(raw)
+                if parsed is None:
+                    link.touch()
+                    continue
+                channel, payload = parsed
+                if not link.deliver_stream(channel, payload):
+                    print(f"[agent-link] {agent}: data for a stream that is "
+                          f"gone (ch {channel})", flush=True)
+                continue
+
+            try:
+                frame = pyjson.loads(raw)
+            except Exception:
+                # An endpoint sending noise must not take the channel down for
+                # itself; the next frame may well be fine.
+                link.touch()
+                continue
+            if not isinstance(frame, dict):
+                link.touch()
+                continue
+
+            kind = frame.get("t")
+            if kind == "res":
+                if not link.deliver(frame):
+                    print(f"[agent-link] {agent}: reply to a request nobody is "
+                          f"waiting for ({frame.get('id')})", flush=True)
+            elif kind == "stream_opened":
+                link.stream_opened(frame.get("ch"))
+            elif kind == "stream_failed":
+                link.stream_failed(frame.get("ch"),
+                                   str(frame.get("why") or "the agent refused"))
+            elif kind == "close":
+                link.close_stream(frame.get("ch"),
+                                  str(frame.get("why") or "the agent closed it"))
+            elif kind == "ping":
+                link.touch()
+                await _ws_notify(ws, pyjson.dumps({"t": "pong"}))
+            else:
+                link.touch()
+    except Exception as e:
+        reason = f"the channel failed: {e}"
+    finally:
+        link.close(reason)
+        AGENT_LINKS.unregister(link)
+        print(f"[agent-link] {agent} disconnected: {reason}", flush=True)
+
+
+def _validate_agent_auth_sync(request) -> str | None:
+    """Resolve an agent from its key, off the event loop.
+
+    A synchronous MySQL connection on a websocket handshake blocks every other
+    request on this worker for its duration, which is how one reconnecting
+    agent slows the console for everyone. The caller runs this in a thread.
+
+    Deliberately narrower than `_validate_agent_auth`: no fallback to the
+    fleet-wide secret. This channel carries `/self_destruct`, and a leaked
+    master key should not open one against every endpoint at once.
+    """
+    key = request.headers.get("X-Agent-Key") or request.args.get("agent_key")
+    if not key:
+        return None
+    try:
+        with sync_mysql_conn("userdb") as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    "SELECT agent_name FROM agent_identities "
+                    "WHERE agent_key=%s AND revoked_at IS NULL",
+                    (key,))
+                row = cur.fetchone()
+                return row[0] if row else None
+            finally:
+                cur.close()
+    except Exception as e:
+        print(f"[agent-link] identity lookup failed: {e}", flush=True)
+        return None
+
+
 async def _ws_notify(ws, payload: str) -> None:
     """Tell the browser something, if it is still listening.
 
@@ -9181,6 +9384,30 @@ async def console_proxy(request, ws, agent):
     await audit_log(request, "CONSOLE_OPEN", agent,
                     f"interactive shell requested by {_client_ip(request)}")
 
+    # The channel first, the same as every command already prefers it - and
+    # before resolving addresses and keys, which are two database round-trips
+    # this path does not need when the agent is already connected. The screen
+    # proxy is written the same way; the two are meant to be one shape.
+    link = _linked_agent(agent)
+    channel_error = ""
+    if link is not None:
+        try:
+            await _relay_channel_stream(ws, link, "console", {})
+            await audit_log(request, "CONSOLE_CLOSE", agent, "via the channel")
+            return
+        except agent_link.LinkError as e:
+            # Told to the operator, not only to the server log. The agent
+            # says why it would not open a console - a shell already running,
+            # no PTY available, a helper that could not reach the desktop -
+            # and that reason was being replaced by the fallback's
+            # "Connection refused", which describes the *second* attempt and
+            # hides the first. The first is the one that was supposed to work.
+            channel_error = str(e)
+            print(f"[console-proxy] {agent}: channel console failed ({e}); "
+                  f"falling back to a direct connection", flush=True)
+            await _ws_notify(ws, pyjson.dumps(
+                {"t": "e", "d": f"the agent's channel refused a console: {e}"}))
+
     try:
         bases = await _agent_http_bases(agent)
         keys = await _get_agent_keys(agent)
@@ -9205,11 +9432,67 @@ async def console_proxy(request, ws, agent):
             return
         print(f"[console-proxy] {agent}: {base} unreachable ({last_error})", flush=True)
 
-    await _ws_notify(ws, pyjson.dumps({
-        "t": "e",
-        "d": f"Could not reach {agent}: {last_error} - tried {', '.join(tried) or 'no address'}",
-    }))
+    where = ", ".join(tried) or "no address"
+    if channel_error:
+        detail = (f"{agent} is connected, but its channel would not open a "
+                  f"console: {channel_error}. The direct addresses were tried "
+                  f"next and failed with {last_error} - {where}")
+    elif link is None:
+        detail = (f"{agent} has no open channel to this server, and the "
+                  f"direct addresses failed with {last_error} - {where}")
+    else:
+        detail = f"Could not reach {agent}: {last_error} - tried {where}"
+    await _ws_notify(ws, pyjson.dumps({"t": "e", "d": detail}))
     await ws.close()
+
+
+async def _relay_channel_stream(ws, link, kind: str, args: dict,
+                                *, binary: bool = False) -> None:
+    """Pump a browser websocket against a stream on the agent's channel.
+
+    The same shape as the direct relays below - two pumps and a gather - so
+    the console and the screen behave identically whichever transport carried
+    them, and a reader comparing the two is not comparing two designs.
+    """
+    stream = await link.open_stream(kind, args)
+
+    async def to_agent():
+        try:
+            while True:
+                data = await ws.recv()
+                if data is None:
+                    return
+                if isinstance(data, str):
+                    data = data.encode("utf-8", "replace")
+                await stream.send(data)
+        except Exception:
+            # The browser hung up, which is the ordinary end of a console.
+            return
+
+    async def to_browser():
+        try:
+            while True:
+                payload = await stream.receive()
+                if payload is None:
+                    return
+                if not payload:
+                    continue
+                # A console is text and a screen is a JPEG. Sending a frame
+                # as text would corrupt it on the way through, and the
+                # browser would render a broken image rather than say why.
+                await ws.send(payload if binary
+                              else payload.decode("utf-8", "replace"))
+        except Exception:
+            return
+
+    try:
+        await asyncio.gather(to_agent(), to_browser())
+    finally:
+        # `end_stream`, not `close_stream`: the latter only forgets it here.
+        # A stream left open on the agent is a shell running with nobody
+        # attached - and since a console is one per host, the next request is
+        # then refused as a duplicate of a session nobody can reach.
+        await link.end_stream(stream.channel, "the viewer went away")
 
 
 async def _console_relay(ws, target_url: str, agent_key: str) -> tuple[bool, str]:
@@ -9280,15 +9563,27 @@ async def vnc_proxy(request, ws, agent):
     q = request.args.get("q", "60")
     w = request.args.get("w", "1280")
 
+    # The channel first, as everywhere else - and *before* resolving addresses
+    # and keys, which are two database round-trips this path does not need
+    # when the agent is already connected.
+    link = _linked_agent(agent)
+    if link is not None:
+        try:
+            await _relay_channel_stream(
+                ws, link, "screen", {"fps": fps, "q": q, "w": w}, binary=True)
+            return
+        except agent_link.LinkError as e:
+            print(f"[screen-proxy] {agent}: channel screen failed ({e}); "
+                  f"falling back to a direct connection", flush=True)
+            await _ws_notify(ws, pyjson.dumps({"error": "agent_channel", "detail": str(e)}))
+
     try:
         bases = await _agent_http_bases(agent)
         keys = await _get_agent_keys(agent)
     except Exception as e:
         print(f"[screen-proxy] resolve {agent} failed: {e}", flush=True)
-        try:
-            await ws.send(pyjson.dumps({"error": "agent_lookup_failed", "detail": str(e)}))
-        except Exception:
-            pass
+        await _ws_notify(ws, pyjson.dumps(
+            {"error": "agent_lookup_failed", "detail": str(e)}))
         await ws.close()
         return
 
@@ -9498,8 +9793,27 @@ if __name__ == "__main__":
     app.config.TOUCHUP = False
     app.config.ACCESS_LOG = True
     
-    num_workers = multiprocessing.cpu_count() if os.name != 'nt' else 1
-    
+    # `WORKERS` was in docker-compose.yaml and was never read: this line took
+    # `cpu_count()` regardless, so a deployment whose configuration said one
+    # worker ran eight. Reading it changes nothing for anyone who has not set
+    # it, and does what the compose file has always said.
+    #
+    # It matters beyond tidiness now. Each worker is a separate process with
+    # its own state, so anything an agent connects *to* - see
+    # `core.agent_link` - exists in one worker and is invisible to the rest.
+    # A request that happened to land on another worker would silently take a
+    # different path, which is the hardest kind of bug to be handed.
+    configured = os.getenv("WORKERS", "").strip()
+    if configured.isdigit() and int(configured) > 0:
+        num_workers = int(configured)
+    else:
+        num_workers = multiprocessing.cpu_count() if os.name != 'nt' else 1
+
+    if num_workers > 1:
+        print(f"[!] Running {num_workers} workers. Agent-initiated channels "
+              f"live in one worker only; set WORKERS=1 until the registry is "
+              f"shared between them.", flush=True)
+
     app.run(
         host="0.0.0.0",
         port=8000,

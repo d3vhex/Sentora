@@ -188,3 +188,59 @@ def test_duplicate_indicators_across_feeds_are_collapsed(monkeypatch):
     indicators, _ = tf.fetch_all()
 
     assert len(indicators) == 1, "the same address was stored twice"
+
+
+# --------------------------------------------------------------------------
+# A busy feed is not a broken one
+# --------------------------------------------------------------------------
+#
+# `Fetched 3221. Problems: feodo: HTTP 503` - abuse.ch returns 503 under load
+# routinely, one attempt turned that into a red line on the operator's screen,
+# and it sat at the same visual weight as the 401 that genuinely needs someone
+# to go and configure a key.
+
+def test_a_server_error_is_retried():
+    import inspect
+    from core import threat_feeds
+
+    source = inspect.getsource(threat_feeds._get_with_retry)
+    assert "status_code < 500" in source, "a 5xx should not return on the first try"
+    assert "RETRY_ATTEMPTS" in source
+
+
+def test_a_client_error_is_not_retried():
+    """A 403 will be a 403 again; retrying it only makes the refresh slower."""
+    import inspect
+    from core import threat_feeds
+
+    source = inspect.getsource(threat_feeds._get_with_retry)
+    assert "return resp" in source
+    assert source.index("status_code < 500") < source.index("time.sleep")
+
+
+def test_a_transient_failure_is_worded_differently_from_a_missing_key():
+    """The two ask different things of whoever reads them: one needs a key
+    configured, the other needs nothing at all."""
+    import inspect
+    from core import threat_feeds
+
+    source = inspect.getsource(threat_feeds.fetch_all)
+    assert "nothing to " in source
+    assert "requires a key" in source
+
+
+def test_the_existing_indicators_survive_a_failed_feed():
+    """A feed being down must not empty the table it fed. Said in the message
+    so nobody goes looking for indicators that were never deleted."""
+    import inspect
+    from core import threat_feeds
+
+    assert "indicators are kept" in inspect.getsource(threat_feeds.fetch_all)
+
+
+def test_a_dropped_connection_is_retried_like_a_5xx():
+    import inspect
+    from core import threat_feeds
+
+    source = inspect.getsource(threat_feeds._get_with_retry)
+    assert "RequestException" in source

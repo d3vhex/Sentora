@@ -840,16 +840,43 @@ def follow_windows_eventlog(rules_list: List[Dict], exclude_patterns, log_type,
                             sigma_rules=None, correlator=None):
     import win32evtlog
     server = 'localhost'
-    
+
+    # The newest record this channel has already been read up to.
+    #
+    # Without it this loop reopened the log every three seconds and read the
+    # newest batch *from the start* every time, so the same events were
+    # processed again for as long as the agent ran. On an idle Windows host
+    # that was around 155 events a second against a limiter allowing 1000 a
+    # minute: `rate_limited` passed 350,000 in forty minutes while
+    # `processed` reached 28.
+    #
+    # The waste was the smaller half. The limiter is checked before anything
+    # else, so re-read events spent the budget a genuinely new event needed -
+    # a real detection could be dropped because the agent was busy rereading
+    # the same logon for the hundredth time. Reading backwards means the
+    # newest come first, so the scan can stop at the first record already
+    # seen.
+    last_record = None
+
     while True:
         hand = None
         try:
             hand = win32evtlog.OpenEventLog(server, log_type)
             flags = win32evtlog.EVENTLOG_BACKWARDS_READ | win32evtlog.EVENTLOG_SEQUENTIAL_READ
-            
+
             events = win32evtlog.ReadEventLog(hand, flags, 0)
             if events:
+                newest_seen = last_record
                 for ev in events:
+                    record = getattr(ev, "RecordNumber", None)
+                    if record is not None:
+                        if last_record is not None and record <= last_record:
+                            # Newest first, so everything from here down has
+                            # been read already.
+                            break
+                        if newest_seen is None or record > newest_seen:
+                            newest_seen = record
+
                     if not rate_limiter.is_allowed():
                         metrics.increment('rate_limited_events')
                         continue
@@ -911,10 +938,16 @@ def follow_windows_eventlog(rules_list: List[Dict], exclude_patterns, log_type,
                     else:
                         metrics.increment('duplicate_events')
 
+                # Advanced once the batch is done, not per event: a failure
+                # part-way through should leave the channel to be re-read
+                # rather than skip whatever was missed.
+                if newest_seen is not None:
+                    last_record = newest_seen
+
             if hand:
                 win32evtlog.CloseEventLog(hand)
                 hand = None
-            
+
             time.sleep(3)
         except Exception as e:
             err_str = str(e)
@@ -935,19 +968,32 @@ def stats_reporter(metrics: MetricsCollector, interval: int = 60):
     report a minute that was 6300 lines of agent.log in thirteen hours,
     almost all of it reporting that nothing had happened since the last one.
     """
-    last_processed = None
+    last_seen = None
     while True:
         time.sleep(interval)
         stats = metrics.get_stats()
+
+        # Excluded events count as movement.
+        #
+        # `is_own_output` increments `excluded_events` and skips the line
+        # before `events_processed` is touched, so on a host where the agent's
+        # own output was the whole problem, nothing this loop was watching
+        # ever changed - and the report stayed silent exactly when the fix was
+        # working. The number that proves the feedback loop is gone was the
+        # one number never printed.
         processed = stats.get('events_processed', 0)
-        if processed == last_processed:
+        excluded = stats.get('excluded_events', 0)
+        moved = (processed, excluded)
+        if moved == last_seen:
             continue        # nothing new since the last report
-        last_processed = processed
+        last_seen = moved
+
         logging.info(
-            "SIEM stats: processed=%s output=%s duplicates=%s rate_limited=%s "
-            "uptime=%.0fs rate=%.2f/s",
+            "SIEM stats: processed=%s output=%s duplicates=%s excluded=%s "
+            "rate_limited=%s uptime=%.0fs rate=%.2f/s",
             processed, stats.get('events_output', 0),
-            stats.get('duplicate_events', 0), stats.get('rate_limited_events', 0),
+            stats.get('duplicate_events', 0), excluded,
+            stats.get('rate_limited_events', 0),
             stats.get('runtime_seconds', 0), stats.get('events_per_second', 0),
         )
 

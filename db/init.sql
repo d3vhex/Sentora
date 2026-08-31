@@ -144,13 +144,12 @@ CREATE TABLE IF NOT EXISTS siem_events (
   KEY idx_siem_sev (severity),
   KEY idx_siem_dup (dup_fp)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
--- Existing deployments: the table above is only created once, so the column
--- has to be added separately. Errors here are printed and skipped by
--- create_tables_if_not_exist when it already exists.
-ALTER TABLE siem_events ADD COLUMN severity VARCHAR(16) NULL;
-ALTER TABLE siem_events ADD KEY idx_siem_sev (severity);
-ALTER TABLE siem_events ADD COLUMN techniques VARCHAR(255) NULL;
-ALTER TABLE siem_events ADD KEY idx_siem_tech (techniques);
+-- Existing deployments still need `severity` and `techniques` added, because
+-- CREATE TABLE IF NOT EXISTS leaves an older table exactly as it is. That
+-- migration lives in server._migrate_siem_events, not here: this file is
+-- re-executed on every ingest, so an unconditional ALTER took a metadata lock
+-- on the busiest table in the schema several times a minute and printed four
+-- duplicate-column/duplicate-key errors each time it did.
 
 -- ================== ai_log_checker_results (optional AI) ==================
 CREATE TABLE IF NOT EXISTS ai_log_checker_results (
@@ -197,10 +196,10 @@ CREATE TABLE IF NOT EXISTS soar_actions (
   KEY idx_soar_dup (dup_fp)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Correct the column type. Idempotent.
-ALTER TABLE soar_actions
-  MODIFY COLUMN expires_at  TIMESTAMP NULL,
-  MODIFY COLUMN resolved_at TIMESTAMP NULL;
+-- expires_at/resolved_at were once NOT NULL. Correcting them lives in
+-- server._migrate_soar_actions: re-running MODIFY here raised no error, so it
+-- looked free, but it still took a metadata lock on soar_actions on every
+-- ingest - the same thing that made automations stop answering agents.
 
 
 -- ================== automations ==================
