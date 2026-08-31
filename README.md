@@ -360,7 +360,7 @@ Leave it empty when the app is reached directly.
 
 ### The agent's own API
 
-The agent listens on `0.0.0.0:9099` and runs as SYSTEM or root. Every route
+The agent listens on `127.0.0.1:9099` and runs as SYSTEM or root. Every route
 requires `X-Agent-Key`; `/self_destruct` requires this agent's own enrolment
 key specifically, so a leaked fleet-wide secret cannot uninstall every
 endpoint at once. `/health` answers liveness without a key and discloses
@@ -371,9 +371,16 @@ whenever `AGENT_MASTER_SECRET` was unset on the host — which nothing ever set,
 so it was the default everywhere. An EDR that fails open is worse than no EDR,
 because the console reports the endpoint as protected.
 
-`AGENT_BIND` moves the listener. It is still `0.0.0.0` by default because the
-server reaches agents over HTTP on this port; binding to loopback needs a
-replacement transport, not a config change.
+Nothing reaches in. The agent opens a WebSocket to the server and keeps it,
+and every server-to-agent request rides that connection — config, SOAR,
+restart, uninstall, the screen stream and the console. This is why the agent
+works behind NAT and behind a host firewall, neither of which the previous
+arrangement survived, and why the installers now *remove* the inbound rule for
+9099 rather than adding one.
+
+`AGENT_BIND` moves the listener, and `0.0.0.0` is the way back if a deployment
+finds something the channel does not carry. Setting it exposes a management
+API on every endpoint that has it, so the agent says so at startup.
 
 ### CORS
 

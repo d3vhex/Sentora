@@ -1194,10 +1194,11 @@ def disable_autostart() -> tuple[bool, str]:
     if system == "windows":
         code, out = _run(["schtasks", "/Delete", "/TN", WINDOWS_TASK_NAME, "/F"])
         detail = out or f"schtasks exited {code}"
-        # The installer opens inbound 9099 for the agent's API. Leaving the
-        # rule behind after an uninstall leaves a hole named after software
-        # that is no longer here, which is exactly the kind of thing nobody
-        # goes looking for later.
+        # Older installers opened inbound 9099 for the agent's API, and the
+        # current one removes that rule rather than adding it - but an
+        # uninstall has to clear it too, or a host that is never reinstalled
+        # keeps a hole named after software that is no longer here, which is
+        # exactly the kind of thing nobody goes looking for later.
         _run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
               "Get-NetFirewallRule -DisplayName 'Sentora Agent API' "
               "-ErrorAction SilentlyContinue | Remove-NetFirewallRule "
@@ -2519,27 +2520,36 @@ if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
 
-    # Configurable, and deliberately still 0.0.0.0 by default.
+    # Loopback by default. The condition this waited on has been met.
     #
-    # Binding to loopback is the right end state and it cannot be the default
-    # today: the server reaches agents by direct HTTP to this port, so
-    # flipping it would silently stop SOAR dispatch, config reads and the
-    # screen stream across the fleet. That needs a transport to replace it
-    # (an outbound agent-initiated channel, or mTLS through a broker), not a
-    # one-line change.
+    # This listener existed because the server reached agents by dialling this
+    # port, so binding it to loopback would have stopped SOAR dispatch, config
+    # reads, the screen stream and the console across the fleet. The note here
+    # said that needed a transport to replace it - "an outbound
+    # agent-initiated channel, or mTLS through a broker" - and the channel is
+    # now that transport. Every route this app serves has a channel
+    # equivalent: /health, /self_destruct, /restart, /reload_auth,
+    # /soar/execute and /config/<type> go through `dispatch_channel_request`,
+    # and /console/ws and /screen/ws through `open_channel_stream`. Nothing
+    # the server asks of an agent needs an open port on the endpoint.
     #
-    # What made the exposure critical was that /self_destruct, /restart and
-    # /reload_auth had no authentication at all, and that permissive auth
-    # accepted any non-empty key on every other route. Both are fixed above.
-    # The listener is now authenticated; it is not yet unreachable.
-    bind_host = os.getenv("AGENT_BIND", "0.0.0.0")
+    # It stays bound rather than removed so a host can still be worked on from
+    # its own console, and so `AGENT_BIND=0.0.0.0` remains the way back if a
+    # deployment finds something the channel does not carry. Setting it is a
+    # deliberate act with a warning attached, which is the difference between
+    # an escape hatch and a default.
+    bind_host = os.getenv("AGENT_BIND", "127.0.0.1")
     bind_port = int(os.getenv("AGENT_PORT", "9099"))
-    if bind_host == "0.0.0.0":
-        print(f"[*] Agent API on {bind_host}:{bind_port} — reachable from the "
-              f"network. Every route requires X-Agent-Key. Set AGENT_BIND=127.0.0.1 "
-              f"once server→agent traffic no longer needs it.", flush=True)
+    if bind_host == "127.0.0.1":
+        print(f"[*] Agent API on {bind_host}:{bind_port} — loopback only. "
+              f"The server reaches this agent over the channel it opens.",
+              flush=True)
     else:
-        print(f"[*] Agent API on {bind_host}:{bind_port}", flush=True)
+        print(f"[!] Agent API on {bind_host}:{bind_port} — reachable from the "
+              f"network. Every route requires X-Agent-Key, but the channel "
+              f"already carries everything the server asks for, so this port "
+              f"is exposure without a purpose unless you know why you set it.",
+              flush=True)
 
     app.run(
         host=bind_host,

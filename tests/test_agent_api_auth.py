@@ -1,8 +1,9 @@
 """Every route on the agent's listener requires a key, and self-destruct
 requires this agent's own key.
 
-The agent binds 0.0.0.0:9099 and runs as SYSTEM or root. Three routes had no
-authentication at all:
+The agent runs as SYSTEM or root. It binds loopback now, but it bound
+0.0.0.0:9099 when these were written and `AGENT_BIND` can put it back there,
+so the routes have to hold on their own. Three had no authentication at all:
 
     curl -X POST http://<endpoint>:9099/self_destruct
 
@@ -60,8 +61,37 @@ def test_every_route_authenticates(name):
     _decorator, node = ROUTES[name]
     body = ast.unparse(node)
     assert "_check_auth_header" in body or "_ws_authorized" in body, (
-        f"{name} serves on 0.0.0.0:9099 with no authentication"
+        f"{name} has no authentication, so it is open to anything on the host "
+        f"and to the network wherever AGENT_BIND is set wide"
     )
+
+
+def test_the_listener_binds_to_loopback_by_default():
+    """The port was on 0.0.0.0 because the server dialled it. It does not any
+    more - every route here has a channel equivalent - so an open management
+    API on every endpoint is exposure with nothing left to justify it.
+
+    `AGENT_BIND` is still the way back, which is what makes this a default
+    rather than a removal.
+    """
+    source = MAIN.read_text(encoding="utf-8")
+    assert 'os.getenv("AGENT_BIND", "127.0.0.1")' in source, (
+        "the agent still offers its management API to the network by default"
+    )
+
+
+def test_binding_wide_is_called_out_at_startup():
+    """Someone who sets it should not have to infer what they have done.
+
+    Matched against the source rather than the AST: the message is written as
+    adjacent f-string literals, so no single constant holds the sentence.
+    """
+    source = MAIN.read_text(encoding="utf-8")
+    assert "[!] Agent API on" in source, (
+        "binding to the network is announced the same way as binding to "
+        "loopback, so nothing distinguishes them in the log"
+    )
+    assert "exposure without a purpose" in source
 
 
 def test_self_destruct_requires_this_agents_own_key():
