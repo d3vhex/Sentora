@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react';
+import { StatCard } from '../components/ui';
 import { Radar, RefreshCw, Search, AlertTriangle, Globe, FileDigit, Link2, Server } from 'lucide-react';
 import { agentService, adminService, authService } from '../services/api';
 
@@ -159,7 +160,7 @@ const ThreatIntel: React.FC = () => {
           label="Last updated"
           value={relativeAge(stats?.newest)}
           sub={stats?.newest ? new Date(stats.newest).toLocaleString() : 'no data yet'}
-          warn={!stats?.newest}
+          color={!stats?.newest ? 'var(--accent-warning)' : undefined}
         />
         <StatCard
           label="Feeds"
@@ -306,17 +307,5 @@ const ThreatIntel: React.FC = () => {
     </div>
   );
 };
-
-const StatCard: React.FC<{ label: string; value: React.ReactNode; sub?: string; warn?: boolean }> = ({ label, value, sub, warn }) => (
-  <div className="card" style={{ padding: '20px' }}>
-    <div style={{ fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--text-secondary)', marginBottom: '8px', fontWeight: 700 }}>
-      {label}
-    </div>
-    <div style={{ fontSize: '1.5rem', fontWeight: 800, color: warn ? 'var(--accent-warning)' : 'var(--text-primary)', lineHeight: 1.2 }}>
-      {value}
-    </div>
-    {sub && <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: '4px' }}>{sub}</div>}
-  </div>
-);
 
 export default ThreatIntel;

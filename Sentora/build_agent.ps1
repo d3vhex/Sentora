@@ -182,6 +182,7 @@ $hiddenImports = @(
     # builds cleanly and dies on the first channel connect, which is the worst
     # place to find it.
     "modules.version",
+    "modules.telemetry_health",
     "websocket",
     "winpty",
     "winpty.ptyprocess",

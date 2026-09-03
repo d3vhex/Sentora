@@ -22,6 +22,7 @@ import modules.screen_capture as screen_capture
 import modules.agent_paths as agent_paths
 import modules.console as console
 import modules.link as link
+import modules.telemetry_health as telemetry_health
 
 import logging
 import builtins
@@ -539,7 +540,16 @@ def send_table(table: str):
             s.sendall(struct.pack('!Q', fsize))
             s.sendall(data_bytes)
 
+        # Marked sent because `sendall` returned, which means the bytes
+        # reached the socket buffer. The ingest protocol has no reply, so
+        # this is the strongest thing the agent can know - and it is weaker
+        # than it reads. A server that accepts a batch and stores none of it
+        # looks identical from here, which is exactly how four tables came to
+        # be permanently empty while this line said "sent (50 rows)" every
+        # cycle. `modules/telemetry_health` exists so the server can put its
+        # own row count beside this number.
         mark_sent(table, [r['id'] for r in rows])
+        telemetry_health.record_send(table, len(rows))
         if debug:
             # The IP/OS/HOST/MAC banner used to be repeated here. It is
             # constant for the life of the process and was the single largest
@@ -548,6 +558,7 @@ def send_table(table: str):
             print(f"[+] {table} sent ({len(rows)} rows)")
 
     except Exception as e:
+        telemetry_health.record_send_failure(table, e)
         if debug:
             print(f"[!] Sending error ({table}): {e}")
 
@@ -563,13 +574,40 @@ def db_sender_loop():
         time.sleep(10)
 
 
+#: How many consecutive failures between repeat reports, once a collector has
+#: announced itself broken. Loud on the first, then rare - a collector that
+#: has been failing for a day should not be writing a line every two minutes.
+_FAILURE_REPEAT_EVERY = 30
+
+
 def periodic_wrapped(func, interval: int, name: str):
+    """Run a collector forever, and say when it stops working.
+
+    The failure report used to be behind `if debug`, which nothing sets. A
+    collector that raised on its first line failed silently every interval
+    for the life of the agent, and the only symptom was an empty table in the
+    console - indistinguishable from a host that genuinely has nothing to
+    report. Hardware and network inventory were both empty for exactly this
+    reason, and nothing anywhere said so.
+
+    Rate-limited rather than unconditional, because the same argument that
+    makes silence wrong makes a line every two minutes useless: it would bury
+    the schema errors and the auth rejections that also live in this log.
+    """
+    failures = 0
     while True:
         try:
             func()
+            if failures:
+                print(f"[+] {name} recovered after {failures} failure(s)", flush=True)
+            failures = 0
         except Exception as e:
-            if debug:
-                print(f"[!] Error: ({name}): {e}")
+            failures += 1
+            if failures == 1 or failures % _FAILURE_REPEAT_EVERY == 0:
+                print(f"[!] {name} failed ({failures} consecutive): "
+                      f"{type(e).__name__}: {e}", flush=True)
+                if debug:
+                    traceback.print_exc()
         time.sleep(interval)
 
 
@@ -1923,6 +1961,13 @@ def dispatch_channel_request(method: str, path: str, body) -> tuple[dict, int]:
 
     if path == "/health":
         return {"ok": True, "agent": AGENT_NAME}, 200
+
+    if path == "/telemetry/health":
+        # What this agent holds and believes it has shipped, per table. The
+        # server puts its own row counts beside these; neither half alone can
+        # tell a quiet host from a broken pipeline.
+        return {"ok": True, "agent": AGENT_NAME,
+                "tables": telemetry_health.report(TABLES)}, 200
 
     # Named rather than a bare 404: a path the agent does not implement is
     # usually a server that is newer than this build, and saying so is the
