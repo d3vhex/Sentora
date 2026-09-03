@@ -12,24 +12,101 @@
 @import '@fontsource/source-code-pro/600.css';
 @import '@fontsource/source-code-pro/700.css';
 
+/* ── Design tokens ────────────────────────────────────────────────────────
+ *
+ * Black carries the page; white draws the structure. Colour is reserved for
+ * meaning - severity, state, a series on a chart - and never used for
+ * decoration, because on a console where red means "something is wrong" a
+ * decorative red costs an operator a second every time they scan the page.
+ *
+ * Everything here exists because 1291 inline style objects across 24 pages
+ * did not: each page invented its own spacing, radius and colour, so the UI
+ * could not be consistent no matter how carefully any single page was
+ * written. These are the shared vocabulary. `components/ui` is the shared
+ * grammar.
+ */
 :root {
+  /* Surfaces. Four steps, dark to light, so depth is expressed by value
+     rather than by shadow - shadows on a black ground are invisible and were
+     doing nothing but costing paint time. */
   --bg-color: #000000;
+  --surface-1: #080808;
+  --surface-2: #101010;
+  --surface-3: #171717;
   --sidebar-bg: #050505;
-  --card-bg: rgba(10, 10, 10, 0.8);
-  --border-color: rgba(255, 255, 255, 0.08);
-  --border-neon: rgba(255, 255, 255, 0.2);
+  --card-bg: var(--surface-1);
+
+  /* Structure. White at low alpha: the frame, not the fill. */
+  --border-color: rgba(255, 255, 255, 0.10);
+  --border-strong: rgba(255, 255, 255, 0.18);
+  --border-neon: var(--border-strong);   /* old name, kept so pages still build */
+
+  /* Text. Three steps is enough; a fourth always gets misused as a second
+     body colour and the hierarchy stops reading. */
   --text-primary: #FAFAFA;
-  --text-secondary: #A3A3A3;
-  --accent-color: #EF4444; /* Vibrant Red */
-  --accent-secondary: #3B82F6; /* Vibrant Blue */
-  --accent-success: #10B981; /* Vibrant Green */
-  --accent-warning: #F59E0B; /* Vibrant Amber */
-  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
-  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
-  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
-  --shadow-glow: 0 0 15px rgba(59, 130, 246, 0.1);
-  --radius-md: 12px;
-  --radius-lg: 16px;
+  --text-secondary: #A1A1AA;
+  --text-muted: #71717A;
+
+  /* Semantic colour. Desaturated from the previous set: these sit on pure
+     black, where a saturated hue vibrates and reads as an alarm even when it
+     is a label. */
+  --accent-color: #DC5B5B;      /* danger    */
+  --accent-secondary: #5B8DEF;  /* info      */
+  --accent-success: #4FA97C;    /* ok        */
+  --accent-warning: #D9A441;    /* warning   */
+  --accent-neutral: #8B8B93;    /* no state  */
+
+  /* Severity, named for what it means rather than for its hue, so a page
+     never has to decide which red is the critical one. */
+  --sev-critical: #DC5B5B;
+  --sev-high: #D97A45;
+  --sev-medium: #D9A441;
+  --sev-low: #5B8DEF;
+  --sev-info: #8B8B93;
+
+  /* Chart series. Ordered for distinguishability at small size, and
+     deliberately not the semantic colours above - a bar being red should not
+     imply danger unless danger is what the bar measures. */
+  --chart-1: #7AA2C4;
+  --chart-2: #6FA88B;
+  --chart-3: #C4A46F;
+  --chart-4: #9B87C4;
+  --chart-5: #6FA5A8;
+  --chart-6: #C48A7A;
+  --chart-grid: rgba(255, 255, 255, 0.06);
+  --chart-axis: #71717A;
+
+  /* Spacing. A scale, so vertical rhythm is a choice made once instead of
+     28px here and 24px three lines down. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+
+  /* Type. */
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-base: 0.875rem;
+  --text-lg: 1rem;
+  --text-xl: 1.25rem;
+  --text-2xl: 1.5rem;
+  --text-3xl: 1.875rem;
+
+  /* Radius. One value, small. The old set had 12px cards next to 4px inputs,
+     which is most of why the console read as a toy rather than a tool. */
+  --radius-sm: 3px;
+  --radius-md: 4px;
+  --radius-lg: 6px;
+
+  /* Kept because pages reference them. Shadows do nothing on black; these
+     resolve to nothing rather than being hunted down across 24 files. */
+  --shadow-sm: none;
+  --shadow-md: none;
+  --shadow-lg: none;
+  --shadow-glow: none;
 }
 
 * {
@@ -118,6 +195,14 @@ body {
   to { opacity: 1; }
 }
 
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.spin {
+  animation: spin 1s linear infinite;
+}
+
 h1, h2, h3, h4, h5 {
   font-family: 'Inter', sans-serif;
   font-weight: 500;
@@ -190,21 +275,31 @@ button:active {
   border-color: var(--border-neon);
 }
 
+/* A surface, not an object.
+ *
+ * This used to lift two pixels and glow on hover, over a 12px backdrop blur.
+ * On a page that is mostly cards, that means the whole console moves when the
+ * pointer crosses it - which reads as a toy, and on a dense table view it is
+ * genuinely distracting. A card is where data sits; it is not a button.
+ *
+ * The blur went with it. It was repainting every card on every scroll to
+ * produce an effect nobody could see against a black ground. */
 .card {
   background: var(--card-bg);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
   border: 1px solid var(--border-color);
   border-radius: var(--radius-md);
-  padding: 24px;
-  box-shadow: var(--shadow-md);
-  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  padding: var(--space-5);
 }
 
-.card:hover {
-  border-color: var(--border-neon);
-  transform: translateY(-2px);
-  box-shadow: var(--shadow-lg), var(--shadow-glow);
+/* Only where the card is genuinely a control. Pages opt in. */
+.card--interactive {
+  cursor: pointer;
+  transition: border-color 0.12s ease, background-color 0.12s ease;
+}
+
+.card--interactive:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-2);
 }
 
 input, select, textarea {

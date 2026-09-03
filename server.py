@@ -27,12 +27,57 @@ DB_USER = os.getenv('DB_USER', 'root')
 DB_PASSWORD = os.getenv('DB_PASSWORD', 'my-secret-pw')
 DB_PORT = int(os.getenv('DB_PORT', '3306'))
 
+#: Tables that hold the *current* state of a host rather than a history of
+#: events. Each batch replaces the contents: the agent re-sends the whole
+#: picture, and the previous picture is no longer true.
+SNAPSHOT_TABLES = {
+    "resource_usage", "disk_usage", "critical_files",
+    "network_connections", "hardware_inventory", "docker_containers",
+}
+
+#: Tables where the same event must never be stored twice.
+#:
+#: Disjoint from SNAPSHOT_TABLES, and that is not a style preference - the two
+#: mechanisms cancel each other out exactly. A snapshot table is emptied
+#: before the batch is written; a deduplicated row is skipped when its
+#: fingerprint has been seen before. Put a table in both and the sequence is:
+#:
+#:   batch 1  delete nothing, fingerprints are new, 50 rows written
+#:   batch 2  delete all 50, every fingerprint already known, 0 rows written
+#:   batch 3+ the same
+#:
+#: which leaves the table permanently empty after the second batch, while the
+#: agent's log reads `network_connections sent (50 rows)` every cycle. The
+#: console showed a host with no network connections and no hardware, the
+#: agent showed it shipping both, and both were telling the truth.
+#:
+#: `_assert_ingest_modes_are_exclusive` below makes adding a table to both a
+#: startup failure rather than a silently empty tab.
 DEDUP_TABLES = {
-    "critical_files", "portscan_result", "packages",
+    "portscan_result", "packages",
     "vulnerabilities_report", "siem_events", "events_alert", "soar_actions",
-    "fim_data", "registry_logs", "network_connections", "process_events", "hardware_inventory", "security_audit", "docker_containers",
+    "fim_data", "registry_logs", "process_events", "security_audit",
     "software_inventory", "network_inventory"
 }
+
+
+def _assert_ingest_modes_are_exclusive() -> None:
+    """A table is a snapshot or it is deduplicated, never both.
+
+    Checked at import so the failure is a server that will not start, rather
+    than a tab that is empty for reasons nobody can see from either side.
+    """
+    both = SNAPSHOT_TABLES & DEDUP_TABLES
+    if both:
+        raise RuntimeError(
+            f"{sorted(both)} are both snapshot and deduplicated tables. A "
+            f"snapshot is emptied before each batch and a duplicate row is "
+            f"skipped, so together they leave the table permanently empty "
+            f"after the second batch while the agent reports sending rows."
+        )
+
+
+_assert_ingest_modes_are_exclusive()
 
 ALLOWED_TABLES = {
     "critical_files", "portscan_result", "resource_usage",
@@ -207,6 +252,61 @@ def _migrate_automation_status(cursor, db_name: str) -> None:
     except mysql.connector.Error as e:
         print(f"[!] {db_name}: could not widen automations.status ({e}); "
               f"will retry on the next start")
+
+
+#: Columns holding Fernet ciphertext that shipped too narrow to hold it.
+#:
+#: `network_connections.local_addr` was VARCHAR(64). A token is over a hundred
+#: characters whatever the plaintext, so every batch failed on its first row
+#: with `1406 Data too long` - and because that table is a snapshot, the
+#: DELETE had already run. The tab was empty for days while the agent's log
+#: read `network_connections sent (50 rows)` every cycle.
+#:
+#: `tests/test_encrypted_column_widths.py` compares the two declarations that
+#: have to agree, so the next one fails in CI rather than as an empty tab.
+_WIDEN_FOR_CIPHERTEXT = (
+    ("network_connections", "local_addr", "VARCHAR(255)"),
+    ("network_connections", "remote_addr", "VARCHAR(255)"),
+    ("hardware_inventory", "serial_number", "VARCHAR(255)"),
+    ("events_alert", "score", "VARCHAR(255)"),
+)
+
+
+def _migrate_encrypted_widths(cursor, db_name: str) -> None:
+    """Widen encrypted columns on databases that already exist.
+
+    `CREATE TABLE IF NOT EXISTS` leaves an older table exactly as it was, so
+    fixing the schema file only helps deployments made after today.
+    """
+    cursor.execute(
+        "SELECT table_name, column_name, character_maximum_length "
+        "FROM information_schema.columns WHERE table_schema = %s",
+        (db_name,),
+    )
+    widths = {(str(t).lower(), str(c).lower()): m for t, c, m in cursor.fetchall()}
+
+    for table, column, declaration in _WIDEN_FOR_CIPHERTEXT:
+        current = widths.get((table.lower(), column.lower()), None)
+        # Absent (no such column) or already wide enough: nothing to do.
+        if current is None or int(current) >= 200:
+            continue
+        try:
+            cursor.execute("SET SESSION lock_wait_timeout = 3")
+            # Backticks directly, as everywhere else in this file. The names
+            # come from the constant above, not from anything an agent sends.
+            cursor.execute(
+                f"ALTER TABLE `{table}` MODIFY COLUMN `{column}` {declaration} NULL")
+            print(f"[+] {db_name}: {table}.{column} widened to hold ciphertext",
+                  flush=True)
+        except Exception as e:
+            # Deliberately not just `mysql.connector.Error`. The first version
+            # of this called a helper that does not exist in this module, so it
+            # raised NameError - which that clause does not catch, on a path
+            # only reached when there is work to do. The migration died
+            # silently every time it mattered and never when it did not.
+            print(f"[!] {db_name}: could not widen {table}.{column} "
+                  f"({type(e).__name__}: {e}); encrypted rows will keep being "
+                  f"rejected", flush=True)
 
 
 def _migrate_agent_info(cursor, db_name: str) -> None:
@@ -468,6 +568,11 @@ def create_tables_if_not_exist(db_name):
             print(f"[!] soar_actions migration skipped: {e}")
 
         try:
+            _migrate_encrypted_widths(cursor, db_name)
+        except mysql.connector.Error as e:
+            print(f"[!] encrypted-width migration skipped: {e}")
+
+        try:
             # Every column update_agent_info's INSERT names is declared here.
             #
             # hostname, mac_address and reported_ip used to be added by ALTERs
@@ -622,7 +727,10 @@ async def insert_data(agent: str, table: str, data: list, public_ip: str = None,
             print(f"[!] Unknown table '{table}' received. Skipping.")
             return
 
-        if table in {"resource_usage", "disk_usage", "critical_files", "network_connections", "hardware_inventory", "docker_containers"}:
+        # A snapshot replaces what was there. Named rather than written out
+        # here, because the same list existing twice is how it came to
+        # overlap with DEDUP_TABLES in the first place.
+        if table in SNAPSHOT_TABLES:
             cursor.execute(f"DELETE FROM `{table}`")
 
         for item in data:

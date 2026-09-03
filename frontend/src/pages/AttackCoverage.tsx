@@ -1,5 +1,10 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Grid3x3, ShieldAlert, ShieldCheck, EyeOff, AlertTriangle } from 'lucide-react';
+import { Grid3x3, ShieldAlert, ShieldCheck, EyeOff, AlertTriangle, GitBranch } from 'lucide-react';
+// One StatCard, not three. It was written independently on this page, on
+// Dashboard and on ThreatIntel, and the three had drifted to different
+// paddings, weights and label sizes - which is most of why the console read
+// as three products rather than one.
+import { StatCard } from '../components/ui';
 import { agentService } from '../services/api';
 
 /**
@@ -33,6 +38,18 @@ type Coverage = {
   observed_count: number;
   quiet: string[];
   uncovered_but_seen: string[];
+  /** Seen, with rules for *other* sub-techniques of the same parent and not
+   *  this one. Its own state because it is the one most easily mistaken for
+   *  coverage: the parent cell is green while this particular action would go
+   *  unnoticed. Detecting T1003.001 (LSASS memory) says nothing about
+   *  T1003.003 (the AD database) - different action, different telemetry. */
+  covered_only_by_a_sibling: string[];
+  /** Seen at sub-technique granularity, with a rule claiming the whole
+   *  parent. Genuinely covered. */
+  covered_by_the_parent: string[];
+  /** Parent technique -> the sub-techniques covered under it, so a rolled-up
+   *  cell can say "2 sub-techniques" rather than implying the whole of it. */
+  subtechniques: Record<string, string[]>;
 };
 
 /** The tactics, in the order ATT&CK orders them: earliest to latest in a
@@ -69,20 +86,6 @@ const tacticOf = (technique: string): string =>
 
 const label = (tactic: string): string =>
   tactic.split('-').map(w => w[0].toUpperCase() + w.slice(1)).join(' ');
-
-const StatCard: React.FC<{
-  label: string; value: React.ReactNode; sub: string;
-  color: string; icon: React.ReactNode;
-}> = ({ label, value, sub, color, icon }) => (
-  <div className="card" style={{ padding: '20px' }}>
-    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '10px', color }}>
-      {icon}
-      <span style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)' }}>{label}</span>
-    </div>
-    <div style={{ fontSize: '1.75rem', fontWeight: 700, color }}>{value}</div>
-    <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '4px' }}>{sub}</div>
-  </div>
-);
 
 const AttackCoverage: React.FC = () => {
   const [data, setData] = useState<Coverage | null>(null);
@@ -172,7 +175,31 @@ const AttackCoverage: React.FC = () => {
           sub="surfaced by the AI or the regex list, with no rule behind it"
           color="#fbbf24" icon={<EyeOff size={16} />}
         />
+        <StatCard
+          label="Covered only by a sibling"
+          value={data?.covered_only_by_a_sibling?.length ?? '—'}
+          sub="a rule exists for another sub-technique, not for this one"
+          color="#f0abfc" icon={<GitBranch size={16} />}
+        />
       </div>
+
+      {!loading && !!data?.covered_only_by_a_sibling?.length && (
+        <div style={{
+          marginBottom: '24px', padding: '14px 16px', borderRadius: '8px',
+          fontSize: '0.8125rem', backgroundColor: 'rgba(240,171,252,0.06)',
+          border: '1px solid rgba(240,171,252,0.25)',
+        }}>
+          <strong>{data.covered_only_by_a_sibling.join(', ')}</strong> fired here,
+          and the rules you have cover a <em>different</em> sub-technique of the
+          same parent. The grid below is drawn at parent granularity, so those
+          cells read as covered — they are not. Detecting one sub-technique says
+          nothing about its siblings: they are different actions with different
+          telemetry, and the rule for one will never fire on the other.
+          <div style={{ marginTop: '6px', opacity: 0.75 }}>
+            Usually cheaper to widen an existing rule than to write a new one.
+          </div>
+        </div>
+      )}
 
       {!loading && data && data.covered_count === 0 && (
         <div style={{

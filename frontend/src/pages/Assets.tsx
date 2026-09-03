@@ -185,11 +185,19 @@ const Assets: React.FC = () => {
                                             <Th>Installed Date</Th>
                                             <Th>Status</Th>
                                         </>}
+                                        {/* The columns `network_connections`
+                                            actually has. `Protocol` was here
+                                            and the table has no such field,
+                                            so it rendered as a blank badge on
+                                            every row - while the remote
+                                            address, which is the whole point
+                                            of an established connection, was
+                                            not shown at all. */}
                                         {activeTab === 'network' && <>
-                                            <Th>Protocol</Th>
-                                            <Th>Local Port</Th>
                                             <Th>Process</Th>
                                             <Th>PID</Th>
+                                            <Th>Local</Th>
+                                            <Th>Remote</Th>
                                             <Th>State</Th>
                                         </>}
                                     </tr>
@@ -230,10 +238,12 @@ const Assets: React.FC = () => {
                                                 <Td><StatusBadge status="installed" /></Td>
                                             </>}
                                             {activeTab === 'network' && <>
-                                                <Td><span style={{ background: 'rgba(59, 130, 246, 0.1)', color: 'var(--accent-secondary)', padding: '2px 8px', borderRadius: '4px', fontSize: '0.75rem', fontWeight: 800 }}>{item.protocol}</span></Td>
-                                                <Td style={{ fontWeight: 800, color: 'var(--accent-color)' }}>{item.local_port}</Td>
                                                 <Td style={{ fontWeight: 600 }}>{item.process_name}</Td>
                                                 <Td style={{ opacity: 0.6 }}>{item.pid}</Td>
+                                                <Td className="mono">{item.local_addr}:{item.local_port}</Td>
+                                                <Td className="mono" style={{ color: 'var(--accent-secondary)' }}>
+                                                    {item.remote_addr}:{item.remote_port}
+                                                </Td>
                                                 <Td><StatusBadge status={item.state} /></Td>
                                             </>}
                                         </tr>
@@ -274,8 +284,8 @@ const Th = ({ children }: any) => (
     <th style={{ padding: '16px 20px', fontSize: '0.8rem', fontWeight: 700, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{children}</th>
 );
 
-const Td = ({ children, style }: any) => (
-    <td style={{ padding: '16px 20px', fontSize: '0.9rem', ...style }}>{children}</td>
+const Td = ({ children, style, className }: any) => (
+    <td className={className} style={{ padding: '16px 20px', fontSize: '0.9rem', ...style }}>{children}</td>
 );
 
 const StatusBadge = ({ status }: { status: string }) => {

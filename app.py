@@ -111,6 +111,7 @@ from ai.utils import load_ai_config, is_critical_log, save_ai_results
 from security import session as session_store
 from security import ssrf
 from core import agent_link
+from core import attack
 from core import config_validation
 from core import login_guard
 from core import netloc
@@ -2543,7 +2544,14 @@ async def get_software_inventory(request, agent):
 @require_permission("read_telemetry")
 @app.route("/api/agent/<agent>/inventory/network")
 async def get_network_inventory(request, agent):
-    return await stream_from_db_dec("network_connections", agent, connect_db_for_agent)
+    # The fields were missing here and nowhere else, so the Network tab
+    # rendered `enc::gAAAAAB...` where the process name should be. Ciphertext
+    # in a column reads as data, not as a fault - the page looked populated
+    # and was unusable. `test_encrypted_reads_decrypt` now requires every
+    # route reading an encrypted table to pass its fields.
+    fields = ENCRYPTED_FIELDS_MAP.get("network_connections")
+    return await stream_from_db_dec("network_connections", agent,
+                                    connect_db_for_agent, encrypted_fields=fields)
 
 @require_permission("read_telemetry")
 @app.route("/api/agent/<agent>/fim")
@@ -6192,6 +6200,12 @@ async def list_agents(request):
             detail["agent_version"] = reported
             detail["version_state"] = state
             detail["version_detail"] = why
+            # Whether a command would reach it *right now*, which is not the
+            # same question as whether it is reporting. Telemetry and control
+            # travel on different connections, so an agent can be sending data
+            # and be uncommandable - and the console has been unable to say
+            # which since the fallback went.
+            detail["channel_connected"] = _linked_agent(detail["name"]) is not None
 
         return sanic_json({"agents": agent_details,
                            "server_version": product_version.SERVER_VERSION,
@@ -6924,6 +6938,15 @@ async def get_attack_coverage(request):
         observed = {}
 
     covered = sorted(_sigma_technique_index())
+
+    # Compared through the technique hierarchy, not as strings.
+    #
+    # This was `set(covered) - set(observed)` both ways, so a rule tagged
+    # `T1003.001` and an event carrying `T1003` never matched each other: one
+    # landed in "covered but never seen" and the other in "seen with nothing
+    # covering it", and both were wrong. Those two lists are the only ones an
+    # operator acts on.
+    states = attack.classify(covered, observed)
     return sanic_json({
         "status": "success",
         "covered": covered,
@@ -6931,12 +6954,22 @@ async def get_attack_coverage(request):
                      for k, v in sorted(observed.items(), key=lambda kv: -kv[1])],
         "covered_count": len(covered),
         "observed_count": len(observed),
-        # Covered but never seen. Normal, and worth showing separately from
-        # the third category below.
-        "quiet": sorted(set(covered) - set(observed)),
-        # Seen with no rule that covers it - a technique the AI or the regex
-        # list surfaced and Sigma has nothing for.
-        "uncovered_but_seen": sorted(set(observed) - set(covered)),
+        # Covered and never seen. Normal, and the healthy majority.
+        "quiet": attack.unseen(covered, observed),
+        # Seen with nothing addressing it at all.
+        "uncovered_but_seen": states["none"],
+        # Seen, with rules for *other* sub-techniques of the same parent and
+        # not this one. Reported separately because it is the state most
+        # easily mistaken for coverage - the parent cell is green while this
+        # particular action would go unnoticed - and because the fix differs:
+        # `none` needs a rule written, this usually needs one widened.
+        "covered_only_by_a_sibling": states["sibling"],
+        # Seen at sub-technique granularity, with a rule that claims the whole
+        # parent.
+        "covered_by_the_parent": states["parent"],
+        # What the grid rolls up, so a cell can say "3 sub-techniques" rather
+        # than implying the whole technique.
+        "subtechniques": attack.rollup(covered),
     })
 
 
@@ -6976,6 +7009,325 @@ def _observed_techniques(agent: str | None = None) -> dict:
         finally:
             cursor.close()
     return seen
+
+
+#: What the server holds for a table, so the two halves can be compared.
+def _server_table_counts(agent: str, tables) -> dict:
+    """Row count and newest row per table, from this agent's database."""
+    counts: dict[str, dict] = {}
+    db = _agent_name_forms(agent)[1] + "_db"
+    with sync_mysql_conn() as conn:
+        cursor = conn.cursor()
+        try:
+            for table in tables:
+                try:
+                    cursor.execute(
+                        f"SELECT COUNT(*) FROM {_quote_identifier(db)}"
+                        f".{_quote_identifier(table)}")
+                    counts[table] = {"rows": int(cursor.fetchone()[0] or 0)}
+                except Exception:
+                    # A table this server does not have. A real state - the
+                    # agent may be newer - and not a reason to fail the rest.
+                    counts[table] = {"rows": None}
+        finally:
+            cursor.close()
+    return counts
+
+
+def _classify_link(agent_side: dict, server_rows) -> tuple[str, str]:
+    """Where the chain is broken for one table, if it is.
+
+    The whole point of this file. Each of these states looked identical from
+    the console before - an empty table - and each needs a different person to
+    do a different thing.
+    """
+    held = int(agent_side.get("held") or 0)
+    unsent = int(agent_side.get("unsent") or 0)
+    shipped = int(agent_side.get("shipped") or 0)
+    error = agent_side.get("last_error")
+
+    if server_rows is None:
+        return ("no table", "this server has no such table; the agent may be "
+                            "newer than it")
+    if held == 0:
+        return ("not collected",
+                "the agent has never written a row of this locally - the "
+                "collector is not running, failed, or does not apply to this host")
+    if error:
+        return ("send failing", f"the agent could not ship it: {error}")
+    if shipped == 0 and unsent > 0:
+        return ("queued", f"{unsent} row(s) collected and none shipped yet")
+    if shipped > 0 and server_rows == 0:
+        # The state that was invisible. The agent's log says "sent (50 rows)"
+        # every cycle and the server holds none of them.
+        return ("lost in transit",
+                f"the agent has shipped {shipped} row(s) and this server holds "
+                f"none - accepted and discarded, not a quiet host")
+    if server_rows == 0:
+        return ("empty", "nothing collected and nothing expected")
+    return ("flowing", f"{server_rows} row(s) here")
+
+
+@app.route("/telemetry-health/<agent>")
+@require_permission("read_telemetry")
+async def get_telemetry_health(request, agent):
+    """Does this agent's telemetry actually arrive? Per table, end to end.
+
+    Three bugs in one day had the same shape: every layer reported success,
+    the chain was broken anyway, and the only symptom was an empty table -
+    indistinguishable from a host that genuinely has nothing to report.
+
+    A collector raised on its first line and the four after it never ran. The
+    server accepted a batch and discarded every row. And the agent marks rows
+    sent as soon as `sendall` returns, because the ingest protocol has no
+    reply - so it reported success in all three cases and was not wrong to.
+
+    Neither half can tell a quiet host from a broken pipeline on its own. This
+    puts the two numbers next to each other, which is all it ever needed.
+    """
+    link = _linked_agent(agent)
+    if link is None:
+        return sanic_json({"status": "error",
+                           "message": _no_channel_message(agent)}, status=502)
+    try:
+        body, status = await link.request("GET", "/telemetry/health", timeout=15)
+    except agent_link.LinkError as e:
+        return sanic_json({"status": "error",
+                           "message": f"the agent did not answer: {e}"}, status=502)
+    if status == 501:
+        return sanic_json({
+            "status": "error",
+            "message": "This agent predates telemetry health reporting. "
+                       "Rebuild and reinstall it.",
+        }, status=501)
+
+    agent_tables = (body or {}).get("tables") or {}
+    server = await asyncio.to_thread(
+        _server_table_counts, agent, sorted(agent_tables))
+
+    report = []
+    for table in sorted(agent_tables):
+        side = agent_tables[table] or {}
+        rows = server.get(table, {}).get("rows")
+        state, detail = _classify_link(side, rows)
+        report.append({
+            "table": table,
+            "state": state,
+            "detail": detail,
+            "agent_held": side.get("held"),
+            "agent_unsent": side.get("unsent"),
+            "agent_shipped": side.get("shipped"),
+            "agent_last_sent_at": side.get("last_sent_at"),
+            "agent_last_error": side.get("last_error"),
+            "server_rows": rows,
+        })
+
+    broken = [r for r in report if r["state"] in
+              ("lost in transit", "send failing", "not collected")]
+    return sanic_json({
+        "status": "success",
+        "agent": agent,
+        "tables": report,
+        "broken_count": len(broken),
+    })
+
+
+def _threat_trend(days: int = 14) -> list:
+    """Detections per day across the fleet, in two counts that differ.
+
+    `detections` is every event that fired a rule. `distinct` is how many
+    *different* techniques were behind them, which is the number worth
+    watching: a thousand detections from one noisy rule and a thousand from
+    forty different techniques are the same bar and completely different days.
+
+    Plotted together on two axes because the shape of one against the other is
+    the signal - a spike in detections with a flat distinct line is almost
+    always a rule that needs tuning, not an incident.
+    """
+    buckets: dict[str, dict] = {}
+    with sync_mysql_conn() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SHOW DATABASES")
+            dbs = [r[0] for r in cursor.fetchall() if r[0].endswith("_db")]
+            for db in dbs:
+                try:
+                    cursor.execute(
+                        f"SELECT DATE(created_at) AS d, techniques, COUNT(*) "
+                        f"FROM {_quote_identifier(db)}.siem_events "
+                        f"WHERE created_at >= CURDATE() - INTERVAL %s DAY "
+                        f"AND techniques IS NOT NULL AND techniques <> '' "
+                        f"GROUP BY d, techniques",
+                        (int(days),),
+                    )
+                except Exception:
+                    # An agent enrolled before the column existed. Not an
+                    # error, and not a reason to fail the whole chart.
+                    continue
+                for day, value, count in cursor.fetchall():
+                    key = day.isoformat() if hasattr(day, "isoformat") else str(day)
+                    bucket = buckets.setdefault(
+                        key, {"date": key, "detections": 0, "techniques": set()})
+                    bucket["detections"] += int(count)
+                    for raw in str(value).split(","):
+                        technique = attack.normalise(raw)
+                        if technique:
+                            bucket["techniques"].add(technique)
+        finally:
+            cursor.close()
+
+    # Every day in the window, including the quiet ones. A line drawn only
+    # through the days that had events invents a slope between them and makes
+    # a two-day gap look like a gradual decline.
+    import datetime
+    today = datetime.date.today()
+    series = []
+    for offset in range(days, -1, -1):
+        key = (today - datetime.timedelta(days=offset)).isoformat()
+        bucket = buckets.get(key)
+        series.append({
+            "date": key,
+            "detections": bucket["detections"] if bucket else 0,
+            "distinct": len(bucket["techniques"]) if bucket else 0,
+        })
+    return series
+
+
+@app.route("/threat-trend")
+@require_permission("read_telemetry")
+async def get_threat_trend(request):
+    """Detections per day across the fleet, for the dashboard."""
+    try:
+        days = max(1, min(int(request.args.get("days", 14)), 90))
+    except ValueError:
+        days = 14
+    try:
+        series = await asyncio.to_thread(_threat_trend, days)
+    except Exception as e:
+        print(f"[!] threat trend query failed: {e}", flush=True)
+        return sanic_json({"status": "error", "message": str(e)}, status=500)
+    return sanic_json({"status": "success", "days": days, "series": series})
+
+
+def _observed_chain(agent: str, hours: int = 168) -> list:
+    """The tactics seen on one host, in kill-chain order, with when.
+
+    A list of techniques tells you what happened. It does not tell you that
+    execution was followed by persistence and then credential access, which is
+    the difference between a suspicious command and an intrusion - and the
+    difference an analyst is trying to establish when they open a host.
+
+    Ordered by the chain rather than by the clock. Timestamps are kept per
+    stage so the two can be read together: a chain whose stages are days apart
+    is a different story from one that completed inside a minute, and only the
+    order makes either legible.
+    """
+    stages: dict[str, dict] = {}
+    db = _agent_name_forms(agent)[1] + "_db"
+    with sync_mysql_conn() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                f"SELECT techniques, MIN(created_at), MAX(created_at), COUNT(*) "
+                f"FROM {_quote_identifier(db)}.siem_events "
+                f"WHERE techniques IS NOT NULL AND techniques <> '' "
+                f"AND created_at >= NOW() - INTERVAL %s HOUR "
+                f"GROUP BY techniques",
+                (int(hours),),
+            )
+            rows = cursor.fetchall()
+        except Exception as e:
+            # An agent with no telemetry, or one enrolled before the column
+            # existed. Not an error, and an empty chain is a true answer.
+            print(f"[attack-chain] {agent}: {e}", flush=True)
+            return []
+        finally:
+            cursor.close()
+
+    tactics_for = _sigma_tactics_by_technique()
+    for value, first, last, count in rows:
+        for raw in str(value).split(","):
+            technique = attack.normalise(raw)
+            if not technique:
+                continue
+            # A technique with no tactic still happened. It lands at the end
+            # of the chain rather than being dropped.
+            for tactic in tactics_for.get(technique) or ["other"]:
+                stage = stages.setdefault(tactic, {
+                    "tactic": tactic, "techniques": set(),
+                    "events": 0, "first_seen": first, "last_seen": last,
+                })
+                stage["techniques"].add(technique)
+                stage["events"] += int(count)
+                if first and (not stage["first_seen"] or first < stage["first_seen"]):
+                    stage["first_seen"] = first
+                if last and (not stage["last_seen"] or last > stage["last_seen"]):
+                    stage["last_seen"] = last
+
+    ordered = sorted(stages.values(),
+                     key=lambda s: attack.tactic_position(s["tactic"]))
+    return [{
+        "tactic": s["tactic"],
+        "position": attack.tactic_position(s["tactic"]),
+        "techniques": sorted(s["techniques"]),
+        "events": s["events"],
+        "first_seen": s["first_seen"].isoformat() if s["first_seen"] else None,
+        "last_seen": s["last_seen"].isoformat() if s["last_seen"] else None,
+    } for s in ordered]
+
+
+def _sigma_tactics_by_technique() -> dict:
+    """Technique -> the tactics its rules are tagged with.
+
+    From the rules themselves, so there is no mapping table here to drift out
+    of date - the same reason the coverage index reads them rather than
+    keeping a list.
+    """
+    mapping: dict[str, list] = {}
+    try:
+        from core.sigma_loader import load_dir
+        path = os.getenv(
+            "SIGMA_RULES_PATH",
+            str(pathlib.Path(__file__).resolve().parent /
+                "Sentora" / "conf" / "sigma"))
+        for rule in load_dir(path).rules:
+            for technique in rule.techniques:
+                clean = attack.normalise(technique)
+                if not clean:
+                    continue
+                known = mapping.setdefault(clean, [])
+                for tactic in rule.tactics:
+                    if tactic not in known:
+                        known.append(tactic)
+    except Exception as e:
+        print(f"[attack-chain] could not read rule tactics: {e}", flush=True)
+    return mapping
+
+
+@app.route("/attack-chain/<agent>")
+@require_permission("read_telemetry")
+async def get_attack_chain(request, agent):
+    """What happened on this host, laid out as a kill chain."""
+    try:
+        hours = max(1, min(int(request.args.get("hours", 168)), 24 * 90))
+    except ValueError:
+        hours = 168
+    try:
+        chain = await asyncio.to_thread(_observed_chain, agent, hours)
+    except Exception as e:
+        print(f"[!] attack chain query failed for {agent}: {e}", flush=True)
+        return sanic_json({"status": "error", "message": str(e)}, status=500)
+
+    return sanic_json({
+        "status": "success",
+        "agent": agent,
+        "hours": hours,
+        "chain": chain,
+        # The full order, so the UI can draw the stages that did *not* happen
+        # as gaps rather than omitting them. A chain with holes in it is the
+        # readable thing; a list of four tactics is not.
+        "tactic_order": list(attack.TACTIC_ORDER),
+    })
 
 
 def _sigma_technique_index() -> set:
