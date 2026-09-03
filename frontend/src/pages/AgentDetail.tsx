@@ -20,6 +20,7 @@ import {
   RotateCcw,
   Pencil,
   FileDown,
+  GitBranch,
   Bomb,
   MonitorPlay,
   TerminalSquare as TerminalIcon,
@@ -448,6 +449,21 @@ const AgentDetail: React.FC = () => {
           <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
             <button onClick={handleRestart} title="Restart Agent" style={{ padding: '10px', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'var(--accent-warning)' }}><RotateCcw size={18} /></button>
             <button onClick={handleSelfDestruct} title="Self Destruct" style={{ padding: '10px', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'var(--accent-color)' }}><Bomb size={18} /></button>
+            {/* Reached from the host, not from the nav: "which tactics ran
+                here, in what order" is a question about one machine. */}
+            <Link to={`/agent/${encodeURIComponent(agentName!)}/chain`}
+              title="Tactics seen on this host, in kill-chain order"
+              style={{ padding: '10px 16px', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'white', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.875rem' }}>
+              <GitBranch size={16} /> Attack chain
+            </Link>
+            {/* The first place to look when a tab on this page is empty:
+                it says whether that means "nothing to report" or "the data
+                is being collected and lost". */}
+            <Link to={`/agent/${encodeURIComponent(agentName!)}/telemetry`}
+              title="Is this host's telemetry actually arriving?"
+              style={{ padding: '10px 16px', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'white', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.875rem' }}>
+              <Activity size={16} /> Telemetry
+            </Link>
             <button onClick={downloadReport} disabled={reporting}
               title="Download a PDF report for this host"
               style={{ padding: '10px 16px', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'white', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.875rem' }}>

@@ -8,6 +8,8 @@ import AdminUsers from './pages/AdminUsers';
 import AIAnalysis from './pages/AIAnalysis';
 import ThreatIntel from './pages/ThreatIntel';
 import AttackCoverage from './pages/AttackCoverage';
+import AttackChain from './pages/AttackChain';
+import TelemetryHealth from './pages/TelemetryHealth';
 import Login from './pages/Login';
 import Playbooks from './pages/Playbooks';
 import Databases from './pages/Databases';
@@ -72,6 +74,24 @@ const App: React.FC = () => {
         <Route path="/attack-coverage" element={
           <ProtectedRoute>
             <AttackCoverage />
+          </ProtectedRoute>
+        } />
+
+        {/* Per host, so it is reached from the host rather than from the nav:
+            "which tactics ran on this machine, in what order" is a question
+            you ask about one machine, not about the estate. */}
+        <Route path="/agent/:agentName/chain" element={
+          <ProtectedRoute>
+            <AttackChain />
+          </ProtectedRoute>
+        } />
+
+        {/* Also per host: "is this machine's telemetry arriving" is asked
+            about one machine, and answered by comparing its numbers with
+            this server's. */}
+        <Route path="/agent/:agentName/telemetry" element={
+          <ProtectedRoute>
+            <TelemetryHealth />
           </ProtectedRoute>
         } />
         

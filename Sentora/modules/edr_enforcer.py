@@ -69,12 +69,23 @@ def check_fim():
             })
 
 def track_network():
+    """Established outbound connections, with the process behind each.
+
+    `psutil.net_connections` raises AccessDenied where the agent is not
+    privileged enough to see other processes' sockets. That is a real
+    condition worth reporting rather than an empty table: the caller isolates
+    and logs it, and an operator can act on "the agent cannot read the
+    connection table" in a way they cannot act on a blank page.
+    """
     for conn in psutil.net_connections(kind='inet'):
         if conn.status == 'ESTABLISHED' and conn.raddr:
             try:
                 proc = psutil.Process(conn.pid)
                 name = proc.name()
             except Exception:
+                # The process ended between listing and lookup, which is
+                # ordinary on a busy host. The connection is still worth
+                # recording.
                 name = "Unknown"
             
             insert_record_enc("network_connections", {
@@ -150,53 +161,90 @@ def monitor_processes():
             continue
 
 def get_hardware_inventory():
+    # Nothing is swallowed here any more. An empty hardware tab is
+    # indistinguishable from a host with no hardware, so a collector that
+    # cannot run has to say why - the console cannot infer it.
     if IS_WINDOWS:
         ps_cmd = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-PnpDevice -PresentOnly | Select-Object FriendlyName, InstanceId | ConvertTo-Json"
-        try:
-            res = subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], capture_output=True, text=True, encoding='utf-8', errors='replace')
-            if res.returncode == 0 and res.stdout:
-                data = json.loads(res.stdout)
-                for item in (data if isinstance(data, list) else [data]):
-                    if not item or not item.get("FriendlyName"): continue
-                    insert_record_enc("hardware_inventory", {
-                        "type": "pnp",
-                        "name": item.get("FriendlyName"),
-                        "product_id": item.get("InstanceId", "N/A"),
-                        "serial_number": item.get("InstanceId", "N/A"),
-                        "status": "active"
-                    })
-        except Exception: pass
+        res = subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], capture_output=True, text=True, encoding='utf-8', errors='replace')
+        if res.returncode != 0:
+            raise RuntimeError(
+                f"Get-PnpDevice exited {res.returncode}: "
+                f"{(res.stderr or '').strip()[:200]}")
+        if not (res.stdout or "").strip():
+            raise RuntimeError("Get-PnpDevice returned nothing")
+        data = json.loads(res.stdout)
+        for item in (data if isinstance(data, list) else [data]):
+            if not item or not item.get("FriendlyName"):
+                continue
+            insert_record_enc("hardware_inventory", {
+                "type": "pnp",
+                "name": item.get("FriendlyName"),
+                "product_id": item.get("InstanceId", "N/A"),
+                "serial_number": item.get("InstanceId", "N/A"),
+                "status": "active"
+            })
     else:
-        try:
-            res = subprocess.run(["lsusb"], capture_output=True, text=True, encoding='utf-8', errors='replace')
-            for line in res.stdout.splitlines():
+        res = subprocess.run(["lsusb"], capture_output=True, text=True, encoding='utf-8', errors='replace')
+        if res.returncode != 0:
+            raise RuntimeError(
+                f"lsusb exited {res.returncode}: "
+                f"{(res.stderr or '').strip()[:200]}")
+        for line in res.stdout.splitlines():
+            if line.strip():
                 insert_record_enc("hardware_inventory", {
                     "type": "usb",
                     "name": line.strip()
                 })
-        except Exception: pass
 
 def monitor_registry():
-    if not IS_WINDOWS: return
+    if not IS_WINDOWS:
+        return
     ps_cmd = "Get-ItemProperty HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run | ConvertTo-Json"
-    try:
-        res = subprocess.run(["powershell", "-Command", ps_cmd], capture_output=True, text=True, encoding='utf-8', errors='replace')
-        if res.returncode == 0 and res.stdout:
-            data = json.loads(res.stdout)
-            for k, v in data.items():
-                if k not in ["PSPath", "PSParentPath", "PSChildName", "PSDrive", "PSProvider"]:
-                    insert_record_enc("registry_logs", {
-                        "hive": "HKLM",
-                        "key_path": "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-                        "value_name": k,
-                        "value_data": str(v),
-                        "status": "monitored"
-                    })
-    except Exception: pass
+    res = subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], capture_output=True, text=True, encoding='utf-8', errors='replace')
+    if res.returncode != 0:
+        raise RuntimeError(
+            f"Get-ItemProperty exited {res.returncode}: "
+            f"{(res.stderr or '').strip()[:200]}")
+    if not (res.stdout or "").strip():
+        return                      # an empty Run key is a real answer
+    data = json.loads(res.stdout)
+    for k, v in data.items():
+        if k not in ["PSPath", "PSParentPath", "PSChildName", "PSDrive", "PSProvider"]:
+            insert_record_enc("registry_logs", {
+                "hive": "HKLM",
+                "key_path": "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                "value_name": k,
+                "value_data": str(v),
+                "status": "monitored"
+            })
 
 def main():
-    check_fim()
-    track_network()
-    monitor_processes()
-    get_hardware_inventory()
-    monitor_registry()
+    """Every collector, each isolated from the others.
+
+    They used to be five bare calls in a row, so the first one to raise took
+    the rest of the cycle with it - and since the caller retries on a timer,
+    it took them again every two minutes, permanently.
+
+    That is why the console showed no hardware and no network inventory at
+    the same time: `track_network` and `get_hardware_inventory` sit second and
+    fourth, and something ahead of them was throwing on every pass. An empty
+    table reads as "this host has nothing to report", which is the one thing
+    it did not mean.
+
+    One failing collector now costs its own data and nothing else, and says
+    so. `periodic_wrapped` rate-limits the repeat, so a permanently broken
+    collector is loud once rather than every two minutes forever.
+    """
+    for name, collector in (
+        ("fim", check_fim),
+        ("network", track_network),
+        ("processes", monitor_processes),
+        ("hardware", get_hardware_inventory),
+        ("registry", monitor_registry),
+    ):
+        try:
+            collector()
+        except Exception as e:
+            print(f"[edr] {name} collector failed: {type(e).__name__}: {e}",
+                  flush=True)

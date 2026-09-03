@@ -1,6 +1,27 @@
-import React, { useEffect, useState } from 'react';
-import { 
-  ShieldAlert, 
+import React, { useEffect, useMemo, useState } from 'react';
+import { Card, StatCard } from '../components/ui';
+import { CategoryBars, ShareDonut, TrendChart } from '../components/ui/charts';
+
+const chartNote: React.CSSProperties = {
+  margin: '0 0 var(--space-3)', color: 'var(--text-muted)',
+  fontSize: 'var(--text-xs)', maxWidth: '58ch',
+};
+
+/** Severity, not series: these categories *are* states, so they take the
+ *  semantic colours rather than the chart palette. */
+const ATTENTION_TONE: Record<string, string> = {
+  'No channel': 'var(--sev-critical)',
+  'Unsupported agent': 'var(--sev-high)',
+  'Version unknown': 'var(--sev-medium)',
+  'Behind': 'var(--sev-low)',
+};
+
+const CONNECTION_TONE: Record<string, string> = {
+  Connected: 'var(--accent-success)',
+  Disconnected: 'var(--sev-critical)',
+};
+import {
+  ShieldAlert,
   Monitor, 
   Activity, 
   Cpu,
@@ -19,6 +40,38 @@ const Dashboard: React.FC = () => {
   const [dbStatus, setDbStatus] = useState<any>(null);
   const [summary, setSummary] = useState<any>(null);
   const [recentAlerts, setRecentAlerts] = useState<any[]>([]);
+  const [trend, setTrend] = useState<{ date: string; detections: number; distinct: number }[]>([]);
+
+  /* Derived on the page rather than asked of the server: the agents list
+     already carries every field these count, and a second endpoint would be
+     a second place for the definition of "needs attention" to live. */
+  const attentionBuckets = useMemo(() => {
+    const count = (fn: (a: any) => boolean) => agents.filter(fn).length;
+    return [
+      { name: 'No channel', value: count((a) => a.channel_connected === false) },
+      { name: 'Unsupported agent', value: count((a) => a.version_state === 'unsupported') },
+      { name: 'Version unknown', value: count((a) => a.version_state === 'unknown') },
+      { name: 'Behind', value: count((a) => a.version_state === 'behind') },
+    ];
+  }, [agents]);
+
+  const connectionBuckets = useMemo(() => ([
+    { name: 'Connected', value: agents.filter((a: any) => a.channel_connected).length },
+    { name: 'Disconnected', value: agents.filter((a: any) => !a.channel_connected).length },
+  ]), [agents]);
+
+  const versionSpread = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const a of agents as any[]) {
+      // Null is a real answer, not a gap: it means the agent sent no version
+      // at all, which is a different fact from being old.
+      const key = a.agent_version || 'Not reported';
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return [...counts.entries()]
+      .map(([name, value]) => ({ name, value }))
+      .sort((a, b) => b.value - a.value);
+  }, [agents]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -33,7 +86,7 @@ const Dashboard: React.FC = () => {
       // Four fan-out requests collapsed into one aggregate. The page was
       // downloading up to 100 decrypted alerts per agent, and every AI
       // insight with its full raw log attached, only to count them.
-      const [agentList, summary, serverRes, gStats, dbRes, aiRes, recent] = await Promise.all([
+      const [agentList, summary, serverRes, gStats, dbRes, aiRes, recent, trendRes] = await Promise.all([
         agentService.getAgents(),
         agentService.getDashboardSummary(),
         agentService.getServerResources(),
@@ -43,7 +96,11 @@ const Dashboard: React.FC = () => {
         agentService.getCustom('/api/ai-insights/all?limit=3&per_agent=3').catch(() => null),
         // The feed below shows six rows; it used to pull a hundred per agent.
         agentService.getCustom('/all_alerts?per_agent=3').catch(() => []),
+        // Fleet-wide detections per day. Its own request because it walks
+        // every agent database and must not hold up the tiles above it.
+        agentService.getCustom('/threat-trend?days=14').catch(() => null),
       ]);
+      setTrend(trendRes?.series || []);
       setAgents(agentList || []);
       setSummary(summary?.status === 'success' ? summary : null);
       setResources(serverRes);
@@ -119,26 +176,26 @@ const Dashboard: React.FC = () => {
 
       {/* Main Stats Row */}
       <div className="responsive-grid" style={{ marginBottom: '24px' }}>
-        <StatCard 
+        <LinkedStat 
           icon={<Monitor color="var(--accent-secondary)" />} 
           label="Connected Agents" 
           value={agents.length.toString()} 
           link="/agents"
         />
-        <StatCard 
+        <LinkedStat 
           icon={<ShieldAlert color="var(--accent-color)" />} 
           label="Critical Alerts" 
           value={criticalCount.toString()}
           warning={criticalCount > 0}
           link="/all-alerts"
         />
-        <StatCard 
+        <LinkedStat 
           icon={<Database color="var(--accent-warning)" />} 
           label="Assets Discovered" 
           value={((globalStats?.total_hardware || 0) + (globalStats?.total_software || 0)).toString()} 
           link="/assets"
         />
-        <StatCard 
+        <LinkedStat 
           icon={<ShieldAlert color="#f472b6" />} 
           label="FIM Violations" 
           value={(globalStats?.total_fim_events || 0).toString()} 
@@ -146,6 +203,46 @@ const Dashboard: React.FC = () => {
           link="/fim"
         />
       </div>
+
+      {/* Fleet health, as shapes rather than as numbers.
+          Four counts an operator scans rather than reads: which hosts need
+          attention, whether commands can actually reach them, what is
+          installed out there, and whether today is unusual. */}
+      <div className="responsive-grid" style={{ marginBottom: 'var(--space-5)' }}>
+        <Card title="Agents requiring attention">
+          <p style={chartNote}>
+            Not an ideal operational state. Each bar is a different problem
+            with a different fix.
+          </p>
+          <CategoryBars data={attentionBuckets} colorFor={(row) => ATTENTION_TONE[row.name]} />
+        </Card>
+
+        <Card title="Endpoint connection status">
+          <p style={chartNote}>
+            Whether a command would reach the host now. Telemetry travels on a
+            separate connection, so an agent can be reporting and still be
+            uncommandable.
+          </p>
+          <CategoryBars data={connectionBuckets} colorFor={(row) => CONNECTION_TONE[row.name]} />
+        </Card>
+
+        <Card title="Agent version coverage">
+          <p style={chartNote}>
+            What is actually installed across the fleet. Hosts that report no
+            version predate version reporting entirely.
+          </p>
+          <ShareDonut data={versionSpread} />
+        </Card>
+      </div>
+
+      <Card title="Threat trend" style={{ marginBottom: 'var(--space-5)' }}>
+        <p style={chartNote}>
+          Detections a day against how many <em>different</em> techniques were
+          behind them. A spike in the bars with a flat line is almost always
+          one noisy rule rather than an incident — which is why both are drawn.
+        </p>
+        <TrendChart data={trend} />
+      </Card>
 
       <div className="responsive-grid" style={{ alignItems: 'start' }}>
         {/* Recent Alerts Feed */}
@@ -412,26 +509,22 @@ const ResourceCard: React.FC<{ label: string, value: number, icon: React.ReactNo
   </div>
 );
 
-const StatCard: React.FC<{ 
-  icon: React.ReactNode, 
-  label: string, 
-  value: string, 
-  warning?: boolean,
-  link?: string
-}> = ({ icon, label, value, warning, link }) => {
-  const content = (
-    <div className="card" style={{ cursor: link ? 'pointer' : 'default', padding: '24px' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
-        <div style={{ width: '40px', height: '40px', borderRadius: '12px', backgroundColor: 'rgba(255,255,255,0.03)', display: 'flex', alignItems: 'center', justifyContent: 'center', border: '1px solid var(--border-color)' }}>
-          {icon}
-        </div>
-        <span style={{ color: 'var(--text-secondary)', fontSize: '0.9rem', fontWeight: 600, letterSpacing: '0.01em' }}>{label}</span>
-      </div>
-      <div className="mono" style={{ fontSize: '2.25rem', fontWeight: 800, color: warning ? 'var(--accent-color)' : 'var(--text-primary)', letterSpacing: '-0.025em' }}>{value}</div>
-    </div>
+/** A dashboard tile that navigates. The shared `StatCard` deliberately knows
+ *  nothing about routing - a primitive that takes a `link` is a primitive that
+ *  will be asked to take an `onClick`, then a `target`, and stop being one. */
+const LinkedStat = ({ icon, label, value, warning, link }: {
+  icon: React.ReactNode; label: string; value: string;
+  warning?: boolean; link?: string;
+}) => {
+  const tile = (
+    <StatCard
+      icon={icon}
+      label={label}
+      value={value}
+      color={warning ? 'var(--accent-color)' : undefined}
+    />
   );
-
-  return link ? <Link to={link}>{content}</Link> : content;
+  return link ? <Link to={link} style={{ display: 'block' }}>{tile}</Link> : tile;
 };
 
 export default Dashboard;

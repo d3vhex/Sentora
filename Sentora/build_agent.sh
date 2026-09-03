@@ -205,6 +205,7 @@ step "Running PyInstaller..."
     --hidden-import modules.console \
     --hidden-import modules.link \
     --hidden-import modules.version \
+    --hidden-import modules.telemetry_health \
     --hidden-import websocket \
     --hidden-import modules.db \
     --exclude-module torch \
