@@ -10,10 +10,16 @@ indistinguishable from a host that genuinely has nothing to report.
 
 The last one is why none of it was visible from here. `sendall` returning
 means the bytes reached the operating system's socket buffer. It says nothing
-about whether the server stored them, and the ingest protocol has no reply -
-so the agent cannot know, and has always reported success.
+about whether the server stored them.
 
-This module does not fix that. It makes the two halves *comparable*: the agent
+The protocol now carries a reply frame, so a batch can be acknowledged and
+`record_send` can report what was actually stored - but only against a server
+new enough to send one. `acknowledged: False` in the report below means the
+server said nothing, which is not the same claim as "nothing arrived", and
+the console has to be able to tell those apart.
+
+That still leaves the comparison worth making. This module makes the two
+halves *comparable*: the agent
 says what it holds and what it has shipped, the server says what it holds, and
 the difference names the broken link. `[+] network_connections sent (50 rows)`
 against a server table with zero rows is not ambiguous once somebody puts the
@@ -37,12 +43,32 @@ _send_state: dict[str, dict] = {}
 _lock = threading.Lock()
 
 
-def record_send(table: str, rows: int) -> None:
+def record_send(table: str, rows: int, receipt: dict | None = None) -> None:
+    """A batch left this agent, and what the server said about it.
+
+    `receipt` is the thing the module docstring above says does not exist. It
+    does now: the ingest protocol carries a reply frame, so a send can report
+    what was *stored* rather than only what was written to a socket. It stays
+    optional because an agent can be pointed at a server older than the frame,
+    and `None` means exactly that - not "nothing was stored", which is a
+    different and much worse claim.
+    """
     with _lock:
         state = _send_state.setdefault(table, {})
         state["last_sent_at"] = time.time()
         state["last_sent_rows"] = int(rows)
         state["last_error"] = None
+        if receipt is None:
+            state["acknowledged"] = False
+            state.pop("last_stored_rows", None)
+        else:
+            state["acknowledged"] = True
+            state["last_stored_rows"] = int(receipt.get("stored") or 0)
+            state["last_duplicate_rows"] = int(receipt.get("duplicates") or 0)
+            # Rows the server judged unstorable. Not retried - a row it could
+            # not store will not become storable - so this count is the only
+            # trace they leave on this side.
+            state["last_rejected_rows"] = int(receipt.get("rejected") or 0)
 
 
 def record_send_failure(table: str, error: Exception | str) -> None:
@@ -94,11 +120,20 @@ def report(tables) -> dict:
         out[table] = {
             "held": held,
             "unsent": unsent,
-            # Rows this agent believes it has shipped. Belief, not fact:
-            # nothing acknowledges an ingest batch.
+            # Rows this agent believes it has shipped.
             "shipped": max(held - unsent, 0),
             "last_sent_at": sent.get("last_sent_at"),
             "last_sent_rows": sent.get("last_sent_rows"),
+            # Whether the server confirmed the last batch, and how much of it
+            # it kept. `acknowledged: False` means the server said nothing -
+            # either it predates the reply frame, or it hung up - and the
+            # number beside it is belief rather than fact. Reported as its own
+            # field so the console can say which, instead of showing a count
+            # whose reliability is invisible.
+            "acknowledged": sent.get("acknowledged", False),
+            "last_stored_rows": sent.get("last_stored_rows"),
+            "last_duplicate_rows": sent.get("last_duplicate_rows"),
+            "last_rejected_rows": sent.get("last_rejected_rows"),
             "last_error": sent.get("last_error"),
             "last_error_at": sent.get("last_error_at"),
         }

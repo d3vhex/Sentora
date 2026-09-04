@@ -1,4 +1,18 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { Card } from '../components/ui';
+import { CategoryBars } from '../components/ui/charts';
+
+const chartNote: React.CSSProperties = {
+  margin: '0 0 var(--space-3)', color: 'var(--text-muted)',
+  fontSize: 'var(--text-xs)', maxWidth: '58ch',
+};
+
+/** Reachability is a state, so it takes the semantic colours rather than the
+ *  chart palette. */
+const REACH_TONE: Record<string, string> = {
+  Commandable: 'var(--accent-success)',
+  'No channel': 'var(--sev-critical)',
+};
 import {
   Monitor,
   Search,
@@ -75,7 +89,29 @@ const Agents: React.FC = () => {
     }
   };
 
-  const filteredAgents = agents.filter(agent => 
+  /* Both derived from the list already loaded. A chart with its own request
+     is a chart that can disagree with the table under it. */
+  const osSpread = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const a of agents) {
+      // "Windows-11-10.0.26200-SP0" -> "Windows 11". The build number is what
+      // the row is for; the chart is about which platforms exist.
+      const raw = String(a.os_info || 'Unknown');
+      const family = raw.split('-').slice(0, 2).join(' ').trim() || 'Unknown';
+      counts.set(family, (counts.get(family) ?? 0) + 1);
+    }
+    return [...counts.entries()]
+      .map(([name, value]) => ({ name, value }))
+      .sort((a, b) => b.value - a.value)
+      .slice(0, 6);
+  }, [agents]);
+
+  const reachability = useMemo(() => ([
+    { name: 'Commandable', value: agents.filter(a => a.channel_connected).length },
+    { name: 'No channel', value: agents.filter(a => !a.channel_connected).length },
+  ]), [agents]);
+
+  const filteredAgents = agents.filter(agent =>
     agent.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
     (agent.display_name || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
     (agent.public_ip || '').includes(searchTerm) ||
@@ -99,6 +135,28 @@ const Agents: React.FC = () => {
             <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
           </button>
         </div>
+      </div>
+
+      {/* The shape of the estate, before the list of it. Deliberately not the
+          dashboard's cards again: that one answers "what needs attention",
+          this one answers "what am I actually running" — which is the
+          question you have when you open the agent list. */}
+      <div className="responsive-grid" style={{ marginBottom: 'var(--space-5)' }}>
+        <Card title="Operating systems">
+          <p style={chartNote}>
+            What the fleet is made of. A single host on an old build is a
+            different problem from half the estate on one.
+          </p>
+          <CategoryBars data={osSpread} />
+        </Card>
+        <Card title="Reachability">
+          <p style={chartNote}>
+            Whether a command would reach the host now. Telemetry travels on a
+            separate connection, so an agent can be reporting and still be
+            uncommandable.
+          </p>
+          <CategoryBars data={reachability} colorFor={(row) => REACH_TONE[row.name]} />
+        </Card>
       </div>
 
       <div className="card" style={{ padding: 0, overflow: 'hidden' }}>

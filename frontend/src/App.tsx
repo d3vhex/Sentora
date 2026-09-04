@@ -22,7 +22,7 @@ import Deployment from './pages/Deployment';
 import SoarHub from './pages/SoarHub';
 import Assets from './pages/Assets';
 import FileIntegrity from './pages/FileIntegrity';
-import LogSearch from './pages/LogSearch';
+import Search from './pages/Search';
 import { authService } from './services/api';
 
 const ProtectedRoute: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -167,11 +167,15 @@ const App: React.FC = () => {
           </ProtectedRoute>
         } />
 
-        <Route path="/log-search" element={
+        <Route path="/search" element={
           <ProtectedRoute>
-            <LogSearch />
+            <Search />
           </ProtectedRoute>
         } />
+
+        {/* The old path, so a bookmark still lands somewhere rather than on
+            the catch-all redirect to the dashboard. */}
+        <Route path="/log-search" element={<Navigate to="/search" replace />} />
         
         <Route path="*" element={<Navigate to="/" />} />
       </Routes>

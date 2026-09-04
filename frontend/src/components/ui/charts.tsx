@@ -133,11 +133,55 @@ export function TrendChart({
   );
 }
 
+/** Several measures over time, on one axis because they share a unit.
+ *
+ * The reason a host page needs this rather than three numbers: a single
+ * sample of "CPU 91%" and a host that has been pinned at 91% for an hour look
+ * identical as a number and are completely different problems. Only the shape
+ * separates a spike from a plateau.
+ *
+ * `domain` defaults to 0-100 because the callers so far are percentages, and
+ * a percentage axis that rescales itself to the data makes 4% and 40% draw
+ * the same picture.
+ */
+export function SeriesLines({
+  data, series, height, domain, unit,
+}: {
+  data: Record<string, any>[];
+  series: { key: string; name: string }[];
+  height?: number;
+  domain?: [number, number];
+  unit?: string;
+}) {
+  const empty = !data.some((row) => series.some((s) => Number(row[s.key]) > 0));
+  return (
+    <Frame height={height ?? 240} empty={empty}>
+      <ComposedChart data={data} margin={{ top: 4, right: 8, bottom: 4, left: -18 }}>
+        <CartesianGrid stroke="var(--chart-grid)" vertical={false} />
+        <XAxis dataKey="label" {...axis} minTickGap={24} />
+        <YAxis {...axis} domain={domain ?? [0, 100]} unit={unit ?? '%'} />
+        <Tooltip {...tooltipStyle} />
+        <Legend wrapperStyle={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }} />
+        {series.map((s, i) => (
+          <Line key={s.key} dataKey={s.key} name={s.name}
+                stroke={SERIES[i % SERIES.length]} strokeWidth={2}
+                dot={false} isAnimationActive={false} />
+        ))}
+      </ComposedChart>
+    </Frame>
+  );
+}
+
 /** A share of a whole. Used sparingly: a donut answers "what proportion",
  *  and almost every other question on this console is better as bars. */
 export function ShareDonut({
-  data, height,
-}: { data: { name: string; value: number }[]; height?: number }) {
+  data, height, colorFor,
+}: {
+  data: { name: string; value: number }[];
+  height?: number;
+  /** Per-slice colour, for the donuts where the slice *is* an outcome. */
+  colorFor?: (row: { name: string; value: number }, index: number) => string;
+}) {
   return (
     <Frame height={height ?? 220} empty={!data.some((d) => d.value > 0)}>
       <PieChart>
@@ -145,7 +189,8 @@ export function ShareDonut({
              innerRadius="55%" outerRadius="80%" paddingAngle={2}
              stroke={token('--bg-color', '#000')}>
           {data.map((row, i) => (
-            <Cell key={row.name} fill={SERIES[i % SERIES.length]} />
+            <Cell key={row.name}
+                  fill={colorFor ? colorFor(row, i) : SERIES[i % SERIES.length]} />
           ))}
         </Pie>
         <Tooltip {...tooltipStyle} />

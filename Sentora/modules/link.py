@@ -82,6 +82,23 @@ def decode_stream_frame(raw: bytes):
 # dying quietly while both ends believe it is up.
 PING_INTERVAL_S = 30.0
 
+# How long any single socket operation may block. Separate from the ping
+# cadence, which it used to be the same number as: `create_connection` was
+# handed PING_INTERVAL_S, so "ping every thirty seconds" quietly also meant
+# "one send may block for thirty seconds" - six times the deadline of the
+# control requests queued behind it. A config read then timed out at 5s
+# against an agent that was connected and healthy, and neither side logged
+# anything, because a reply that is never sent logs nothing.
+SOCKET_TIMEOUT_S = 10.0
+
+# How long a *stream* payload will wait for the send lock before giving up.
+#
+# The asymmetry this whole arrangement rests on: a screen frame is stale the
+# moment it is delayed and the next one supersedes it, while nothing
+# supersedes the answer somebody is waiting for. So stream payloads yield and
+# control frames do not.
+STREAM_SEND_WAIT_S = 0.25
+
 RECONNECT_MIN_S = 2.0
 RECONNECT_MAX_S = 60.0
 
@@ -112,6 +129,15 @@ class AgentLinkClient:
         self._send_lock = threading.Lock()
         self._streams: dict[int, object] = {}
         self._streams_lock = threading.Lock()
+        #: Stream payloads that yielded to a control frame. Counted rather
+        #: than logged per frame, and reported once a stream ends - a number
+        #: here is a slow link, not a fault.
+        self._dropped_frames = 0
+        #: How many control frames are waiting for the wire. A stream payload
+        #: does not even queue while this is non-zero, which is what stops a
+        #: continuous capture from pushing a reply past the server's deadline.
+        self._control_waiting = 0
+        self._control_lock = threading.Lock()
         self.connected = False
         self.last_error = ""
 
@@ -183,7 +209,7 @@ class AgentLinkClient:
             url,
             header=[f"X-Agent-Key: {self.agent_key}",
                     f"X-Agent-Version: {AGENT_VERSION}"],
-            timeout=PING_INTERVAL_S)
+            timeout=SOCKET_TIMEOUT_S)
         self._ws = ws
         self.connected = True
         self.last_error = ""
@@ -227,18 +253,55 @@ class AgentLinkClient:
                 # descriptor the agent keeps for the rest of its life.
                 print(f"[link] socket would not close: {e}", flush=True)
 
-    def _send(self, frame) -> None:
+    def _send(self, frame, *, droppable: bool = False) -> None:
+        """Put one frame on the wire.
+
+        Serialised, because two frames interleaved on one socket is a protocol
+        error rather than a slow response. That single lock is also what made
+        a screen stream able to starve a config reply: the pump holds it for
+        every frame it sends, it never stops sending, and a request waiting
+        behind it has five seconds before the server gives up on the agent.
+
+        `droppable` is how the two are told apart. A stream payload that
+        cannot get onto the wire promptly is already stale - the next capture
+        supersedes it - so it yields. A reply does not: dropping one would
+        produce the same timeout by a quieter route.
+        """
         ws = self._ws
         if ws is None:
             return
-        # Serialised: replies and stream payloads are produced on worker
-        # threads, and two frames interleaved on one socket is a protocol
-        # error rather than a slow response.
-        with self._send_lock:
+
+        if droppable:
+            # Yield to anything already queued. Without this a screen pump
+            # and a reply race for the same lock on equal terms, and Python
+            # locks are not fair - a pump producing a frame every 200ms will
+            # win often enough to push a reply past the five seconds the
+            # server waits.
+            if self._control_waiting:
+                self._dropped_frames += 1
+                return
+            if not self._send_lock.acquire(timeout=STREAM_SEND_WAIT_S):
+                # Not worth logging per frame: on a slow link this is the
+                # normal, healthy outcome, and a line for each one would be
+                # the noisiest thing in agent.log.
+                self._dropped_frames += 1
+                return
+        else:
+            with self._control_lock:
+                self._control_waiting += 1
+            try:
+                self._send_lock.acquire()
+            finally:
+                with self._control_lock:
+                    self._control_waiting -= 1
+
+        try:
             if isinstance(frame, (bytes, bytearray)):
                 ws.send_binary(bytes(frame))
             else:
                 ws.send(json.dumps(frame))
+        finally:
+            self._send_lock.release()
 
     def _handle(self, raw) -> None:
         # Binary means stream payload; the socket keeps the two apart so
@@ -324,18 +387,45 @@ class AgentLinkClient:
         self._send({"t": "stream_opened", "ch": channel})
 
         why = "the stream ended"
+        dropped_at_start = self._dropped_frames
         try:
             while not self._stop.is_set():
+                # Whether this pump still owns the channel it was opened on.
+                #
+                # Without it a pump outlives its stream. A screen capture has
+                # no natural end, so when the viewer went away and the server
+                # forgot the channel, this loop carried on capturing and
+                # sending for the life of the connection - competing for the
+                # send lock with every config read and restart, on behalf of
+                # nobody. The server's side of it printed "data for a stream
+                # that is gone" once per frame and changed nothing.
+                with self._streams_lock:
+                    still_ours = self._streams.get(channel) is stream
+                if not still_ours:
+                    why = "the stream was closed"
+                    return
+
                 chunk = stream.read(0.2)
                 if chunk is None:
                     why = getattr(stream, "exit_reason", "") or why
                     break
                 if chunk:
-                    self._send(encode_stream_frame(channel, chunk))
+                    # Droppable: a screen frame that cannot get onto the wire
+                    # promptly is stale, and the next one supersedes it.
+                    self._send(encode_stream_frame(channel, chunk),
+                               droppable=True)
         except Exception as e:
             why = f"the stream failed: {e}"
             print(f"[link] {kind} stream failed: {e}", flush=True)
         finally:
+            dropped = self._dropped_frames - dropped_at_start
+            if dropped:
+                # One line per stream, not per frame. A count here means the
+                # link could not keep up with the capture rate, which is a
+                # slow network rather than a fault - but it is the number to
+                # look at when a screen view is choppy.
+                print(f"[link] {kind} stream: {dropped} frame(s) yielded to "
+                      f"control traffic", flush=True)
             self._close_stream(channel, why, tell_server=True)
 
     def _close_stream(self, channel, why: str = "", *, tell_server: bool = False) -> None:

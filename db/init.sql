@@ -393,3 +393,71 @@ CREATE TABLE IF NOT EXISTS network_connections (
     KEY idx_nc_port (local_port),
     KEY idx_nc_dup (dup_fp)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ================== registry_logs ==================
+--
+-- These three tables were missing from this file while `ALLOWED_TABLES` and
+-- `DEDUP_TABLES` in server.py both named them and the agent collected them.
+-- The result was a batch rejected with 1146 on every cycle, on the one side
+-- where nobody was looking: the agent's log said `registry_logs sent (3
+-- rows)`, the console showed an empty table, and the only place the two
+-- numbers appeared together was the telemetry health view that eventually
+-- surfaced it -- 7,788 rows held on the endpoint against a table that did not
+-- exist.
+--
+-- `hive`, `key_path`, `value_name` and `value_data` are encrypted by the
+-- agent (see core/telemetry_crypto.ENCRYPTED_FIELDS), so every one of them
+-- has to be wide enough for Fernet ciphertext rather than for the value a
+-- human would read. A VARCHAR sized for the plaintext fails with 1406 the
+-- first time a real row arrives, which is how `network_connections` lost a
+-- day of data.
+CREATE TABLE IF NOT EXISTS registry_logs (
+    id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    hive         VARCHAR(512),
+    key_path     TEXT,
+    value_name   VARCHAR(512),
+    value_data   TEXT,
+    status       VARCHAR(32),
+    `timestamp`  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    sent         TINYINT(1) DEFAULT 0,
+    dup_fp       CHAR(64) NULL,
+    KEY idx_reg_status (status),
+    KEY idx_reg_dup (dup_fp)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ================== process_events ==================
+--
+-- `name`, `cmdline` and `username` are encrypted. `cmdline` is TEXT because a
+-- command line is unbounded before encryption and more so after it.
+CREATE TABLE IF NOT EXISTS process_events (
+    id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    pid          INT,
+    ppid         INT,
+    name         VARCHAR(512),
+    cmdline      TEXT,
+    username     VARCHAR(512),
+    status       VARCHAR(32),
+    `timestamp`  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    sent         TINYINT(1) DEFAULT 0,
+    dup_fp       CHAR(64) NULL,
+    KEY idx_proc_pid (pid),
+    KEY idx_proc_status (status),
+    KEY idx_proc_dup (dup_fp)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ================== security_audit ==================
+--
+-- `finding` and `details` are encrypted; `severity` and `category` are not,
+-- so the console can filter on them without a key.
+CREATE TABLE IF NOT EXISTS security_audit (
+    id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    category     VARCHAR(64),
+    finding      TEXT,
+    severity     VARCHAR(32),
+    details      TEXT,
+    `timestamp`  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    sent         TINYINT(1) DEFAULT 0,
+    dup_fp       CHAR(64) NULL,
+    KEY idx_audit_sev (severity),
+    KEY idx_audit_dup (dup_fp)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

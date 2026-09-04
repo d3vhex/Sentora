@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { useParams, Link } from 'react-router-dom';
 import { 
@@ -33,6 +33,30 @@ import AgentConsole from '../components/AgentConsole';
 import Fuse from 'fuse.js';
 import { isUnanswered, countUnanswered } from '../lib/insightTriage';
 import { summariseEventMessage } from '../lib/windowsEvent';
+import { Card } from '../components/ui';
+import { CategoryBars } from '../components/ui/charts';
+
+const chartNote: React.CSSProperties = {
+  margin: '0 0 var(--space-3)', color: 'var(--text-muted)',
+  fontSize: 'var(--text-xs)', maxWidth: '58ch',
+};
+
+const SEVERITY_TONE: Record<string, string> = {
+  CRITICAL: 'var(--sev-critical)',
+  HIGH: 'var(--sev-high)',
+  MEDIUM: 'var(--sev-medium)',
+  LOW: 'var(--sev-low)',
+  INFO: 'var(--sev-info)',
+};
+const SEVERITY_ORDER = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'];
+
+/** Disk is the one host metric where the number alone is a decision: under
+ *  80% nobody cares, over 90% something is about to stop working. */
+const diskTone = (pct: number) =>
+  pct >= 90 ? 'var(--sev-critical)'
+  : pct >= 80 ? 'var(--sev-high)'
+  : pct >= 60 ? 'var(--sev-medium)'
+  : 'var(--chart-1)';
 
 // log_extractor often stuffs the enriched event into the `message` column as a
 // JSON string. Surface the inner fields so the table shows real columns instead
@@ -757,6 +781,34 @@ const OverviewTab: React.FC<{ data: any }> = ({ data }) => {
   const latestResources = data.resources[0] || {};
   const latestDisk = data.disks[0] || {};
 
+  /* `resource_usage` is a snapshot table - the server keeps one row per agent
+     - so there is no CPU history to plot here, and a line drawn through a
+     single sample would be a chart pretending to be a trend. What this host
+     does have more than one of is alerts and open ports, so those are what
+     get drawn. */
+  const alertsBySeverity = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const a of data.alerts || []) {
+      const sev = String(parseSiemRow(a).severity || 'INFO').toUpperCase();
+      counts.set(sev, (counts.get(sev) ?? 0) + 1);
+    }
+    return SEVERITY_ORDER
+      .filter((name) => counts.has(name))
+      .map((name) => ({ name, value: counts.get(name) as number }));
+  }, [data.alerts]);
+
+  const portsByService = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const r of data.portscans || []) {
+      const key = String(r.service || 'unknown');
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return [...counts.entries()]
+      .map(([name, value]) => ({ name, value }))
+      .sort((a, b) => b.value - a.value)
+      .slice(0, 6);
+  }, [data.portscans]);
+
   return (
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(350px, 1fr))', gap: '32px' }}>
       <div style={{ display: 'flex', flexDirection: 'column', gap: '32px' }}>
@@ -800,6 +852,23 @@ const OverviewTab: React.FC<{ data: any }> = ({ data }) => {
             <DetailItem label="MAC Identifier" value={data.info[0]?.mac_address || '-'} />
           </div>
         </div>
+
+        <Card title="Alerts by severity">
+          <p style={chartNote}>
+            Three criticals and three hundred lows are the same "300 alerts"
+            in a counter and completely different afternoons.
+          </p>
+          <CategoryBars data={alertsBySeverity} height={180}
+                        colorFor={(row) => SEVERITY_TONE[row.name] ?? 'var(--chart-1)'} />
+        </Card>
+
+        <Card title="Listening services">
+          <p style={chartNote}>
+            What this host exposes, grouped by service. Anything here that the
+            machine has no reason to run is attack surface nobody chose.
+          </p>
+          <CategoryBars data={portsByService} height={180} />
+        </Card>
 
         <div className="card">
           <h3 style={{ fontSize: '1.125rem', marginBottom: '20px' }}>Threat Summary</h3>
@@ -867,6 +936,36 @@ const VulnsTab: React.FC<{ agentName: string, data: any[], onRefresh: () => void
 
   const rows = data.map((r: any) => [r.package_name, r.package_version, r.vulnerability_id, r.summary]);
 
+  /* OSV gives us an advisory id and a summary, not a CVSS score - so there is
+     no severity to chart here, and inventing one from the summary text would
+     be worse than not having it. What the rows do support is *where* the
+     findings land: which package carries them, and which advisory database
+     produced them. */
+  const byPackage = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const r of data) {
+      const key = String(r.package_name || 'unknown');
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return [...counts.entries()]
+      .map(([name, value]) => ({ name, value }))
+      .sort((a, b) => b.value - a.value)
+      .slice(0, 6);
+  }, [data]);
+
+  const bySource = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const r of data) {
+      const id = String(r.vulnerability_id || '');
+      const prefix = id.split('-')[0].toUpperCase() || 'UNKNOWN';
+      counts.set(prefix, (counts.get(prefix) ?? 0) + 1);
+    }
+    return [...counts.entries()]
+      .map(([name, value]) => ({ name, value }))
+      .sort((a, b) => b.value - a.value)
+      .slice(0, 6);
+  }, [data]);
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
       <div className="card" style={{ padding: '16px 20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '16px', flexWrap: 'wrap' }}>
@@ -905,6 +1004,24 @@ const VulnsTab: React.FC<{ agentName: string, data: any[], onRefresh: () => void
           {scanning ? 'Scanning…' : 'Scan Now'}
         </button>
       </div>
+      <div className="responsive-grid">
+        <Card title="Most affected packages">
+          <p style={chartNote}>
+            A list of two hundred advisories is usually a handful of packages.
+            Upgrading the top bar tends to clear most of the table.
+          </p>
+          <CategoryBars data={byPackage} />
+        </Card>
+        <Card title="Advisory source">
+          <p style={chartNote}>
+            Which database matched. All of one prefix means OSV only resolved
+            one ecosystem - the rest of the installed software went unchecked
+            rather than came back clean.
+          </p>
+          <CategoryBars data={bySource} />
+        </Card>
+      </div>
+
       <TableTab
         title={`Vulnerabilities Report (${rows.length})`}
         columns={['Package', 'Version', 'CVE ID', 'Summary']}
@@ -2044,6 +2161,25 @@ const SystemTab: React.FC<{ data: any }> = ({ data }) => (
         <ResourceMeter label="Memory Usage" value={data.resources[0]?.mem_percent || 0} />
       </div>
     </div>
+    <Card title="Disk pressure">
+      <p style={chartNote}>
+        Every mount on one axis. Six separate meters make you compare six
+        numbers by eye; one chart puts the mount that is about to fill up at
+        the top of the picture.
+      </p>
+      <CategoryBars
+        data={(data.disks || [])
+          .map((d: any) => ({
+            name: String(d.mountpoint || d.device || '?'),
+            value: Number(d.percent) || 0,
+          }))
+          .sort((a: any, b: any) => b.value - a.value)
+          .slice(0, 8)}
+        height={200}
+        colorFor={(row) => diskTone(row.value)}
+      />
+    </Card>
+
     <div className="card">
       <h3 style={{ fontSize: '1.125rem', marginBottom: '24px' }}>Disk Inventory</h3>
       <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>

@@ -1,4 +1,5 @@
 import socket
+import ssl
 import struct
 import time
 import asyncio
@@ -320,6 +321,23 @@ class FernetKeyRefresher(threading.Thread):
 AGENT_NAME = None
 SERVER_IP = None
 SERVER_PORT = 5001
+
+#: Telemetry transport. Derived at startup from the enrolment config's
+#: `server_url` scheme - see `_resolve_ingest_transport`. An https console
+#: means an https-grade ingest channel, because the two carry the same data
+#: and there is nothing to be gained from encrypting the smaller half.
+INGEST_TLS = False
+INGEST_TLS_PORT = 5011
+#: PEM bundle for a self-signed server. Verification is not optional: an
+#: unverified TLS connection is encrypted to whoever answered, which against
+#: an attacker on the path is what not encrypting it would have achieved.
+INGEST_CA = None
+#: The name in the server's certificate. Separate from SERVER_IP because the
+#: certificate is issued for a hostname and the connection is usually made to
+#: an address, and TLS checks the name.
+SERVER_HOSTNAME = None
+#: An unbounded blocking read is how a collector thread disappears for good.
+INGEST_TIMEOUT_S = 30
 AUTOMATIONS_API_URL = None
 AUTOMATIONS_MODE = "auto"
 AGENT_SHARED_SECRET = None
@@ -508,6 +526,72 @@ def send_alert(source, severity, message, metadata=None):
         print(f"[Alert] Failed to send alert: {e}")
 
 
+def _ingest_socket():
+    """A connected socket to the ingest listener, TLS when the server is https.
+
+    Derived from the enrolment config's `server_url` rather than configured
+    separately - the same reasoning `modules/link.channel_url` gives for the
+    control channel. A second setting is a second thing to get wrong, and it
+    would be wrong in exactly the deployments where the first one was right.
+
+    The certificate is verified. A self-signed server needs its CA here
+    (`server_ca` in config.json, or SENTORA_CA_CERT); without it the
+    connection fails, and it should - an unverified TLS connection encrypts
+    the traffic to whoever answered, which against an attacker on the path is
+    the same as not encrypting it.
+    """
+    raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    raw.settimeout(INGEST_TIMEOUT_S)
+    try:
+        raw.connect((SERVER_IP, SERVER_PORT))
+        if not INGEST_TLS:
+            return raw
+        context = ssl.create_default_context(cafile=INGEST_CA or None)
+        return context.wrap_socket(raw, server_hostname=SERVER_HOSTNAME or SERVER_IP)
+    except Exception:
+        raw.close()
+        raise
+
+
+def _read_receipt(sock):
+    """The server's reply, or None if it did not send one.
+
+    None is a real answer and not a failure: a server built before the reply
+    frame stores the batch and closes, which arrives here as a clean EOF. It
+    must not be reported as data loss, and it must not be reported as success
+    either - `record_send` keeps the difference.
+    """
+    try:
+        header = _recv_exactly(sock, 4)
+        if header is None:
+            return None
+        (length,) = struct.unpack('!I', header)
+        # A sane bound. Nothing legitimate sends a megabyte of receipt, and
+        # allocating on a length an attacker chose is how a reply frame turns
+        # into a denial of service against the agent.
+        if length == 0 or length > 64 * 1024:
+            return None
+        body = _recv_exactly(sock, length)
+        if body is None:
+            return None
+        return json.loads(body.decode('utf-8'))
+    except Exception:
+        # A malformed or truncated reply is treated as no reply. The batch is
+        # already stored or already lost by this point; guessing which from a
+        # broken frame would be worse than saying "unacknowledged".
+        return None
+
+
+def _recv_exactly(sock, n: int):
+    buf = b''
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
 def send_table(table: str):
     rows = fetch_unsent(table, limit=50)
     if not rows:
@@ -518,8 +602,7 @@ def send_table(table: str):
     fsize = len(data_bytes)
 
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect((SERVER_IP, SERVER_PORT))
+        with _ingest_socket() as s:
 
             agent_bytes = AGENT_NAME.encode('utf-8')
             s.sendall(struct.pack('!I', len(agent_bytes)))
@@ -540,22 +623,45 @@ def send_table(table: str):
             s.sendall(struct.pack('!Q', fsize))
             s.sendall(data_bytes)
 
-        # Marked sent because `sendall` returned, which means the bytes
-        # reached the socket buffer. The ingest protocol has no reply, so
-        # this is the strongest thing the agent can know - and it is weaker
-        # than it reads. A server that accepts a batch and stores none of it
-        # looks identical from here, which is exactly how four tables came to
-        # be permanently empty while this line said "sent (50 rows)" every
-        # cycle. `modules/telemetry_health` exists so the server can put its
-        # own row count beside this number.
+            # Read before the socket closes. This used to mark rows sent the
+            # moment `sendall` returned, which only ever meant the bytes
+            # reached the operating system's socket buffer - a server that
+            # accepted a batch and stored none of it looked identical from
+            # here. That is how four tables stayed permanently empty for days
+            # while this function logged "sent (50 rows)" every cycle.
+            receipt = _read_receipt(s)
+
+        if receipt is not None and receipt.get("error"):
+            # The server took the bytes and could not store them. Leaving the
+            # rows unsent is the entire point of the reply frame: they are
+            # retried, and the reason is on the endpoint where somebody
+            # asking "why is this table empty" will find it.
+            telemetry_health.record_send_failure(
+                table, f"server refused the batch: {receipt['error']}")
+            if debug:
+                print(f"[!] {table}: server stored nothing "
+                      f"({receipt['error']}); rows kept for retry")
+            return
+
         mark_sent(table, [r['id'] for r in rows])
-        telemetry_health.record_send(table, len(rows))
+        telemetry_health.record_send(table, len(rows), receipt=receipt)
         if debug:
             # The IP/OS/HOST/MAC banner used to be repeated here. It is
             # constant for the life of the process and was the single largest
             # thing in agent.log: 4376 copies of the same 120-character string
             # in thirteen hours. It is logged once at startup instead.
-            print(f"[+] {table} sent ({len(rows)} rows)")
+            if receipt is None:
+                # An older server. Said as much rather than printed as a
+                # success, because "sent" here means the same weak thing it
+                # always did.
+                print(f"[+] {table} sent ({len(rows)} rows, unacknowledged - "
+                      f"server did not reply)")
+            else:
+                rejected = receipt.get("rejected", 0)
+                note = (f", {rejected} REJECTED" if rejected else "")
+                print(f"[+] {table} sent ({len(rows)} rows, "
+                      f"{receipt.get('stored', 0)} stored, "
+                      f"{receipt.get('duplicates', 0)} already held{note})")
 
     except Exception as e:
         telemetry_health.record_send_failure(table, e)
@@ -601,6 +707,23 @@ def periodic_wrapped(func, interval: int, name: str):
             if failures:
                 print(f"[+] {name} recovered after {failures} failure(s)", flush=True)
             failures = 0
+        except SystemExit as e:
+            # A library calling `sys.exit` must not end the collector.
+            #
+            # SystemExit inherits from BaseException, so `except Exception`
+            # does not see it - and in a thread Python discards it silently.
+            # `portscanner` and `info_collector` both did this on their error
+            # paths, so each died on its first failure and never ran again:
+            # `portscan_result sent` appeared zero times in the log of a host
+            # that had been up for days, and the Ports tab was empty with
+            # nothing anywhere saying why.
+            #
+            # Both are fixed to raise instead. This stays because the next
+            # module to do it should be a reported failure, not a thread that
+            # quietly stops existing.
+            failures += 1
+            print(f"[!] {name} called sys.exit({e.code}) - treating it as a "
+                  f"failure rather than ending the collector", flush=True)
         except Exception as e:
             failures += 1
             if failures == 1 or failures % _FAILURE_REPEAT_EVERY == 0:
@@ -1695,9 +1818,53 @@ def _parse_args():
                              'Generated by the server installer; required for the agent to run.')
     parser.add_argument('--api', '-p', type=str, default=None,
                         help='Automations API base (Default: http://<server>:8000)')
-    parser.add_argument('--ingest-port', type=int, default=5001,
-                        help='Ingest TCP port (Default: 5001)')
+    parser.add_argument('--ingest-port', type=int, default=None,
+                        help='Ingest TCP port. Default follows the server URL '
+                             'scheme: 5011 for https, 5001 for http.')
+    parser.add_argument('--ca', type=str, default=None,
+                        help='PEM bundle used to verify the server certificate. '
+                             'Needed when the server uses the self-signed CA '
+                             'from certs/generate_certs.py.')
     return parser.parse_args()
+
+
+def _resolve_ingest_transport(cfg: dict, args) -> tuple[bool, int, str | None, str | None]:
+    """Whether telemetry goes over TLS, and to which port.
+
+    Derived from `server_url`, the same rule `modules/link.channel_url` uses
+    for the control channel: an `https://` console means an encrypted ingest
+    channel. Deriving beats configuring here because the two settings would
+    have to agree, nothing would make them, and the deployment where they
+    disagreed would be the one that thought it was encrypted.
+
+    An explicit `--ingest-port` still wins. Somebody port-forwarding through a
+    bastion has a real reason to override this, and the derivation is a
+    default rather than a rule.
+    """
+    server_url = str(cfg.get("server_url") or "")
+    tls = server_url.lower().startswith("https://")
+
+    if args.ingest_port is not None:
+        port = int(args.ingest_port)
+    elif cfg.get("ingest_port"):
+        port = int(cfg["ingest_port"])
+    else:
+        port = INGEST_TLS_PORT if tls else 5001
+
+    ca = (args.ca or cfg.get("server_ca") or os.getenv("SENTORA_CA_CERT") or "").strip()
+    if ca and not os.path.exists(ca):
+        print(f"[!] server_ca points at {ca!r}, which does not exist. TLS "
+              f"verification will use the system trust store and will fail "
+              f"against a self-signed server.", flush=True)
+        ca = ""
+
+    # The name the certificate is issued for. Taken from the URL rather than
+    # from SERVER_IP: `certs/generate_certs.py` puts a hostname in the SAN,
+    # and verifying an address against it fails with a message that reads
+    # like a certificate problem when it is an addressing one.
+    host = server_url.split("://", 1)[-1].split("/", 1)[0].split(":")[0] or None
+
+    return tls, port, (ca or None), host
 
 
 def _load_identity_from_config(path: str) -> dict:
@@ -1985,6 +2152,7 @@ def dispatch_channel_request(method: str, path: str, body) -> tuple[dict, int]:
 
 def main():
     global AGENT_NAME, SERVER_IP, SERVER_PORT, AGENT_SHARED_SECRET, AUTOMATIONS_API_URL, AUTOMATIONS_MODE
+    global INGEST_TLS, INGEST_CA, SERVER_HOSTNAME
 
     if hasattr(signal, 'SIGTERM'):
         try:
@@ -2031,8 +2199,10 @@ def main():
 
     AGENT_NAME = args.agent or cfg.get("agent_name")
     SERVER_IP = args.server or cfg.get("server_ip") or (cfg.get("server_url", "").replace("http://", "").replace("https://", "").split(":")[0] or "127.0.0.1")
-    SERVER_PORT = int(args.ingest_port)
     AGENT_SHARED_SECRET = cfg.get("agent_key")
+
+    INGEST_TLS, SERVER_PORT, INGEST_CA, SERVER_HOSTNAME = _resolve_ingest_transport(
+        cfg, args)
 
     if not AGENT_NAME:
         AGENT_NAME = "agent"
@@ -2064,7 +2234,8 @@ def main():
 
     print(f"[*] Agent Name: {AGENT_NAME}")
     print(f"[*] Server IP: {SERVER_IP}")
-    print(f"[*] Ingest Port: {SERVER_PORT}")
+    print(f"[*] Ingest: {SERVER_IP}:{SERVER_PORT} "
+          f"({'TLS' if INGEST_TLS else 'PLAINTEXT - telemetry crosses the network in the clear'})")
     print(f"[*] API Base: {AUTOMATIONS_API_URL}")
     print(f"[*] Automations Mode: {AUTOMATIONS_MODE} "
           f"({'server' if (AUTOMATIONS_MODE == 'server' or (AUTOMATIONS_MODE == 'auto' and AUTOMATIONS_API_URL)) else 'db'})")

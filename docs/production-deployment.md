@@ -97,10 +97,30 @@ while the queue backed up behind it.
 
 | Direction | Port | Protocol | Required when |
 | :--- | :--- | :--- | :--- |
-| Agent → server | 5001/tcp | length-framed binary | always |
-| Agent → server | 8000/tcp | HTTPS REST + WS | always (SOAR polling, deploy, screen stream) |
-| Operator → server | 8000/tcp | HTTPS | UI access |
-| Server → agent | 5000/tcp | HTTP | config push, SOAR execute, screen stream (`AGENT_PORT`) |
+| Agent → server | 5011/tcp | length-framed binary inside TLS | `TLS_ENABLED=1` (the target state) |
+| Agent → server | 5001/tcp | length-framed binary, **in the clear** | until every agent is rebuilt |
+| Agent → server | 8000/tcp | HTTP(S) REST + WS | always — the agent's own channel (`/agent-link`) |
+| Operator → server | 8000/tcp | HTTP(S) | UI access |
+
+**Nothing connects to an agent.** There is no inbound port on a monitored
+host: config push, SOAR execute, the console and the screen stream all travel
+back down the websocket the agent opens. A firewall rule allowing the server
+to reach endpoints is not needed and should be removed if one exists.
+
+`5001` and `5011` carry the same protocol; `5011` wraps it in TLS. Both listen
+by default because a fleet does not migrate in one step, and closing `5001`
+before the agents are rebuilt stops their telemetry with no symptom on either
+side — a host that went quiet is indistinguishable from a host with nothing to
+report. The ingest log names each agent still arriving in the clear, once
+each:
+
+```
+[!] web-01 is sending telemetry in the clear on port 5001. ...
+```
+
+When that stops appearing, set `INGEST_TLS_REQUIRED=1` and stop publishing
+`5001`. An un-migrated agent is then refused, which is a symptom somebody can
+see.
 
 Only `app` and `ingest` publish on all interfaces. Everything else binds to
 `BIND_ADDR`, which defaults to `127.0.0.1`:
@@ -165,10 +185,22 @@ attribute the source IP.
 
 ## 3. TLS / Certificate Handling
 
+> **These settings did nothing until recently.** `TLS_ENABLED`, `TLS_CERT` and
+> `TLS_KEY` were described in this guide, in `.env.example`, and in the
+> instructions `certs/generate_certs.py` prints when it finishes — and read by
+> no line of code. Setting `TLS_ENABLED=1` produced a console that came up
+> cleanly on plain HTTP while its operator had every reason to believe it was
+> HTTPS, with the login form and the session cookie crossing the network in
+> clear text. If you are upgrading from a build before this section changed,
+> **assume the console was never encrypted** and rotate any credential that was
+> typed into it.
+
 ### 3.1 Three patterns
 
 1. **Reverse proxy terminates TLS (recommended).** App listens on plain HTTP
-   at `:8000`, ingest plain TCP at `:5001`. Rotation is a proxy reload.
+   at `:8000`, ingest plain TCP at `:5001`. Rotation is a proxy reload. Set
+   `SESSION_COOKIE_SECURE=1` by hand — TLS terminating at a proxy is invisible
+   from inside the app, so nothing can infer it for you.
 2. **App container terminates TLS.** Cert at `certs/server.crt` + `.key`, and
    in `.env`:
    ```ini
@@ -176,14 +208,47 @@ attribute the source IP.
    TLS_CERT=/app/certs/server.crt
    TLS_KEY=/app/certs/server.key
    ```
-   Rotation requires `docker compose restart app`.
+   Rotation requires `docker compose restart app ingest`. Both read the same
+   pair; `app` is the only writer.
 3. **Self-signed, lab only.** With `TLS_ENABLED=1` and no certificate
-   present, the app generates one on first boot; `python certs/generate_certs.py
-   --force` replaces it. Each deployment gets its own key, and the key never
-   leaves the machine that made it — nothing is bundled any more, because a
-   committed private key gave every install the same published TLS identity.
-   Browsers will warn: the CA is self-signed and trusts nothing. Use a real
-   certificate for anything reachable beyond your own network.
+   present, the app generates one on first boot into the `sentora_certs`
+   volume; `python certs/generate_certs.py --force` replaces it. Each
+   deployment gets its own key, and the key never leaves the machine that made
+   it — nothing is bundled any more, because a committed private key gave
+   every install the same published TLS identity. Browsers will warn: the CA
+   is self-signed and trusts nothing. Use a real certificate for anything
+   reachable beyond your own network.
+
+**A certificate that cannot be loaded stops the server.** `TLS_ENABLED=1` with
+a missing, unreadable or mismatched pair exits with a message naming the file,
+rather than falling back to plain HTTP. Falling back is how the original
+problem would come back wearing an error nobody reads in a container log.
+
+### 3.1.1 What the agent has to trust
+
+Against a self-signed server the agent verifies and therefore fails, which is
+correct — an unverified TLS connection is encrypted to whoever answered. Give
+it the CA:
+
+```jsonc
+// config.json, beside agent_name / agent_key / server_url
+{
+  "server_url": "https://soc.example.com:8000",
+  "server_ca": "C:\Sentora\rootCA.crt"
+}
+```
+
+`SENTORA_CA_CERT` and `--ca` do the same thing. Copy `certs/rootCA.crt` from
+the server — the certificate, never `rootCA.key`.
+
+The transport is derived from `server_url`, not configured separately: an
+`https://` console means telemetry goes to `5011` inside TLS and the channel
+goes to `wss://`. Two settings that had to agree, with nothing making them
+agree, would be wrong in exactly the deployment that believed it was
+encrypted. `--ingest-port` still overrides the port for a bastion setup.
+
+With a real certificate from a public CA, `server_ca` is unnecessary — the
+system trust store already has it.
 
 ### 3.2 Session cookies require this
 
@@ -192,8 +257,13 @@ terminating anywhere in front of the UI.** The session cookie is what
 authenticates the operator; without `Secure` it can travel over plain HTTP.
 
 The inverse is also a trap: setting it to `1` while serving plain HTTP means
-the browser silently drops the cookie and nobody can log in. That is why the
-default is `0`.
+the browser silently drops the cookie and nobody can log in.
+
+Unset, it now follows `TLS_ENABLED` rather than defaulting to `0`. The two had
+to agree and nothing made them, so turning on TLS and leaving this alone gave
+an HTTPS console whose session cookie was still allowed onto plain HTTP. An
+explicit value still wins — which is what pattern 1 above needs, because a
+proxy terminating TLS is invisible from inside this process.
 
 `SESSION_COOKIE_SAMESITE` defaults to `Lax`, which blocks the cross-site
 POST/XHR that CSRF needs. Only a split-origin deployment needs `None`, and
@@ -210,13 +280,52 @@ nginx -t && nginx -s reload      # no downtime
 App-terminated:
 
 ```bash
-cp new.crt /opt/sentora/certs/server.crt
-cp new.key /opt/sentora/certs/server.key
-docker compose restart app
+docker compose cp new.crt app:/app/certs/server.crt
+docker compose cp new.key app:/app/certs/server.key
+docker compose restart app ingest
 ```
 
-**Agent trust:** agents do not pin a server cert — they trust the system trust
-store. Rotation is server-side only; no re-enrolment needed.
+`ingest` reads the same volume read-only, so it has to be restarted too — a
+console on the new certificate and telemetry still presenting the old one is
+the kind of half-migration that shows up as a few hosts going quiet.
+
+**Agent trust:** agents verify against the system trust store, plus `server_ca`
+if one is configured. Rotating a certificate issued by a public CA is
+server-side only. Rotating the *self-signed CA* — which `--force` does — is
+not: every agent holding the old `rootCA.crt` will refuse the new server and
+stop sending. Replace the file on the endpoints first, or re-enrol them.
+
+### 3.4 Why not mTLS, and what it would take
+
+Client certificates were considered for agent authentication and deliberately
+not implemented. The reasoning, so it does not have to be reconstructed later:
+
+**What authenticates an agent today.** Every agent route checks `X-Agent-Key`
+against a per-agent secret issued at enrolment. The control channel refuses
+the fleet-wide key outright, because it carries `/self_destruct` among other
+things and a leaked master key should not be able to open one against every
+endpoint at once. Ingest is the weaker half — it identifies an agent by the
+name in the frame, and TLS gives it a private channel but not a proof of who
+is on the other end.
+
+**What mTLS would add.** A key that cannot be replayed from a captured log or
+a config file, and revocation that does not depend on the server remembering
+to reject a secret.
+
+**Why it is not in yet.** A client certificate needs an enrolment flow that
+issues one, an agent that stores it as securely as it stores the key it
+already has, a CA whose private key lives on the server that signs them, and a
+revocation path — a CRL or a short lifetime with renewal. Every one of those
+is a way for an agent to lose the ability to report, and an agent that cannot
+report is invisible in precisely the way this platform exists to prevent. The
+enrolment flow is the part to build first, and it is not a smaller change than
+the transport work above.
+
+**The honest summary:** TLS here protects the telemetry in transit and proves
+the *server's* identity to the agent. It does not prove the agent's identity
+to the server beyond a bearer secret. If your threat model includes an
+attacker who can read an endpoint's config file, that secret is what they get,
+and mTLS is the thing that would help.
 
 ---
 
@@ -228,6 +337,7 @@ store. Rotation is server-side only; no re-enrolment needed.
 | :--- | :--- | :--- | :--- |
 | Volume `mysql_data` | All telemetry, agents, AI insights, automations, sessions | High | `mysqldump --all-databases` daily |
 | Volume `sentora_data` | `data/fernet.key` — the **agent** telemetry key | **Critical** | Encrypted vault |
+| Volume `sentora_certs` | The deployment's TLS certificate and self-signed CA | High | Encrypted vault (it holds `server.key`) |
 | File `.env` | `FERNET_KEY` (server key), DB and broker passwords, agent shared secret | **Critical** | Encrypted vault |
 | Volume `opensearch_data` | Log search index | Medium | Rebuildable from MySQL |
 | Volume `ollama` | Model weights | Low | Re-pull, or restore for air-gap |
@@ -240,6 +350,12 @@ volume; before that volume existed it was regenerated on every
 telemetry. If you are restoring a deployment from before that change, expect
 some historical rows to be undecryptable — the UI marks them
 `<decryption failed — key mismatch>` rather than showing ciphertext.
+
+Losing `sentora_certs` is recoverable but not free: a new certificate and a
+new CA are generated, and every agent holding the old `rootCA.crt` refuses the
+new server and stops sending until the file is replaced on the endpoint. The
+backup script tars every volume `docker-compose.yaml` declares, so this one is
+picked up without anybody having to remember it.
 
 ### 4.2 Backup script
 

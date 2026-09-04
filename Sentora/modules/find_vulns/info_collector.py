@@ -59,8 +59,13 @@ def list_linux_packages(pm):
 
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
     if result.returncode != 0:
-        print(f"Error getting Linux packages: {result.stderr}", file=sys.stderr)
-        sys.exit(1)
+        # Raised, not `sys.exit(1)`. This runs on a collector thread under
+        # `periodic_wrapped`, which catches Exception - and SystemExit
+        # inherits from BaseException, so it slipped past and killed the
+        # thread permanently on the first failure, without a line anywhere.
+        raise RuntimeError(
+            f"{' '.join(cmd)} exited {result.returncode}: "
+            f"{(result.stderr or '').strip()[:200]}")
 
     if pm == 'pacman':
         return [line.split(' ', 1) for line in result.stdout.splitlines() if line.strip()]
@@ -118,11 +123,9 @@ def save_packages(packages):
         insert_record_enc(TABLE, payload)
 
 def main():
-    try:
-        system = detect_platform()
-    except RuntimeError as e:
-        print(e, file=sys.stderr)
-        sys.exit(1)
+    # Not caught and turned into `sys.exit`: the caller is a collector loop
+    # that reports and retries, and SystemExit would end the thread instead.
+    system = detect_platform()
 
     if system == 'windows':
         packages = list_windows_packages()

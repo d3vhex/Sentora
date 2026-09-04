@@ -1,4 +1,7 @@
 import asyncio
+import contextlib
+import functools
+import ssl
 import struct
 import os
 import mysql.connector
@@ -22,6 +25,29 @@ SERVER_IP = os.getenv('INGEST_BIND', '0.0.0.0')
 SERVER_PORT = int(os.getenv('INGEST_PORT', '5001'))
 BUFFER_SIZE = 16 * 1024
 
+# Telemetry over TLS, on a second port beside the plaintext one.
+#
+# A second port rather than a flag on the first, because the two cannot share
+# one: the existing protocol opens with a 4-byte big-endian length, so its
+# first byte is always 0x00, and a TLS ClientHello opens with 0x16. They are
+# trivially distinguishable - and distinguishing them means reading a byte
+# that then cannot be handed back to the TLS layer, so one port can serve one
+# of them and not both.
+#
+# Both listeners run by default, on purpose. Cutting straight to TLS would
+# blackhole every agent built before this, and telemetry going quiet is the
+# exact failure this codebase keeps finding: a host that stopped reporting and
+# a host with nothing to report render identically. So the plaintext listener
+# stays, counts who is still using it, and says so - and
+# INGEST_TLS_REQUIRED=1 closes it once the fleet has moved.
+INGEST_TLS_PORT = int(os.getenv('INGEST_TLS_PORT', '5011'))
+INGEST_TLS_REQUIRED = os.getenv('INGEST_TLS_REQUIRED', '0').strip().lower() in ('1', 'true', 'yes', 'on')
+
+#: Agents seen on the plaintext listener since this process started. Not a
+#: counter of connections - a set of names, because "nine agents are still in
+#: the clear" is the number an operator can act on, and 40,000 is not.
+PLAINTEXT_AGENTS: set[str] = set()
+
 DB_HOST = os.getenv('DB_HOST', '127.0.0.1')
 DB_USER = os.getenv('DB_USER', 'root')
 DB_PASSWORD = os.getenv('DB_PASSWORD', 'my-secret-pw')
@@ -30,8 +56,24 @@ DB_PORT = int(os.getenv('DB_PORT', '3306'))
 #: Tables that hold the *current* state of a host rather than a history of
 #: events. Each batch replaces the contents: the agent re-sends the whole
 #: picture, and the previous picture is no longer true.
+#:
+#: "The agent re-sends the whole picture" is the load-bearing half of that
+#: sentence, and it is a claim about the collector, not a preference. Snapshot
+#: semantics are only correct for a collector that re-reports everything every
+#: cycle; against one that reports deltas, DELETE-then-insert throws away
+#: everything the delta did not mention.
+#:
+#: `critical_files` used to be here and is the reason the paragraph exists.
+#: `check_permissions` writes a row only when a file's owner, group or mode
+#: has actually changed - it is a change log, and the agent even keeps a
+#: UNIQUE index on its `dup_fp` to guarantee that. So three permission changes
+#: meant the server deleted the 1,200 rows it held and stored three, and after
+#: a server-side database reset the table stayed empty for ever: there was
+#: nothing new to send, and by design a sent row is never re-offered. Six of
+#: the seven tables the agent deduplicates locally were already in
+#: DEDUP_TABLES; this was the one that was not.
 SNAPSHOT_TABLES = {
-    "resource_usage", "disk_usage", "critical_files",
+    "resource_usage", "disk_usage",
     "network_connections", "hardware_inventory", "docker_containers",
 }
 
@@ -54,7 +96,7 @@ SNAPSHOT_TABLES = {
 #: `_assert_ingest_modes_are_exclusive` below makes adding a table to both a
 #: startup failure rather than a silently empty tab.
 DEDUP_TABLES = {
-    "portscan_result", "packages",
+    "critical_files", "portscan_result", "packages",
     "vulnerabilities_report", "siem_events", "events_alert", "soar_actions",
     "fim_data", "registry_logs", "process_events", "security_audit",
     "software_inventory", "network_inventory"
@@ -711,7 +753,23 @@ def _parse_os_info_tail(os_info: str | None):
 
 
 async def insert_data(agent: str, table: str, data: list, public_ip: str = None, os_info: str = None,
-                      reported_ip: str = None):
+                      reported_ip: str = None) -> dict:
+    """Store a batch and report what actually happened to it.
+
+    The return value is the point. This used to return None and swallow every
+    insertion failure into a debug line, which was fine for a caller that
+    ignored it - and the caller ignored it because the wire protocol had no
+    way to say anything back. The agent therefore marked rows sent the moment
+    `sendall` returned, and a server that accepted a batch and stored none of
+    it was indistinguishable from one that stored all of it.
+
+    That is not hypothetical: four tables were permanently empty for days
+    while the agent logged "sent (50 rows)" every cycle, because the column
+    was too narrow for the ciphertext and every INSERT raised 1406 into this
+    `except`.
+
+    So: a receipt, and an `error` that survives to the other end.
+    """
     db_name = create_agent_db_if_not_exists(agent)
     create_tables_if_not_exist(db_name)
 
@@ -725,13 +783,18 @@ async def insert_data(agent: str, table: str, data: list, public_ip: str = None,
     try:
         if table not in ALLOWED_TABLES:
             print(f"[!] Unknown table '{table}' received. Skipping.")
-            return
+            return {"stored": 0, "error": f"unknown table {table!r}"}
 
         # A snapshot replaces what was there. Named rather than written out
         # here, because the same list existing twice is how it came to
         # overlap with DEDUP_TABLES in the first place.
         if table in SNAPSHOT_TABLES:
             cursor.execute(f"DELETE FROM `{table}`")
+
+        stored = 0
+        duplicates = 0
+        rejected = 0
+        first_error = None
 
         for item in data:
             item = dict(item)
@@ -745,12 +808,65 @@ async def insert_data(agent: str, table: str, data: list, public_ip: str = None,
                     (table, fp)
                 )
                 if cursor.rowcount == 0:
+                    # Already held. Counted as accepted rather than stored:
+                    # the agent must not resend it, and reporting it as
+                    # stored would make dedup look like data loss.
+                    duplicates += 1
                     continue
 
             keys = ', '.join(f"`{k}`" for k in item.keys())
             values = ', '.join(['%s'] * len(item))
             sql = f"INSERT INTO `{table}` ({keys}) VALUES ({values})"
-            cursor.execute(sql, list(item.values()))
+            if table in SNAPSHOT_TABLES:
+                # Last write wins, which is what "snapshot" means.
+                #
+                # The agent appends a row per entity per collection cycle and
+                # ships them in batches of fifty, so one batch routinely
+                # carries the same container or disk from several cycles. The
+                # server's DELETE clears the previous picture but not the
+                # repeats inside the batch itself, and `docker_containers` has
+                # UNIQUE(container_id) - so the second copy raised 1062, the
+                # whole batch rolled back, and the table stayed empty while
+                # the agent logged "docker_containers sent (8 rows)".
+                updates = ', '.join(f"`{k}`=VALUES(`{k}`)" for k in item.keys())
+                sql += f" ON DUPLICATE KEY UPDATE {updates}"
+
+            try:
+                cursor.execute(sql, list(item.values()))
+                stored += 1
+            except Exception as row_error:
+                # Per row, because one unstorable row used to take the other
+                # forty-nine with it. A batch is not a transaction as far as
+                # the fleet is concerned: it is fifty independent facts, and
+                # losing all of them because one is malformed is the worst
+                # available outcome.
+                rejected += 1
+                if first_error is None:
+                    first_error = f"{type(row_error).__name__}: {row_error}"
+
+                # Take the fingerprint back out.
+                #
+                # It was written a few lines above, before the row it stands
+                # for existed. While a failure rolled the whole batch back
+                # that was harmless - the fingerprint went with it. Now that a
+                # batch commits despite a rejected row, leaving it behind
+                # marks the row as already-seen for ever: it is skipped as a
+                # duplicate on every future attempt, so it can never be stored
+                # even once the reason it failed is fixed.
+                #
+                # `registry_logs` showed exactly this - three fingerprints
+                # held against a table that did not exist, for three rows that
+                # would have stayed unstorable after the table was created.
+                if table in DEDUP_TABLES:
+                    try:
+                        cursor.execute(
+                            "DELETE FROM ingest_fingerprint "
+                            "WHERE table_name=%s AND fp=%s", (table, fp))
+                    except Exception as cleanup_error:
+                        print(f"[!] {agent}/{table}: could not release the "
+                              f"fingerprint for a rejected row: "
+                              f"{cleanup_error}", flush=True)
+                continue
 
             for _alert in correlate_across_hosts(agent, table, item, cursor):
                 _spawn(publish_to_ai_queue(agent, "events_alert", _alert),
@@ -799,9 +915,28 @@ async def insert_data(agent: str, table: str, data: list, public_ip: str = None,
                    label=f"index {agent}/{table}")
 
         conn.commit()
+        if rejected:
+            # Reported, not hidden behind a successful-looking receipt. The
+            # agent does not retry these - a row the server cannot store will
+            # not become storable on the next attempt - so this line is the
+            # only trace they ever leave.
+            print(f"[!] {agent}/{table}: stored {stored}, rejected {rejected} "
+                  f"({first_error})", flush=True)
+        return {"stored": stored, "duplicates": duplicates,
+                "rejected": rejected, "error": None}
     except Exception as e:
-        if debug:
-            print(f"[!] Data insertion error: {e}")
+        # Printed unconditionally, not behind `debug`. A batch that fails to
+        # store is the single most important thing this process can say, and
+        # it spent that failure inside an `if debug` that is off in
+        # production.
+        print(f"[!] {agent}/{table}: data insertion failed: "
+              f"{type(e).__name__}: {e}", flush=True)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return {"stored": 0, "duplicates": 0, "rejected": 0,
+                "error": f"{type(e).__name__}: {e}"}
     finally:
         cursor.close()
         conn.close()
@@ -921,11 +1056,29 @@ def observed_peer_ip(writer) -> str | None:
     return host
 
 
-async def handle_client(reader, writer):
+async def handle_client(reader, writer, encrypted: bool = True):
+    """One batch from one agent.
+
+    `encrypted` says which listener the connection arrived on. It is recorded
+    rather than acted on: refusing here would make a legacy agent's telemetry
+    vanish with no explanation anywhere, which is the failure mode this whole
+    module keeps being bitten by. INGEST_TLS_REQUIRED refuses it earlier, by
+    not opening the plaintext port at all - a connection refused is a symptom
+    an operator can see.
+    """
     try:
         raw_len = await recv_all(reader, 4)
         (agent_name_len,) = struct.unpack('!I', raw_len)
         agent_name = (await recv_all(reader, agent_name_len)).decode('utf-8')
+
+        if not encrypted and agent_name not in PLAINTEXT_AGENTS:
+            PLAINTEXT_AGENTS.add(agent_name)
+            print(f"[!] {agent_name} is sending telemetry in the clear on "
+                  f"port {SERVER_PORT}. Its logs, hostnames and process "
+                  f"names cross the network unencrypted. Rebuild the agent "
+                  f"against an https:// server URL to move it to "
+                  f"{INGEST_TLS_PORT}; set INGEST_TLS_REQUIRED=1 to stop "
+                  f"accepting this once the fleet has moved.", flush=True)
 
         raw_ip_len = await recv_all(reader, 4)
         (ip_len,) = struct.unpack('!I', raw_ip_len)
@@ -962,8 +1115,9 @@ async def handle_client(reader, writer):
                 print(f"[ERROR] JSON decode failed from {agent_name}@{public_ip}: {e}")
                 return
 
-        await insert_data(agent_name, fname.replace(".json", ""), data, public_ip, os_info,
-                          reported_ip=claimed_ip)
+        receipt = await insert_data(agent_name, fname.replace(".json", ""), data,
+                                    public_ip, os_info, reported_ip=claimed_ip)
+        await _send_receipt(writer, receipt)
         if debug:
             print(f"[INFO] Data received from {agent_name}@{public_ip} ({os_info}) - File: {fname}, Size: {fsize} bytes")
 
@@ -975,16 +1129,117 @@ async def handle_client(reader, writer):
         await writer.wait_closed()
 
 
-async def main():
-    server = await asyncio.start_server(
-        handle_client, SERVER_IP, SERVER_PORT,
-        reuse_address=True, reuse_port=False
-    )
-    addr = server.sockets[0].getsockname()
-    print(f"[*] TCP ingest server listening on: {addr}")
+async def _send_receipt(writer, receipt) -> None:
+    """Tell the agent what became of the batch it just sent.
 
-    async with server:
-        await server.serve_forever()
+    The ingest protocol had no reply at all, which is why the agent marked
+    rows sent on `sendall` returning - the strongest thing it could know, and
+    much weaker than it read. This adds the only frame that lets the agent
+    distinguish "stored" from "accepted by a socket".
+
+    Appended rather than versioned, and safe in both directions. An agent
+    built before this reads nothing and closes; the write lands in a socket
+    buffer nobody drains and is discarded when the connection goes, so the
+    failure mode for an old fleet is exactly the behaviour it has today.
+    """
+    if receipt is None:
+        return
+    try:
+        blob = json.dumps(receipt).encode("utf-8")
+        writer.write(struct.pack("!I", len(blob)) + blob)
+        await writer.drain()
+    except Exception as e:
+        # An agent that hung up before reading is the ordinary case for any
+        # build older than this frame, so this is not worth a line unless
+        # somebody is debugging.
+        if debug:
+            print(f"[INFO] receipt not delivered: {type(e).__name__}: {e}")
+
+
+def _ingest_tls_context():
+    """The server-side TLS context for the ingest listener, or None.
+
+    Shares `core.tls` with the console rather than growing a second pair of
+    certificate settings. One identity for the deployment is also the only
+    arrangement an agent can be told to trust in one step.
+
+    This process reads the certificate and never creates one. `app` owns
+    generation, the way it already owns the Fernet key, and mounts the
+    directory read-only here. Two processes generating independently would
+    each end up holding a certificate the other does not, and an agent that
+    verified the console would then fail against ingest for no visible
+    reason - a host that goes quiet, which is the exact symptom this codebase
+    keeps chasing.
+    """
+    from core import tls as product_tls
+
+    if not product_tls.tls_enabled():
+        return None
+
+    config = product_tls.existing()
+    if not config:
+        # Not an error worth a traceback: on a first boot this process
+        # usually wins the race with `app` by a few seconds. `restart: always`
+        # brings it back, and the message says what it is waiting for rather
+        # than looking like a broken configuration.
+        raise RuntimeError(
+            "no certificate at certs/server.crt yet. `app` generates it on "
+            "first boot and this process reads it; if `app` is running and "
+            "this persists, check that both mount the same certs volume."
+        )
+
+    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    context.load_cert_chain(certfile=config["cert"], keyfile=config["key"])
+    return context
+
+
+async def main():
+    servers = []
+
+    tls_context = None
+    try:
+        tls_context = _ingest_tls_context()
+    except Exception as e:
+        # Same rule as the console: asking for TLS and not getting it is a
+        # startup failure. Telemetry is the more sensitive of the two streams
+        # - it carries the process names, paths and log lines of every host -
+        # so falling back to the plaintext port would be the worse half of
+        # the deployment silently continuing.
+        print(f"[!] ingest TLS was requested and cannot be served: {e}", flush=True)
+        raise SystemExit(2)
+
+    if tls_context is not None:
+        servers.append(await asyncio.start_server(
+            functools.partial(handle_client, encrypted=True),
+            SERVER_IP, INGEST_TLS_PORT, ssl=tls_context,
+            reuse_address=True, reuse_port=False,
+        ))
+        print(f"[*] TLS ingest listening on {SERVER_IP}:{INGEST_TLS_PORT}", flush=True)
+    elif INGEST_TLS_REQUIRED:
+        print("[!] INGEST_TLS_REQUIRED=1 but TLS_ENABLED is not set, so there "
+              "is no encrypted listener to require. Set TLS_ENABLED=1.",
+              flush=True)
+        raise SystemExit(2)
+
+    if INGEST_TLS_REQUIRED:
+        print(f"[*] Plaintext ingest on {SERVER_PORT} is closed "
+              f"(INGEST_TLS_REQUIRED=1). Agents that have not been rebuilt "
+              f"will be refused rather than silently accepted.", flush=True)
+    else:
+        servers.append(await asyncio.start_server(
+            functools.partial(handle_client, encrypted=False),
+            SERVER_IP, SERVER_PORT,
+            reuse_address=True, reuse_port=False,
+        ))
+        warning = ("in the clear" if tls_context is None else
+                   "in the clear, for agents not yet rebuilt")
+        print(f"[*] TCP ingest listening on {SERVER_IP}:{SERVER_PORT} ({warning})",
+              flush=True)
+
+    async with contextlib.AsyncExitStack() as stack:
+        for server in servers:
+            await stack.enter_async_context(server)
+        await asyncio.gather(*(s.serve_forever() for s in servers))
 
 if __name__ == "__main__":
     asyncio.run(main())

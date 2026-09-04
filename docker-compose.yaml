@@ -130,6 +130,18 @@ services:
       # made all previously encrypted agent telemetry unreadable. Back this
       # volume up — there is no key rotation path.
       - sentora_data:/app/data
+      # TLS material, on the same footing as the Fernet key above: generated
+      # on first boot by this container and needed for the life of the
+      # deployment. Without a volume it lived in the image layer and was
+      # regenerated on every `--build`, which changes the deployment's TLS
+      # identity - every agent that had been given the CA to trust would stop
+      # verifying, and stop reporting, after a routine rebuild.
+      #
+      # `app` mounts it read-write and is the only writer. `ingest` mounts the
+      # same volume read-only, for exactly the reason the data volume gives:
+      # a second process that can generate its own would hold a certificate
+      # the first one does not.
+      - sentora_certs:/app/certs
     # The whole host filesystem used to be bind-mounted here as
     # `/:/host_disk:ro`, so that the dashboard could show one disk-usage
     # percentage. That handed /etc/shadow, every SSH key and every other
@@ -163,7 +175,17 @@ services:
       ollama-init:
         condition: service_completed_successfully
     ports:
+      # 5001 is the original plaintext listener; 5011 carries the same
+      # protocol inside TLS. Both are published because a fleet does not move
+      # in one step, and closing 5001 before the agents have been rebuilt
+      # makes their telemetry stop with no symptom on either side - a host
+      # that went quiet looks exactly like a host with nothing to say.
+      #
+      # server.py names every agent still arriving in the clear, once each.
+      # When that list is empty, set INGEST_TLS_REQUIRED=1 and drop the 5001
+      # line below; a connection refused is a symptom somebody can see.
       - "5001:5001"
+      - "5011:5011"
     volumes:
       # Read-only, and required. The agent encrypts `message` before sending;
       # this key is what turns it back into a log. Without it the worker
@@ -174,6 +196,9 @@ services:
       # read-only here means a container that starts before that cannot
       # quietly generate a different one and decrypt nothing.
       - sentora_data:/app/data:ro
+      # Same arrangement, same reason: `app` generates the certificate, this
+      # process reads it. See `server._ingest_tls_context`.
+      - sentora_certs:/app/certs:ro
 
   rabbitmq:
     image: rabbitmq:3-management
@@ -341,3 +366,7 @@ volumes:
   mysql_data:
   opensearch_data:
   sentora_data:
+  # Back this up with the Fernet key. Losing it is not fatal - a new
+  # certificate is generated - but every agent holding the old CA stops
+  # verifying the server and stops sending until it is re-pointed.
+  sentora_certs:

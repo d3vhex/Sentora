@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { 
   Database, 
   Search, 
@@ -11,6 +11,22 @@ import {
   Info
 } from 'lucide-react';
 import { agentService } from '../services/api';
+import { Card } from '../components/ui';
+import { CategoryBars } from '../components/ui/charts';
+
+const chartNote: React.CSSProperties = {
+  margin: '0 0 var(--space-3)', color: 'var(--text-muted)',
+  fontSize: 'var(--text-xs)', maxWidth: '58ch',
+};
+
+/** A socket state is a state, so it takes a semantic colour. A listening
+ *  socket is surface; an established one is a conversation already underway. */
+const STATE_TONE: Record<string, string> = {
+  LISTEN: 'var(--sev-medium)',
+  ESTABLISHED: 'var(--sev-high)',
+  CLOSE_WAIT: 'var(--sev-low)',
+  TIME_WAIT: 'var(--sev-info)',
+};
 
 const Assets: React.FC = () => {
     const [agents, setAgents] = useState<any[]>([]);
@@ -62,6 +78,38 @@ const Assets: React.FC = () => {
         const searchStr = JSON.stringify(item).toLowerCase();
         return searchStr.includes(searchTerm.toLowerCase());
     });
+
+    /* One chart per tab, because the three tabs answer three different
+       questions - and all of them are asked of the rows already on screen,
+       so the picture and the table can never disagree. */
+    const breakdown = useMemo(() => {
+        const field =
+            activeTab === 'hardware' ? (i: any) => i.type
+            : activeTab === 'software' ? (i: any) => i.vendor
+            : (i: any) => i.state;
+
+        const counts = new Map<string, number>();
+        for (const item of filteredData) {
+            const key = String(field(item) || 'unknown').trim() || 'unknown';
+            counts.set(key, (counts.get(key) ?? 0) + 1);
+        }
+        return [...counts.entries()]
+            .map(([name, value]) => ({
+                name: name.length > 22 ? name.slice(0, 21) + '…' : name,
+                value,
+            }))
+            .sort((a, b) => b.value - a.value)
+            .slice(0, 8);
+    }, [filteredData, activeTab]);
+
+    const breakdownCopy = activeTab === 'hardware'
+        ? { title: 'Hardware by type',
+            note: 'What the inventory is made of. A category that is missing entirely usually means the collector for it failed rather than the host has none.' }
+        : activeTab === 'software'
+        ? { title: 'Packages by vendor',
+            note: 'Who wrote the software on this host. A long tail of one-off vendors is where unmanaged software lives.' }
+        : { title: 'Connections by state',
+            note: 'Listening sockets are attack surface; established ones are traffic already flowing. The mix is the shape of what this host is doing.' };
 
     return (
         <div style={{ padding: '32px', maxWidth: '1600px', margin: '0 auto', animation: 'fadeIn 0.5s ease-out' }}>
@@ -157,6 +205,19 @@ const Assets: React.FC = () => {
                         <TabButton active={activeTab === 'hardware'} onClick={() => setActiveTab('hardware')} icon={<Cpu size={16} />} label="Hardware" />
                         <TabButton active={activeTab === 'software'} onClick={() => setActiveTab('software')} icon={<Package size={16} />} label="Software" />
                         <TabButton active={activeTab === 'network'} onClick={() => setActiveTab('network')} icon={<Globe size={16} />} label="Network" />
+                    </div>
+
+                    <div style={{ marginBottom: '24px' }}>
+                        <Card title={breakdownCopy.title}>
+                            <p style={chartNote}>{breakdownCopy.note}</p>
+                            <CategoryBars
+                                data={breakdown}
+                                height={200}
+                                colorFor={activeTab === 'network'
+                                    ? (row) => STATE_TONE[row.name.toUpperCase()] ?? 'var(--chart-1)'
+                                    : undefined}
+                            />
+                        </Card>
                     </div>
 
                     {/* Table View */}
