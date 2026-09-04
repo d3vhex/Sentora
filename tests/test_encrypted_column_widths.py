@@ -88,6 +88,16 @@ CASES = [
 def test_an_encrypted_column_can_hold_its_ciphertext(table, column):
     declared = _column_type(table, column)
     if declared is None:
+        # A skip here used to cover a real hole. Nine of these skipped for
+        # months, and the reason was not "that column is spelled differently"
+        # - it was that `registry_logs`, `process_events` and `security_audit`
+        # had no server-side table at all, so there was no width to check
+        # because there was nowhere to put the data. The suite reported
+        # "nothing to check here" about three tables the agent was filling.
+        #
+        # `test_every_ingestible_table_has_somewhere_to_land` below is the
+        # test that catches that directly; this one stays a skip so a column
+        # renamed on one side is not reported twice.
         pytest.skip(f"{table}.{column} is not in db/init.sql")
 
     kind, width = declared

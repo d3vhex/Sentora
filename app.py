@@ -116,6 +116,7 @@ from core import config_validation
 from core import login_guard
 from core import netloc
 from core import threat_feeds
+from core import tls as product_tls
 from core import version as product_version
 # Installer templating: pure string generation, extracted so app.py is not
 # also 420 lines of PowerShell. See core/installers.py.
@@ -125,7 +126,13 @@ from core.installers import _render_linux_install, _render_windows_install
 # TLS; a Secure cookie on a plain-http lab deployment is silently dropped by
 # the browser and nobody can log in. Set SESSION_COOKIE_SECURE=1 in .env once
 # you terminate TLS in front of the app.
-SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE", "0").lower() in ("1", "true", "yes", "on")
+#
+# Unset now means "follow TLS_ENABLED" rather than "0". The pair had to agree
+# and nothing made them: an operator who turned on TLS and left this alone got
+# an HTTPS console whose session cookie was still allowed onto plain HTTP.
+# An explicit value still wins, because TLS terminating at a proxy is
+# invisible from in here and that deployment needs the flag by hand.
+SESSION_COOKIE_SECURE = product_tls.cookie_should_be_secure()
 
 # 'Lax' blocks the cookie on cross-site POST/XHR, which is the CSRF case that
 # matters, while staying compatible with normal same-origin use. 'Strict' is
@@ -356,6 +363,42 @@ fernet = load_or_create_fernet_from_env()
 
 import zipfile
 import io
+
+@app.get("/api/agent/ca")
+async def download_ca(request):
+    """The self-signed CA certificate, for agents that have to verify this
+    server.
+
+    Public, and safe to be. This serves `rootCA.crt` and never `rootCA.key`:
+    the certificate is the half of the pair whose entire purpose is to be
+    distributed, and publishing it grants nothing - it lets a client check a
+    signature it could not otherwise check.
+
+    Fetching it over the connection it is meant to secure is trust on first
+    use, and worth being honest about rather than dressing up. It is the same
+    trust the enrolment token and the agent binary already travel on in the
+    same installer run: anyone able to intercept this exchange can hand over a
+    binary of their choosing, and the CA is the smallest of those problems.
+    Deployments that cannot accept that should ship `rootCA.crt` out of band
+    and set `server_ca` by hand.
+
+    404 rather than an empty body when there is no CA, because a zero-byte
+    PEM written to disk fails later with a message about the certificate
+    format, at a point far from the cause.
+    """
+    ca = pathlib.Path(__file__).resolve().parent / "certs" / "rootCA.crt"
+    if not ca.exists():
+        return json({
+            "error": "no_local_ca",
+            "message": "This server has no self-signed CA. That is expected "
+                       "when TLS is off, or when TLS_CERT points at a "
+                       "certificate from a real CA - in which case the agent "
+                       "needs no extra trust and server_ca can stay unset.",
+        }, status=404)
+    return await response.file(
+        str(ca), mime_type="application/x-pem-file",
+        filename="rootCA.crt")
+
 
 @app.get("/api/agent/download/<os_type>")
 async def download_agent(request, os_type):
@@ -1142,6 +1185,11 @@ _PUBLIC_HANDLERS = {
     # before the agent polled them, so they never ran and the UI showed them
     # green. They authenticate now — see _require_agent.
     "download_agent", "register_agent", "agent_bootstrap",
+    # The CA certificate, and only the certificate. It is the half of the pair
+    # whose purpose is to be handed out, an installer needs it before it holds
+    # any credential, and publishing it grants nothing - it lets a client check
+    # a signature it could not otherwise check.
+    "download_ca",
     "deploy_agent_linux", "deploy_agent_windows",
     "get_pending_automations_for_agent",
     "report_automation_result", "report_automation_result_by_id",
@@ -1178,6 +1226,10 @@ _PUBLIC_EXACT_PATHS = {
     # here only because the operator session middleware would otherwise reject
     # the handshake before the handler is ever reached.
     "/agent-link",
+    # The CA *certificate*, so an agent can verify a self-signed server.
+    # Public on purpose: a certificate is the half of the pair meant to be
+    # handed out, and an installer needs it before it has any credential.
+    "/api/agent/ca",
 }
 _AGENT_PATH_SUFFIXES = ("/automations/pending", "/automations/report")
 
@@ -6249,17 +6301,47 @@ async def restart_db(request):
 
 
 
+#: Tables this endpoint may empty. Both are deduplicated on ingest, which is
+#: why `_clear_one_table` exists rather than a bare TRUNCATE.
+CLEARABLE_TABLES = ["events_alert", "siem_events"]
+
+
+async def _clear_one_table(cursor, table: str) -> None:
+    """Empty a table *and* forget what it has already seen.
+
+    The TRUNCATE alone left every ingest fingerprint behind, and that is not a
+    tidiness problem - it permanently blinds the table.
+
+    Ingest writes a fingerprint per row into `ingest_fingerprint` and skips any
+    row whose fingerprint it already holds. Clearing the rows without clearing
+    the fingerprints therefore means every future row of that table is skipped
+    as a duplicate of a row that no longer exists. The table stays empty for
+    ever, and the agent is told the server already has the data - so it marks
+    those rows sent and never offers them again.
+
+    Seen live: an agent shipped 507 new `siem_events` rows into a table
+    holding zero, and every layer reported success. One click on Clear had
+    turned the most important table on the console into a permanent silence
+    that looks exactly like a quiet host.
+    """
+    await cursor.execute(f"TRUNCATE TABLE {table}")
+    # Scoped to this table: the fingerprints for everything else describe rows
+    # that are still there, and dropping them would re-admit every duplicate
+    # the ingest path exists to reject.
+    await cursor.execute(
+        "DELETE FROM ingest_fingerprint WHERE table_name=%s", (table,))
+
+
 @require_permission("clear_logs")
 @app.route("/<agent>/clear/<table>", methods=["POST"])
 async def clear_table(request, agent, table):
-    allowed_tables = ["events_alert", "siem_events"]
-    if table not in allowed_tables:
+    if table not in CLEARABLE_TABLES:
         return sanic_json({"status": "error", "message": f"{table} Can't be cleaned."}, status=403)
 
     try:
         cnx = await connect_db_for_agent(agent)
         cursor = await cnx.cursor()
-        await cursor.execute(f"TRUNCATE TABLE {table}")
+        await _clear_one_table(cursor, table)
         await cnx.commit()
         await cursor.close(); await cnx.close()
         return sanic_json({"status": "success", "message": f"{table} tablosu temizlendi."})
@@ -6269,11 +6351,10 @@ async def clear_table(request, agent, table):
 @require_permission("clear_logs")
 @app.route("/<agent>/clear_delayed/<table>", methods=["POST"])
 async def clear_table_delayed(request, agent, table):
-    allowed_tables = ["events_alert", "siem_events"]
     data = request.json or {}
     delay = int(data.get("delay", 0))
 
-    if table not in allowed_tables:
+    if table not in CLEARABLE_TABLES:
         return sanic_json({"status": "error", "message": f"{table} is not a table this endpoint may clear"}, status=403)
 
     if delay <= 0:
@@ -6284,7 +6365,10 @@ async def clear_table_delayed(request, agent, table):
         try:
             cnx = await connect_db_for_agent(agent)
             cursor = await cnx.cursor()
-            await cursor.execute(f"TRUNCATE TABLE {table}")
+            # The same clear as the immediate route, through the same
+            # function. Two copies of a TRUNCATE is how one of them came to
+            # forget the fingerprints in the first place.
+            await _clear_one_table(cursor, table)
             await cnx.commit()
             await cursor.close(); await cnx.close()
             print(f"{table} {delay} cleaned after this.")
@@ -9641,6 +9725,10 @@ async def agent_link_socket(request, ws):
                     f"agent opened a channel ({state}: {detail})")
 
     reason = "the agent disconnected"
+    #: Channels we have already told this agent to stop. Frames sent before
+    #: that close arrived are ordinary, and one line each would be the
+    #: noisiest thing in the log at exactly the wrong moment.
+    orphaned: set[int] = set()
     try:
         while True:
             raw = await ws.recv()
@@ -9655,8 +9743,26 @@ async def agent_link_socket(request, ws):
                     continue
                 channel, payload = parsed
                 if not link.deliver_stream(channel, payload):
-                    print(f"[agent-link] {agent}: data for a stream that is "
-                          f"gone (ch {channel})", flush=True)
+                    # Say so, rather than only noticing. This printed a line
+                    # per frame and changed nothing, so an agent whose viewer
+                    # had gone kept capturing and sending for the life of the
+                    # connection - and every one of those frames competed for
+                    # the agent's single send lock with the config reads and
+                    # restarts queued behind them. That is how a healthy,
+                    # connected agent came to answer GET /config/rules in
+                    # more than five seconds.
+                    #
+                    # Once per channel: the close is already travelling, and
+                    # the frames still in flight were sent before it arrived.
+                    if channel not in orphaned:
+                        orphaned.add(channel)
+                        print(f"[agent-link] {agent}: data for a stream that "
+                              f"is gone (ch {channel}); telling it to stop",
+                              flush=True)
+                        await _ws_notify(ws, pyjson.dumps({
+                            "t": "close", "ch": channel,
+                            "why": "nothing is attached to this stream",
+                        }))
                 continue
 
             try:
@@ -9863,48 +9969,288 @@ async def vnc_proxy(request, ws, agent):
 async def serve_root(request):
     return await response.file("./frontend/dist/index.html")
 
+#: Page size. Capped because `size` reaches OpenSearch directly, and a
+#: request for a million rows is answered by building a million rows.
+SEARCH_MAX_SIZE = 200
+SEARCH_DEFAULT_SIZE = 50
+
+#: How far back a search looks when nothing says otherwise.
+#:
+#: A default at all, rather than "everything", is the single biggest change
+#: here. The previous version had no time filter of any kind, so every search
+#: scanned the whole retention and sorted it - and no operator could ask the
+#: question they actually had, which is nearly always about a window.
+SEARCH_DEFAULT_WINDOW = "now-24h"
+
+_RELATIVE_TIME = re.compile(r"^now(-\d+[smhdwMy])?(/[smhdwMy])?$")
+
+
+def _time_bound(value: str | None, fallback: str) -> str:
+    """An OpenSearch date-math bound, or the fallback.
+
+    `now-7d` and an ISO timestamp are both accepted; anything else is
+    refused rather than passed through, because an unparseable bound sent to
+    the engine comes back as a 400 the operator has to decode.
+    """
+    text = (value or "").strip()
+    if not text:
+        return fallback
+    if _RELATIVE_TIME.match(text):
+        return text
+    try:
+        datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return text
+    except ValueError:
+        return fallback
+
+
+def _positive_int(value, default: int, maximum: int) -> int:
+    """A bounded integer from a query string.
+
+    `int(request.args.get("limit", 100))` was the previous version: `?limit=abc`
+    raised inside the handler and came back as a bodyless 500, and
+    `?limit=999999` was honoured.
+    """
+    try:
+        parsed = int(str(value))
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(parsed, maximum))
+
+
 @require_permission("read_telemetry")
 @app.route("/api/logs/search")
 async def search_logs_api(request):
-    agent = request.args.get("agent", "*")
-    table = request.args.get("table", "*")
-    query_str = request.args.get("q", "*")
-    limit = int(request.args.get("limit", 100))
-    
-    if query_str == "*":
-        query_body = {
-            "size": limit,
-            "query": {
-                "bool": {
-                    "must": [
-                        {"wildcard": {"agent_name": agent}}
-                    ]
-                }
-            },
-            "sort": [{"@timestamp": {"order": "desc"}}]
-        }
-    else:
-        query_body = {
-            "size": limit,
-            "query": {
-                "bool": {
-                    "must": [
-                        {"wildcard": {"agent_name": agent}},
-                        {"multi_match": {"query": query_str, "fields": ["*"]}}
-                    ]
-                }
-            },
-            "sort": [{"@timestamp": {"order": "desc"}}]
-        }
-    
-    index_mask = f"sentora-logs-{table.replace('_', '-')}" if table != "*" else "sentora-logs-*"
-    
-    resp = os_utils.search_logs(query_body, index_mask=index_mask)
-    if not resp:
-        return sanic_json({"hits": []})
-        
-    hits = [h["_source"] for h in resp.get("hits", {}).get("hits", [])]
-    return sanic_json({"hits": hits, "total": resp.get("hits", {}).get("total", {}).get("value", 0)})
+    """Search indexed telemetry: a window, a query, and a page of results.
+
+    What this replaces could do one thing - free text across every field, over
+    the whole retention, first N results, no way to see the N+1th. Three of
+    those are what an operator asks for first.
+
+    The query is Lucene syntax (`severity:critical AND source:sshd`), which is
+    what the filter builder in the console writes and what somebody who knows
+    the syntax can edit by hand. Leading wildcards are refused: `*foo` forces
+    a scan of every term in the index and is the classic way to take a search
+    cluster down from a text box.
+    """
+    query_text = (request.args.get("q") or "").strip()
+    agent = (request.args.get("agent") or "").strip()
+    table = (request.args.get("table") or "").strip()
+    size = _positive_int(request.args.get("size"),
+                         SEARCH_DEFAULT_SIZE, SEARCH_MAX_SIZE)
+    page = _positive_int(request.args.get("page"), 1, 10_000) - 1
+
+    filters: list = [{
+        "range": {"@timestamp": {
+            "gte": _time_bound(request.args.get("from"), SEARCH_DEFAULT_WINDOW),
+            "lte": _time_bound(request.args.get("to"), "now"),
+        }},
+    }]
+    if agent:
+        # An exact term, not a wildcard. The previous version put the caller's
+        # string straight into a `wildcard` clause, so the default `*` matched
+        # every term in the index and a leading `*` was one keystroke away.
+        hyphen, underscore, _ = _agent_name_forms(agent)
+        filters.append({"terms": {"agent_name.keyword":
+                                  sorted({agent, hyphen, underscore})}})
+
+    must: list = []
+    if query_text:
+        must.append({"query_string": {
+            "query": query_text,
+            "default_operator": "AND",
+            "analyze_wildcard": True,
+            "allow_leading_wildcard": False,
+            "lenient": True,
+        }})
+
+    body = {
+        "from": page * size,
+        "size": size,
+        "track_total_hits": True,
+        "query": {"bool": {"must": must or [{"match_all": {}}], "filter": filters}},
+        "sort": [{"@timestamp": {"order": "desc"}}],
+    }
+
+    index_mask = (f"sentora-logs-{table.replace('_', '-')}"
+                  if table else "sentora-logs-*")
+    try:
+        resp = await asyncio.to_thread(
+            os_utils.search_logs, body, index_mask)
+    except os_utils.SearchError as e:
+        # 400, not an empty result. A search that could not run and a search
+        # that found nothing were the same screen, and on a security console
+        # one of those is an all-clear and the other is no answer at all.
+        return sanic_json({
+            "status": "error",
+            "message": f"The query could not be run: {e}",
+            "hits": [], "total": 0,
+        }, status=400)
+
+    hits = resp.get("hits", {})
+    total = (hits.get("total") or {}).get("value", 0)
+    return sanic_json({
+        "status": "success",
+        "hits": [{**h.get("_source", {}), "_index": h.get("_index")}
+                 for h in hits.get("hits", [])],
+        "total": total,
+        "page": page + 1,
+        "size": size,
+        "pages": max(1, -(-total // size)),
+        "took_ms": resp.get("took"),
+    })
+
+
+#: Columns the Events search may filter and sort on, per table.
+#:
+#: An allowlist, because these become SQL identifiers. Everything the operator
+#: types goes in as a parameter; only the *column* comes from here.
+EVENT_SEARCH_TABLES = {
+    "siem_events": ("id", "source", "severity", "message", "techniques",
+                    "created_at"),
+    "events_alert": ("id", "source", "severity", "message", "created_at"),
+}
+
+EVENT_SEARCH_MAX_SIZE = 200
+
+
+def _fernet() -> "Fernet":
+    """The key this server decrypts telemetry with."""
+    key = getattr(app.ctx, "fernet_key", None) or bootstrap_client.get_fernet_key()
+    return Fernet(key.encode("utf-8") if isinstance(key, str) else key)
+
+
+def _search_events_sync(table: str, term: str, agent: str | None,
+                        severity: str | None, hours: int,
+                        page: int, size: int) -> tuple[list, int]:
+    """Search the per-agent MySQL tables. Returns (rows, total).
+
+    Separate from the log search rather than merged with it. The two stores
+    answer different questions - OpenSearch holds raw telemetry, these hold
+    what the rules decided about it - and merging them means one ranking over
+    two things that are not comparable. Tabs, not a union.
+    """
+    columns = EVENT_SEARCH_TABLES[table]
+    encrypted = set(ENCRYPTED_FIELDS_MAP.get(table) or ())
+
+    rows: list = []
+    total = 0
+    with sync_mysql_conn() as conn:
+        cursor = conn.cursor(dictionary=True)
+        try:
+            cursor.execute("SHOW DATABASES")
+            dbs = [r["Database"] for r in cursor.fetchall()
+                   if str(r["Database"]).endswith("_db")]
+            if agent:
+                wanted = _agent_name_forms(agent)[1] + "_db"
+                dbs = [d for d in dbs if d == wanted]
+
+            for db in dbs:
+                where = ["created_at >= NOW() - INTERVAL %s HOUR"]
+                params: list = [hours]
+                # `severity` is encrypted in some tables, so it cannot be
+                # filtered in SQL there - it is applied after decryption below.
+                if severity and "severity" in columns and "severity" not in encrypted:
+                    where.append("severity = %s")
+                    params.append(severity)
+                clause = " AND ".join(where)
+                # Through the escaper even though `columns` is an allowlist and
+                # `db` came from SHOW DATABASES. Relying on where a name came
+                # from is how the rule rots: the next person adds one that came
+                # from somewhere else and the shape looks identical.
+                select = ", ".join(_quote_identifier(c) for c in columns)
+                try:
+                    cursor.execute(
+                        f"SELECT {select} FROM {_quote_identifier(db)}"
+                        f".{_quote_identifier(table)} "
+                        f"WHERE {clause} ORDER BY created_at DESC LIMIT 2000",
+                        params)
+                except Exception:
+                    continue                # table not provisioned on this agent
+                for row in cursor.fetchall():
+                    row["agent"] = db[:-3]
+                    rows.append(row)
+        finally:
+            cursor.close()
+
+    # Decrypt, then filter. The searchable text is inside the ciphertext, so
+    # a `LIKE` in SQL would match nothing and report it as no results - which
+    # is the failure this whole page is being rebuilt around.
+    if encrypted:
+        fernet_obj = _fernet()
+        rows = [decrypt_row_fields(r, list(encrypted), fernet_obj) for r in rows]
+
+    if term:
+        needle = term.lower()
+        rows = [r for r in rows
+                if any(needle in str(v).lower() for v in r.values())]
+    if severity and "severity" in encrypted:
+        rows = [r for r in rows
+                if str(r.get("severity") or "").lower() == severity.lower()]
+
+    rows.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
+    total = len(rows)
+    start = (page - 1) * size
+    return rows[start:start + size], total
+
+
+@require_permission("read_telemetry")
+@app.route("/api/events/search")
+async def search_events_api(request):
+    """Search what the rules decided, as opposed to the raw telemetry.
+
+    The Events half of the search page. Kept as its own endpoint and its own
+    tab because the two stores are not comparable: one ranking over both would
+    have to decide whether a raw log line outranks a detection, and there is
+    no answer to that.
+    """
+    table = (request.args.get("table") or "siem_events").strip()
+    if table not in EVENT_SEARCH_TABLES:
+        return sanic_json({
+            "status": "error",
+            "message": f"{table!r} is not searchable; "
+                       f"try {sorted(EVENT_SEARCH_TABLES)}",
+        }, status=400)
+
+    size = _positive_int(request.args.get("size"), 50, EVENT_SEARCH_MAX_SIZE)
+    page = _positive_int(request.args.get("page"), 1, 10_000)
+    hours = _positive_int(request.args.get("hours"), 24, 24 * 365)
+
+    try:
+        rows, total = await asyncio.to_thread(
+            _search_events_sync, table,
+            (request.args.get("q") or "").strip(),
+            (request.args.get("agent") or "").strip() or None,
+            (request.args.get("severity") or "").strip() or None,
+            hours, page, size)
+    except Exception as e:
+        print(f"[!] event search failed: {e}", flush=True)
+        return sanic_json({"status": "error",
+                           "message": f"The search could not be run: {e}"},
+                          status=500)
+
+    return sanic_json({
+        "status": "success",
+        "hits": rows,
+        "total": total,
+        "page": page,
+        "size": size,
+        "pages": max(1, -(-total // size)),
+        "tables": sorted(EVENT_SEARCH_TABLES),
+    })
+
+
+@require_permission("read_telemetry")
+@app.route("/api/logs/fields")
+async def search_log_fields(request):
+    """The field names the filter builder offers.
+
+    Read from the index mapping rather than a hand-kept list: the indices are
+    created by dynamic mapping from whatever the agents send, so a list here
+    would describe a schema nobody wrote.
+    """
+    fields = await asyncio.to_thread(os_utils.log_fields)
+    return sanic_json({"status": "success", "fields": fields})
 
 @app.route("/<path:path>", name="frontend_spa")
 async def serve_index(request, path=""):
@@ -9957,11 +10303,34 @@ if __name__ == "__main__":
               f"live in one worker only; set WORKERS=1 until the registry is "
               f"shared between them.", flush=True)
 
+    # TLS_ENABLED / TLS_CERT / TLS_KEY were documented in .env.example, in
+    # docs/production-deployment.md and in the output of
+    # certs/generate_certs.py, and read by nothing. Setting them produced a
+    # console that came up cleanly on plain HTTP while its operator had every
+    # reason to think it was HTTPS - so the login form and the session cookie
+    # crossed the network in clear text with no symptom at all.
+    #
+    # `core.tls.resolve` raises rather than falling back. A server that cannot
+    # do what its configuration says must not quietly do something weaker.
+    try:
+        ssl_config = product_tls.resolve()
+    except product_tls.TLSConfigError as e:
+        print(f"[!] {e}", flush=True)
+        raise SystemExit(2)
+
+    print(f"[*] Serving on port 8000 over {product_tls.describe()}", flush=True)
+    if ssl_config and not SESSION_COOKIE_SECURE:
+        # Reachable only when SESSION_COOKIE_SECURE=0 is set by hand against
+        # an HTTPS listener, which is a downgrade rather than a default.
+        print("[!] TLS is on but SESSION_COOKIE_SECURE=0 is set explicitly; "
+              "the session cookie is allowed onto plain HTTP.", flush=True)
+
     app.run(
         host="0.0.0.0",
         port=8000,
         single_process=(num_workers == 1),
         workers=num_workers,
         access_log=True,
-        auto_reload=False
+        auto_reload=False,
+        ssl=ssl_config,
     )

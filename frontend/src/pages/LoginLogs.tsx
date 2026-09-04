@@ -1,6 +1,13 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { ShieldCheck, ShieldAlert, Globe, Search } from 'lucide-react';
 import { adminService } from '../services/api';
+import { Card } from '../components/ui';
+import { CategoryBars } from '../components/ui/charts';
+
+const chartNote: React.CSSProperties = {
+  margin: '0 0 var(--space-3)', color: 'var(--text-muted)',
+  fontSize: 'var(--text-xs)', maxWidth: '58ch',
+};
 
 const LoginLogs: React.FC = () => {
   const [logs, setLogs] = useState<any[]>([]);
@@ -12,11 +19,57 @@ const LoginLogs: React.FC = () => {
       .finally(() => setLoading(false));
   }, []);
 
+  /* A hundred rows scrolled past is not a picture of who is trying to get in.
+     These two are: which accounts are being attempted, and where from. Both
+     read the rows already loaded, so neither can disagree with the table. */
+  const failedByUser = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const l of logs) {
+      if (l.status === 'success') continue;
+      const key = String(l.username || 'unknown');
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return [...counts.entries()]
+      .map(([name, value]) => ({ name, value }))
+      .sort((a, b) => b.value - a.value)
+      .slice(0, 6);
+  }, [logs]);
+
+  const bySourceIp = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const l of logs) {
+      const key = String(l.ip_address || 'unknown');
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return [...counts.entries()]
+      .map(([name, value]) => ({ name, value }))
+      .sort((a, b) => b.value - a.value)
+      .slice(0, 6);
+  }, [logs]);
+
   return (
     <div>
       <div style={{ marginBottom: '32px' }}>
         <h2 style={{ fontSize: '1.875rem', marginBottom: '8px' }}>Access Audit Logs</h2>
         <p style={{ color: 'var(--text-secondary)' }}>Detailed history of all authentication attempts, including local and LDAP logins.</p>
+      </div>
+
+      <div className="responsive-grid" style={{ marginBottom: '24px' }}>
+        <Card title="Failed attempts by account">
+          <p style={chartNote}>
+            Empty is the healthy picture. One account taking most of the bars
+            is either a stuck client or someone guessing at it.
+          </p>
+          <CategoryBars data={failedByUser} height={200}
+                        colorFor={() => 'var(--sev-critical)'} />
+        </Card>
+        <Card title="Attempts by source address">
+          <p style={chartNote}>
+            Where the logins come from, successes included. An address nobody
+            recognises near the top is worth a look before it succeeds.
+          </p>
+          <CategoryBars data={bySourceIp} height={200} />
+        </Card>
       </div>
 
       <div style={{ backgroundColor: 'var(--card-bg)', border: '1px solid var(--border-color)', borderRadius: '12px', overflow: 'hidden' }}>

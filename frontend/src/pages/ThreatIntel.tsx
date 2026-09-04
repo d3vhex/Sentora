@@ -1,5 +1,6 @@
-import React, { useEffect, useState, useCallback } from 'react';
-import { StatCard } from '../components/ui';
+import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import { StatCard, Card } from '../components/ui';
+import { CategoryBars, ShareDonut } from '../components/ui/charts';
 import { Radar, RefreshCw, Search, AlertTriangle, Globe, FileDigit, Link2, Server } from 'lucide-react';
 import { agentService, adminService, authService } from '../services/api';
 
@@ -12,6 +13,11 @@ type Indicator = {
   description: string;
   created_at?: string;
   last_seen?: string;
+};
+
+const chartNote: React.CSSProperties = {
+  margin: '0 0 var(--space-3)', color: 'var(--text-muted)',
+  fontSize: 'var(--text-xs)', maxWidth: '58ch',
 };
 
 const SEVERITY_STYLE: Record<string, { color: string; bg: string }> = {
@@ -98,6 +104,22 @@ const ThreatIntel: React.FC = () => {
 
   const stats = data?.stats;
   const indicators: Indicator[] = data?.indicators || [];
+
+  /* Both read the same `stats` the counters and the source list read, so a
+     chart cannot disagree with the row beside it. */
+  const typeShare = useMemo(() => (
+    (stats?.by_type || [])
+      .map((t: any) => ({ name: String(t.type || 'unknown'), value: Number(t.n) || 0 }))
+      .sort((a: any, b: any) => b.value - a.value)
+      .slice(0, 8)
+  ), [stats]);
+
+  const sourceShare = useMemo(() => (
+    (stats?.by_source || [])
+      .map((t: any) => ({ name: String(t.source || 'unknown'), value: Number(t.n) || 0 }))
+      .sort((a: any, b: any) => b.value - a.value)
+      .slice(0, 6)
+  ), [stats]);
   const feedsOff = stats?.mode === 'off';
 
   return (
@@ -172,6 +194,27 @@ const ThreatIntel: React.FC = () => {
           value={`${stats?.stale_after_days ?? '—'} d`}
           sub="indicators not re-seen"
         />
+      </div>
+
+      {/* The counters say how many indicators are held; these say what kind
+          they are and where they came from. Both matter, because a feed list
+          that is 99% one source is one outage away from being empty, and a
+          store that is all file hashes will not match network telemetry. */}
+      <div className="responsive-grid" style={{ marginBottom: '28px' }}>
+        <Card title="By indicator type">
+          <p style={chartNote}>
+            What the store can actually match on. Hashes match process
+            telemetry; addresses and domains match connections.
+          </p>
+          <CategoryBars data={typeShare} />
+        </Card>
+        <Card title="Share by feed">
+          <p style={chartNote}>
+            How concentrated the intel is. One feed carrying nearly all of it
+            means one broken key takes the coverage with it.
+          </p>
+          <ShareDonut data={sourceShare} />
+        </Card>
       </div>
 
       {/* Per-source breakdown: a feed that stopped refreshing shows an old

@@ -136,7 +136,7 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen }) => {
           {authService.hasPermission('read_telemetry') && <SidebarLink to="/all-alerts" icon={<Activity size={18} />} label="Global Alerts" />}
           {authService.hasPermission('read_telemetry') && <SidebarLink to="/assets" icon={<Database size={18} />} label="Asset Inventory" />}
           {authService.hasPermission('read_telemetry') && <SidebarLink to="/fim" icon={<ShieldAlert size={18} />} label="File Integrity" />}
-          {authService.hasPermission('read_telemetry') && <SidebarLink to="/log-search" icon={<Search size={18} />} label="Log Explorer (OS)" />}
+          {authService.hasPermission('read_telemetry') && <SidebarLink to="/search" icon={<Search size={18} />} label="Search" />}
           {authService.hasPermission('read_telemetry') && <SidebarLink to="/threat-intel" icon={<Radar size={18} />} label="Threat Intelligence" />}
           {authService.hasPermission('read_telemetry') && <SidebarLink to="/attack-coverage" icon={<Grid3x3 size={18} />} label="ATT&CK Coverage" />}
           {authService.hasPermission('manage_agent') && <SidebarLink to="/deployment" icon={<Download size={18} />} label="Deploy Agent" />}

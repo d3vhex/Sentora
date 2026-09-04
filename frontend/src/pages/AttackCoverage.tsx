@@ -5,6 +5,7 @@ import { Grid3x3, ShieldAlert, ShieldCheck, EyeOff, AlertTriangle, GitBranch } f
 // paddings, weights and label sizes - which is most of why the console read
 // as three products rather than one.
 import { StatCard } from '../components/ui';
+import { CategoryBars } from '../components/ui/charts';
 import { agentService } from '../services/api';
 
 /**
@@ -124,6 +125,15 @@ const AttackCoverage: React.FC = () => {
   });
   const tactics = [...TACTIC_ORDER, 'other'].filter(t => byTactic.has(t));
 
+  /* In kill-chain order, not sorted by height. A bar chart of tactics sorted
+     by count answers a question nobody has; sorted by the chain it answers
+     "where in an intrusion would this estate not see anything". */
+  const coverageByTactic = tactics.map(tactic => ({
+    name: tactic.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+    value: (byTactic.get(tactic) ?? [])
+      .filter(t => data?.covered.includes(t)).length,
+  }));
+
   const cellStyle = (technique: string): React.CSSProperties => {
     const seen = eventsFor(technique) > 0;
     const covered = data?.covered.includes(technique) ?? false;
@@ -182,6 +192,26 @@ const AttackCoverage: React.FC = () => {
           color="#f0abfc" icon={<GitBranch size={16} />}
         />
       </div>
+
+      {/* The grid answers "which cell". This answers "which stage of an
+          intrusion am I blind in", which is the question you ask before
+          reading a grid of eighty cells. Drawn in kill-chain order, so the
+          gap is where in an attack it sits rather than where in an alphabet. */}
+      {!loading && tactics.length > 0 && (
+        <div className="card" style={{ marginBottom: 'var(--space-5)' }}>
+          <h2 style={{ fontSize: 'var(--text-lg)', fontWeight: 500,
+                       margin: '0 0 var(--space-2)' }}>
+            Coverage by tactic
+          </h2>
+          <p style={{ margin: '0 0 var(--space-3)', color: 'var(--text-muted)',
+                      fontSize: 'var(--text-xs)', maxWidth: '62ch' }}>
+            Techniques a rule addresses, per stage. A short bar early in the
+            chain is worse than a short bar late in it: nothing you fail to
+            detect at initial access gets easier to catch afterwards.
+          </p>
+          <CategoryBars data={coverageByTactic} height={240} />
+        </div>
+      )}
 
       {!loading && !!data?.covered_only_by_a_sibling?.length && (
         <div style={{

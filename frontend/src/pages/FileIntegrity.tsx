@@ -1,4 +1,22 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
+import { Card } from '../components/ui';
+import { CategoryBars } from '../components/ui/charts';
+
+const chartNote: React.CSSProperties = {
+  margin: '0 0 var(--space-3)', color: 'var(--text-muted)',
+  fontSize: 'var(--text-xs)', maxWidth: '58ch',
+};
+
+/** These are states, so they take the semantic colours. A deletion is not
+ *  worse than a modification because it is drawn in a different hue - it is
+ *  worse, and the hue says so. */
+const STATUS_TONE: Record<string, string> = {
+  deleted: 'var(--sev-critical)',
+  changed: 'var(--sev-high)',
+  modified: 'var(--sev-high)',
+  created: 'var(--sev-medium)',
+  baseline: 'var(--accent-neutral)',
+};
 import { 
   ShieldCheck, 
   Search, 
@@ -61,6 +79,38 @@ const FileIntegrity: React.FC = () => {
         const searchStr = (item.path + item.status).toLowerCase();
         return searchStr.includes(searchTerm.toLowerCase());
     });
+
+    /* Derived from the rows already loaded, so the charts and the timeline
+       below can never disagree about the same events. */
+    const byStatus = useMemo(() => {
+        const counts = new Map<string, number>();
+        for (const e of data) {
+            const key = String(e.status || 'unknown');
+            counts.set(key, (counts.get(key) ?? 0) + 1);
+        }
+        return [...counts.entries()]
+            .map(([name, value]) => ({ name, value }))
+            .sort((a, b) => b.value - a.value);
+    }, [data]);
+
+    const byDirectory = useMemo(() => {
+        const counts = new Map<string, number>();
+        for (const e of data) {
+            const path = String(e.path || '');
+            const cut = Math.max(path.lastIndexOf('\\'), path.lastIndexOf('/'));
+            const dir = cut > 0 ? path.slice(0, cut) : path || 'unknown';
+            counts.set(dir, (counts.get(dir) ?? 0) + 1);
+        }
+        return [...counts.entries()]
+            // Only the tail of a long path fits on an axis, and the tail is
+            // the part that distinguishes them.
+            .map(([name, value]) => ({
+                name: name.length > 28 ? '…' + name.slice(-27) : name,
+                value,
+            }))
+            .sort((a, b) => b.value - a.value)
+            .slice(0, 6);
+    }, [data]);
 
     return (
         <div style={{ padding: '32px', maxWidth: '1600px', margin: '0 auto', animation: 'fadeIn 0.5s ease-out' }}>
@@ -151,7 +201,31 @@ const FileIntegrity: React.FC = () => {
 
                 {/* Main Content: Timeline */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
-                    
+
+                    {/* A timeline reads one event at a time, which is right
+                        once you know which event. These two say which: what
+                        kind of change, and where they are concentrated. A
+                        directory producing hundreds of "modified" is a watch
+                        list that needs narrowing, not an intrusion. */}
+                    <div className="responsive-grid">
+                        <Card title="By change">
+                            <p style={chartNote}>
+                                Created and deleted are rarer than modified, and
+                                worth more when they happen.
+                            </p>
+                            <CategoryBars data={byStatus}
+                                          colorFor={(row) => STATUS_TONE[row.name] ?? 'var(--chart-1)'} />
+                        </Card>
+                        <Card title="Busiest directories">
+                            <p style={chartNote}>
+                                Where the events cluster. One directory carrying
+                                most of them usually means the watch list is too
+                                wide rather than the host is busy.
+                            </p>
+                            <CategoryBars data={byDirectory} />
+                        </Card>
+                    </div>
+
                     <div style={{ background: 'var(--card-bg)', borderRadius: '20px', border: '1px solid var(--border-color)', padding: '24px', display: 'flex', alignItems: 'center', gap: '20px', boxShadow: '0 4px 20px rgba(0,0,0,0.1)' }}>
                         <div style={{ background: 'rgba(34, 197, 94, 0.1)', padding: '12px', borderRadius: '12px' }}>
                             <Activity size={24} color="#4ade80" />

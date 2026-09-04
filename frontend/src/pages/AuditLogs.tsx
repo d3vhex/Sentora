@@ -1,6 +1,13 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { User, Activity, Globe, Search, Eye } from 'lucide-react';
 import { adminService, agentService } from '../services/api';
+import { Card } from '../components/ui';
+import { CategoryBars } from '../components/ui/charts';
+
+const chartNote: React.CSSProperties = {
+  margin: '0 0 var(--space-3)', color: 'var(--text-muted)',
+  fontSize: 'var(--text-xs)', maxWidth: '58ch',
+};
 
 const formatTs = (raw: any): string => {
   if (!raw) return '-';
@@ -36,6 +43,25 @@ const AuditLogs: React.FC = () => {
       .finally(() => setLoading(false));
   };
 
+  /* Both derived from the rows already fetched - a chart with its own query
+     is a chart that can disagree with the table under it. */
+  const _top = (pick: (l: any) => any) => {
+    const counts = new Map<string, number>();
+    for (const l of logs) {
+      const key = String(pick(l) || 'unknown').trim() || 'unknown';
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return [...counts.entries()]
+      .map(([name, value]) => ({
+        name: name.length > 22 ? name.slice(0, 21) + '…' : name,
+        value,
+      }))
+      .sort((a, b) => b.value - a.value)
+      .slice(0, 6);
+  };
+  const byAction = useMemo(() => _top((l) => l.action), [logs]);
+  const byUser = useMemo(() => _top((l) => l.username), [logs]);
+
   const handleSearch = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter') {
       fetchLogs(searchTerm || '*');
@@ -47,6 +73,27 @@ const AuditLogs: React.FC = () => {
       <div style={{ marginBottom: '32px' }}>
         <h2 style={{ fontSize: '1.875rem', marginBottom: '8px' }}>Action Audit Logs</h2>
         <p style={{ color: 'var(--text-secondary)' }}>Comprehensive history of all administrative actions, resource modifications, and system changes.</p>
+      </div>
+
+      {/* An audit log is read after something went wrong, and by then the
+          question is never "what happened" but "who was doing what". A
+          hundred rows in reverse-chronological order answers the first and
+          hides the second. */}
+      <div className="responsive-grid" style={{ marginBottom: '24px' }}>
+        <Card title="Actions performed">
+          <p style={chartNote}>
+            What this window is mostly made of. A destructive action appearing
+            at all is worth more attention than a common one appearing often.
+          </p>
+          <CategoryBars data={byAction} height={200} />
+        </Card>
+        <Card title="Busiest operators">
+          <p style={chartNote}>
+            Who is making the changes. An account here that nobody is sitting
+            at is the finding.
+          </p>
+          <CategoryBars data={byUser} height={200} />
+        </Card>
       </div>
 
       <div style={{ backgroundColor: 'var(--card-bg)', border: '1px solid var(--border-color)', borderRadius: '12px', overflow: 'hidden' }}>

@@ -114,14 +114,40 @@ curl -fsSL -H "X-Agent-Key: $AGENT_KEY" -o agent.zip "$SERVER_URL/api/agent/down
 unzip -q -o agent.zip
 chmod +x main 2>/dev/null || true
 
+# The CA this server signs with, if it signs with its own.
+#
+# Only for an https server: against http there is nothing to verify, and
+# against a certificate from a real CA the endpoint's trust store already has
+# it (the server answers 404 and this stays empty). Fetching it over the
+# connection it secures is trust on first use - the same trust the enrolment
+# token and the agent binary above already travel on in this very script.
+SERVER_CA=""
+case "$SERVER_URL" in
+  https://*)
+    if curl -fsSk -o "$INSTALL_DIR/rootCA.crt" "$SERVER_URL/api/agent/ca"        && [ -s "$INSTALL_DIR/rootCA.crt" ]; then
+      SERVER_CA="$INSTALL_DIR/rootCA.crt"
+      echo "[*] Stored the server CA for certificate verification."
+    else
+      rm -f "$INSTALL_DIR/rootCA.crt"
+      echo "[i] Server has no local CA; verifying against the system trust store."
+    fi
+    ;;
+esac
+
 # Write identity config
+#
+# No ingest_port: the agent derives it from server_url, so an https server
+# means telemetry goes to the TLS listener. Pinning 5001 here would have kept
+# every installed agent on the plaintext port no matter what the server was
+# configured to do.
 umask 077
 cat > "$INSTALL_DIR/config.json" <<EOF
 {{
   "agent_name": "$AGENT_NAME",
   "agent_key":  "$AGENT_KEY",
   "server_url": "$SERVER_URL",
-  "server_ip":  "$SERVER_IP"
+  "server_ip":  "$SERVER_IP",
+  "server_ca":  "$SERVER_CA"
 }}
 EOF
 chmod 600 "$INSTALL_DIR/config.json"
@@ -409,12 +435,33 @@ def _render_windows_install(server_url: str, server_ip: str, token: str) -> str:
             return
         }}
 
+        # See the Linux script for the reasoning. Only for an https server,
+        # and trust on first use over the same connection that just delivered
+        # main.exe.
+        $ServerCa = ""
+        if ($ServerUrl -like "https://*") {{
+            $CaPath = Join-Path $InstallDir "rootCA.crt"
+            try {{
+                Invoke-WebRequest -Uri "$ServerUrl/api/agent/ca" -OutFile $CaPath -UseBasicParsing -TimeoutSec 30
+                if ((Test-Path $CaPath) -and ((Get-Item $CaPath).Length -gt 0)) {{
+                    $ServerCa = $CaPath
+                    Write-Host "[*] Stored the server CA for certificate verification."
+                }}
+            }} catch {{
+                Write-Host "[i] Server has no local CA; verifying against the system trust store." -ForegroundColor DarkGray
+            }}
+        }}
+
+        # `ingest_port` is deliberately absent. It was pinned to 5001 here,
+        # which would have held every Windows agent on the plaintext listener
+        # regardless of how the server was configured - the agent derives the
+        # port from server_url instead, so https means the TLS one.
         $Config = @{{
             agent_name      = $AgentName
             agent_key       = $AgentKey
             server_url      = $ServerUrl
             server_ip       = $ServerIp
-            ingest_port     = 5001
+            server_ca       = $ServerCa
         }} | ConvertTo-Json -Depth 3
         $ConfigPath = Join-Path $InstallDir "config.json"
         # PS5.1 `Set-Content -Encoding UTF8` writes a BOM which Python's

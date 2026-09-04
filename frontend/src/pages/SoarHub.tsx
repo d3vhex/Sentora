@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useMemo } from 'react';
 import {
   Zap,
   Activity,
@@ -19,6 +19,22 @@ import {
 } from 'lucide-react';
 import { agentService } from '../services/api';
 import { Link } from 'react-router-dom';
+import { Card } from '../components/ui';
+import { CategoryBars, ShareDonut } from '../components/ui/charts';
+
+const chartNote: React.CSSProperties = {
+  margin: '0 0 var(--space-3)', color: 'var(--text-muted)',
+  fontSize: 'var(--text-xs)', maxWidth: '58ch',
+};
+
+/** Outcomes are states, so they take the semantic colours rather than a
+ *  series palette - a failed response should not be teal because it happened
+ *  to be the third slice. */
+const OUTCOME_TONE: Record<string, string> = {
+  Failed: 'var(--sev-critical)',
+  Pending: 'var(--sev-medium)',
+  Succeeded: 'var(--accent-success)',
+};
 
 // ── Action intelligence ──────────────────────────────────────────────────────
 type RiskLevel = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
@@ -215,6 +231,51 @@ const SoarHub: React.FC = () => {
   };
   const [searchTerm, setSearchTerm] = useState('');
 
+  /* Derived from the same rows the stream below renders, so the charts can
+     never disagree with the table under them. */
+  const _label = (a: any) => String(a.action || 'unknown').toUpperCase();
+  const _succeeded = (a: any) => a.status === 'success' || a.status === 'completed';
+  const _pending = (a: any) => a.status === 'active' || a.status === 'pending';
+
+  const byAction = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const a of allActionsCache) {
+      const key = _label(a);
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return [...counts.entries()]
+      .map(([name, value]) => ({ name, value }))
+      .sort((a, b) => b.value - a.value)
+      .slice(0, 6);
+  }, [allActionsCache]);
+
+  const byOutcome = useMemo(() => {
+    let ok = 0, failed = 0, pending = 0;
+    for (const a of allActionsCache) {
+      if (_succeeded(a)) ok++;
+      else if (a.status === 'failed') failed++;
+      else if (_pending(a)) pending++;
+    }
+    return [
+      { name: 'Succeeded', value: ok },
+      { name: 'Failed', value: failed },
+      { name: 'Pending', value: pending },
+    ];
+  }, [allActionsCache]);
+
+  const failuresByAction = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const a of allActionsCache) {
+      if (a.status !== 'failed') continue;
+      const key = _label(a);
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return [...counts.entries()]
+      .map(([name, value]) => ({ name, value }))
+      .sort((a, b) => b.value - a.value)
+      .slice(0, 6);
+  }, [allActionsCache]);
+
   const filteredActions = (filterMode === 'failed' 
     ? allActionsCache.filter(a => a.status === 'failed') 
     : allActionsCache
@@ -307,6 +368,37 @@ const SoarHub: React.FC = () => {
         <SoarStatCard label="Active IP Blocks" value={stats.activeBlocks} icon={<AlertTriangle color="var(--accent-warning)" />} color="var(--accent-warning)" />
         <SoarStatCard label="Pending Tasks" value={stats.pending} icon={<Clock color="var(--accent-secondary)" />} color="var(--accent-secondary)" />
         <SoarStatCard label="Failed Responses" value={stats.failed} icon={<ShieldAlert color="var(--accent-color)" />} color="var(--accent-color)" />
+      </div>
+
+      {/* Four counters say how much automation ran. They do not say whether
+          it worked, and a playbook that fires constantly and fails every time
+          scores well on all four. These two answer that: which actions the
+          rules actually reach for, and how those attempts end. */}
+      <div className="responsive-grid" style={{ marginBottom: '32px' }}>
+        <Card title="Actions taken">
+          <p style={chartNote}>
+            Which responses the rules reach for. One action carrying everything
+            usually means one rule is doing all the firing.
+          </p>
+          <CategoryBars data={byAction} />
+        </Card>
+        <Card title="How they ended">
+          <p style={chartNote}>
+            A response that was attempted is not a response that landed. Failures
+            here are threats that were detected and then not contained.
+          </p>
+          <ShareDonut data={byOutcome}
+                      colorFor={(row) => OUTCOME_TONE[row.name] ?? 'var(--chart-1)'} />
+        </Card>
+        <Card title="Failures by action">
+          <p style={chartNote}>
+            Empty is the healthy picture. A single action dominating this chart
+            is a broken playbook rather than a busy week - the same call failing
+            the same way every time.
+          </p>
+          <CategoryBars data={failuresByAction}
+                        colorFor={() => 'var(--sev-critical)'} />
+        </Card>
       </div>
 
       <div className="responsive-grid" style={{ alignItems: 'start' }}>
