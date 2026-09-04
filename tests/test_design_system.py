@@ -231,6 +231,90 @@ def test_the_dashboard_says_whether_a_command_would_reach_a_host():
     assert "channel_connected" in dashboard
 
 
+@pytest.mark.parametrize("page", PAGES, ids=lambda p: p.stem)
+def test_no_page_reaches_past_the_chart_wrappers(page):
+    """Recharts styles itself with props, not CSS. A page importing it
+    directly draws a white grid and a light tooltip on a black ground, and
+    picks its own series colours - which is how the console came to look like
+    three products the first time."""
+    source = page.read_text(encoding="utf-8")
+    assert "from 'recharts'" not in source, (
+        f"{page.name} imports recharts directly; use components/ui/charts so "
+        f"the palette and the axes stay in one place"
+    )
+
+
+def test_the_charted_pages_use_the_shared_palette():
+    """A chart is only consistent if its colours come from the tokens. Pages
+    that hardcode a hex are how a series colour comes to mean two things."""
+    charted = [p for p in PAGES
+               if "components/ui/charts" in p.read_text(encoding="utf-8")]
+    assert len(charted) >= 4, (
+        f"only {len(charted)} pages use the shared charts; the dashboard's "
+        f"visual language has not reached the rest of the console"
+    )
+
+
+#: Pages whose data is a distribution rather than a record. A table is the
+#: right way to read one row; it is the wrong way to see that four hundred of
+#: them are the same package, or that every failure belongs to one playbook.
+CHART_WORTHY = [
+    "Dashboard", "GlobalAlerts", "Agents", "AttackCoverage",
+    "FileIntegrity", "SoarHub", "ThreatIntel", "AgentDetail",
+    "Assets", "AuditLogs", "LoginLogs",
+]
+
+
+@pytest.mark.parametrize("stem", CHART_WORTHY)
+def test_the_pages_that_answer_a_distribution_draw_one(stem):
+    """The console had exactly one page with charts and twenty-three with
+    tables, so the dashboard looked like a different product from everything
+    it linked to. This is the list of pages where the shape of the data is
+    the answer, not a decoration on it."""
+    page = FRONTEND / "pages" / f"{stem}.tsx"
+    source = page.read_text(encoding="utf-8")
+    assert "components/ui/charts" in source, (
+        f"{stem} answers a 'how much of what' question and still only has a "
+        f"table"
+    )
+
+
+@pytest.mark.parametrize("stem", CHART_WORTHY)
+def test_the_chart_import_is_actually_rendered(stem):
+    """Importing a wrapper and never rendering it makes the page pass the
+    test above while looking exactly as it did before. Grep for the import is
+    not evidence of a chart; a `data=` prop on a wrapper is."""
+    source = (FRONTEND / "pages" / f"{stem}.tsx").read_text(encoding="utf-8")
+    wrappers = ("CategoryBars", "ShareDonut", "TrendChart", "SeriesLines")
+    rendered = [w for w in wrappers if re.search(rf"<{w}", source)]
+    assert rendered, f"{stem} imports the chart wrappers but renders none"
+
+    for wrapper in rendered:
+        assert re.search(rf"<{wrapper}[^>]*data=", source, re.S), (
+            f"{stem} renders <{wrapper}> with no data prop"
+        )
+
+
+def test_the_wrappers_let_a_caller_colour_a_state():
+    """Most series should take the neutral palette. But when the category *is*
+    a severity or an outcome, drawing "failed" in whatever colour the third
+    slice happened to get is the chart lying about its own data."""
+    source = CHARTS.read_text(encoding="utf-8")
+    for wrapper in ("CategoryBars", "ShareDonut"):
+        block = source[source.index(f"export function {wrapper}"):]
+        block = block[:block.index(chr(10) + "}" + chr(10))]
+        assert "colorFor" in block, f"{wrapper} cannot express a semantic colour"
+
+
+def test_the_line_chart_pins_its_axis():
+    """A percentage axis that rescales to its data draws 4% and 40% as the
+    same picture, which is the one thing a resource chart must not do."""
+    source = CHARTS.read_text(encoding="utf-8")
+    lines = source[source.index("export function SeriesLines"):
+                   source.index("export function ShareDonut")]
+    assert "domain ?? [0, 100]" in lines
+
+
 def test_the_attack_chain_is_reachable_from_a_host():
     """It answers a question about one machine, so it is reached from that
     machine rather than from the nav."""

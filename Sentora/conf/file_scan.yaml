@@ -6,6 +6,15 @@ target_dirs:
   windows:
     - "C:\\Users"
 
+# Directories that churn on every host and mean nothing when they do.
+#
+# `windows` was empty, and `modules/fim.py` did not read this key at all - so
+# the real-time watcher recorded every temp file, browser cache entry and pip
+# install under C:\Users as an integrity violation. Thousands an hour, with a
+# real change to a real file somewhere among them.
+#
+# The module now merges these with its own defaults rather than replacing
+# them, so adding one directory here does not silently un-exclude the rest.
 exclude_dirs:
   linux:
     - /proc
@@ -13,7 +22,11 @@ exclude_dirs:
     - /dev
     - /var/lib/docker
     - /run
-  windows: []
+  windows:
+    - "*\\AppData\\Local\\Temp\\*"
+    - "*\\AppData\\Local\\Packages\\*"
+    - "*\\node_modules\\*"
+    - "*\\$Recycle.Bin\\*"
 
 backup_extensions:
   - sql.gz

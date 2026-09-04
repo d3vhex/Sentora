@@ -647,10 +647,19 @@ async def main_async():
         print(f"{'='*70}\n")
     except KeyboardInterrupt:
         print("\n[!] Scan interrupted by user.")
-        sys.exit(1)
+        raise
     except Exception as e:
+        # Raised, not `sys.exit(1)`.
+        #
+        # This runs on a collector thread under `periodic_wrapped`, which
+        # catches Exception. `sys.exit` raises SystemExit, which inherits from
+        # BaseException and slips straight past that - so the thread died on
+        # the first failed scan and never ran again, silently, for the life of
+        # the agent. `portscan_result sent` appears zero times in the log of a
+        # host that had been up for days, and the Ports tab was empty with
+        # nothing anywhere saying why.
         print(f"\n[!] Unexpected error: {e}")
-        sys.exit(1)
+        raise
 
 def main():
     import sys

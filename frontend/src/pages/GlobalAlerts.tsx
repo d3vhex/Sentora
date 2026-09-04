@@ -15,8 +15,24 @@ import {
   RefreshCw
 } from 'lucide-react';
 import { agentService } from '../services/api';
+import { Card } from '../components/ui';
+import { CategoryBars } from '../components/ui/charts';
 
 import Fuse from 'fuse.js';
+
+const chartNote: React.CSSProperties = {
+  margin: '0 0 var(--space-3)', color: 'var(--text-muted)',
+  fontSize: 'var(--text-xs)', maxWidth: '58ch',
+};
+
+/** These categories *are* severities, so they take the semantic colours
+ *  rather than the chart palette. */
+const SEVERITY_BAR: Record<string, string> = {
+  Critical: 'var(--sev-critical)',
+  High: 'var(--sev-high)',
+  Medium: 'var(--sev-medium)',
+  Low: 'var(--sev-low)',
+};
 
 const GlobalAlerts: React.FC = () => {
   const [alerts, setAlerts] = useState<any[]>([]);
@@ -117,6 +133,27 @@ const GlobalAlerts: React.FC = () => {
     low: alerts.filter(a => a.severity === 'LOW').length
   };
 
+  /* Derived from the rows already on the page. A chart that needs its own
+     request is a chart that disagrees with the table under it. */
+  const severityBars = React.useMemo(() => ([
+    { name: 'Critical', value: stats.critical },
+    { name: 'High', value: stats.high },
+    { name: 'Medium', value: stats.medium },
+    { name: 'Low', value: stats.low },
+  ]), [stats.critical, stats.high, stats.medium, stats.low]);
+
+  const byAgent = React.useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const a of alerts) {
+      const host = a.agent || 'unknown';
+      counts.set(host, (counts.get(host) ?? 0) + 1);
+    }
+    return [...counts.entries()]
+      .map(([name, value]) => ({ name, value }))
+      .sort((a, b) => b.value - a.value)
+      .slice(0, 6);
+  }, [alerts]);
+
   return (
     <div>
       <div className="flex-responsive" style={{ justifyContent: 'space-between', marginBottom: '32px' }}>
@@ -132,11 +169,31 @@ const GlobalAlerts: React.FC = () => {
       </div>
 
       {/* Severity Stats */}
-      <div className="responsive-grid" style={{ marginBottom: '32px' }}>
-        <SeverityStat label="CRITICAL" count={stats.critical} color="var(--accent-color)" icon={<XCircle size={20} />} />
-        <SeverityStat label="HIGH" count={stats.high} color="#f97316" icon={<AlertTriangle size={20} />} />
-        <SeverityStat label="MEDIUM" count={stats.medium} color="var(--accent-warning)" icon={<AlertCircle size={20} />} />
-        <SeverityStat label="LOW" count={stats.low} color="var(--accent-secondary)" icon={<CheckCircle2 size={20} />} />
+      <div className="responsive-grid" style={{ marginBottom: 'var(--space-5)' }}>
+        <SeverityStat label="CRITICAL" count={stats.critical} color="var(--sev-critical)" icon={<XCircle size={20} />} />
+        <SeverityStat label="HIGH" count={stats.high} color="var(--sev-high)" icon={<AlertTriangle size={20} />} />
+        <SeverityStat label="MEDIUM" count={stats.medium} color="var(--sev-medium)" icon={<AlertCircle size={20} />} />
+        <SeverityStat label="LOW" count={stats.low} color="var(--sev-low)" icon={<CheckCircle2 size={20} />} />
+      </div>
+
+      {/* The two questions asked before reading a single alert: how bad, and
+          where. Both are answered by the rows already on this page, so they
+          cost nothing but the drawing. */}
+      <div className="responsive-grid" style={{ marginBottom: 'var(--space-5)' }}>
+        <Card title="By severity">
+          <p style={chartNote}>
+            The shape matters more than the total: a hundred alerts that are
+            all low is a quiet day, and three criticals is not.
+          </p>
+          <CategoryBars data={severityBars} colorFor={(row) => SEVERITY_BAR[row.name]} />
+        </Card>
+        <Card title="Noisiest hosts">
+          <p style={chartNote}>
+            Where the alerts are concentrated. One host carrying most of them
+            is usually one misconfiguration rather than an estate on fire.
+          </p>
+          <CategoryBars data={byAgent} />
+        </Card>
       </div>
 
       <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
