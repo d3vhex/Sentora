@@ -177,3 +177,155 @@ def test_the_written_config_is_valid_json():
     # Shell variables stand in for values; substitute something JSON-safe.
     literal = re.sub(r"\$[A-Z_]+", "x", body).strip()
     json.loads(literal)
+
+
+# --------------------------------------------------------------------------
+# Enrolment has to be possible in the first place
+# --------------------------------------------------------------------------
+
+def test_trust_is_established_before_the_first_network_call():
+    """The CA was fetched at the *end* of both installers, after registration
+    and after the binary download.
+
+    Against a self-signed server every one of those calls failed first, and
+    the CA that would have fixed them arrived two steps too late:
+
+        iwr : Temel alinan baglanti kapatildi: SSL/TLS guvenli kanali icin
+              guven iliskisi kurulamadi.
+
+    So enrolment - the one path a machine with no Sentora on it has to walk -
+    was impossible the moment TLS was turned on.
+    """
+    for name, script in (("linux", _linux("https://soc.example.com")),
+                         ("windows", _windows("https://soc.example.com"))):
+        ca_at = script.index("/api/agent/ca")
+        register_at = script.index("/api/agents/register")
+        download_at = script.index("/api/agent/download/")
+        assert ca_at < register_at, f"{name} registers before it trusts anything"
+        assert ca_at < download_at, f"{name} downloads before it trusts anything"
+
+
+def test_the_rest_of_the_install_verifies():
+    """The exception is for one request. Every call after it has the CA
+    available and must use it - otherwise the bypass has quietly become the
+    transport."""
+    linux = _linux("https://soc.example.com")
+    for call in ("/api/agents/register", "/api/agent/download/linux"):
+        line = next(l for l in linux.splitlines() if call in l)
+        assert "$CURL_CA" in line, f"{call} does not verify the server"
+
+    windows = _windows("https://soc.example.com")
+    assert r"Cert:\LocalMachine\Root" in windows, (
+        "the Windows installer never installs the CA, so every later call - "
+        "and any browser on the host - still cannot verify the console"
+    )
+
+
+def test_the_bypass_leaves_nothing_behind():
+    """The first version restored a static `ServerCertificateValidationCallback`
+    in a `finally`, which was the right instinct about the wrong mechanism -
+    that callback cannot work on PS 5.1 at all (see below).
+
+    `curl.exe` needs no restoring: the exception lives and dies with a child
+    process, so nothing in the PowerShell session is left unverified. This
+    pins that property rather than the old ceremony - if the fetch ever moves
+    back in-process, it has to reintroduce the restore too.
+    """
+    code = _executable(_windows("https://soc.example.com"))
+    fetch = code[code.index("$CaPath = Join-Path"):]
+    fetch = fetch[:fetch.index("Import-Certificate")]
+
+    assert "curl.exe" in fetch, "the first-contact fetch is in-process again"
+    assert "ServicePointManager" not in fetch, (
+        "process-wide TLS state is being changed; if that is deliberate it "
+        "has to be restored, and a script-block callback still will not work"
+    )
+
+
+def test_no_bypass_when_there_is_nothing_to_bypass():
+    """An http:// server has no certificate to distrust, and adding `-k`
+    there would be a habit that outlives the reason for it."""
+    linux = _linux("http://10.0.0.5:8000")
+    assert "curl -fsSk" not in linux.split("case \"$SERVER_URL\"")[0]
+
+
+@pytest.mark.parametrize("scheme,self_signed,expect_bypass", [
+    ("https", True, True),      # our own CA: nothing trusts it yet
+    ("https", False, False),    # a real certificate: the snippet must stay clean
+    ("http", True, False),      # no TLS at all
+])
+def test_the_console_hands_out_a_command_that_can_run(scheme, self_signed, expect_bypass):
+    """The one-liner is the first thing a new host runs, and it was emitted
+    without regard to whether anything could verify the server."""
+    app_py = (ROOT / "app.py").read_text(encoding="utf-8")
+    block = app_py[app_py.index('"install": {') - 3000:app_py.index('"install": {')]
+    assert "ca_certificate()" in block, (
+        "the enrolment snippet is built without checking whether this server "
+        "signs with its own CA"
+    )
+    assert 'proto == "https"' in block, \
+        "the snippet would carry a TLS exception on a plain-http server"
+
+
+# --------------------------------------------------------------------------
+# The bypass has to actually run
+# --------------------------------------------------------------------------
+
+def _executable(script: str) -> str:
+    """The script with its comment lines stripped.
+
+    The comments here warn about the exact construct they name, so matching
+    the raw text finds the warning and reads it as the code. That has now
+    caught seven tests in this suite.
+    """
+    return "\n".join(line for line in script.splitlines()
+                     if not line.strip().startswith("#"))
+
+
+def test_no_script_block_is_used_as_a_certificate_callback():
+    """`ServerCertificateValidationCallback = {$true}` is the form everyone
+    reaches for, and on PowerShell 5.1 it does not work.
+
+    .NET invokes the callback on an I/O thread that has no runspace, so the
+    script block itself throws:
+
+        PSInvalidOperationException: There is no Runspace available to run
+        scripts in this thread. The script block you attempted to invoke
+        was: $true
+
+    What the operator sees is "an unexpected error occurred on a send", which
+    reads as a TLS failure. An hour went into protocol versions, cipher
+    suites, ALPN and IPv6 before the inner exception was unwrapped. Any fix
+    here has to be a compiled type or an out-of-process client - never a
+    script block.
+    """
+    code = _executable(_windows("https://soc.example.com"))
+    assert "ServerCertificateValidationCallback" not in code, (
+        "the installer sets a certificate callback again; on PS 5.1 a script "
+        "block there fails on a thread with no runspace"
+    )
+
+
+def test_the_first_contact_fetch_runs_out_of_process():
+    """`curl.exe` ships with Windows 10 1803 and later, has no runspace to
+    lose, and confines the exception to one request with no static state left
+    behind for the rest of the session."""
+    code = _executable(_windows("https://soc.example.com"))
+    assert "curl.exe -fsSk" in code
+
+    missing = _executable(_windows("https://soc.example.com"))
+    assert "Get-Command curl.exe" in missing, (
+        "nothing says what to do on a Windows old enough to lack curl.exe"
+    )
+
+
+def test_the_console_snippet_avoids_the_same_trap():
+    """The one-liner is the first thing anybody runs, and it had the same
+    broken callback in it."""
+    app_py = (ROOT / "app.py").read_text(encoding="utf-8")
+    block = app_py[app_py.index("self_signed = product_tls.ca_certificate()"):]
+    block = block[:block.index('"install": {')]
+    executable = "\n".join(l for l in block.splitlines()
+                           if not l.strip().startswith("#"))
+    assert "ServerCertificateValidationCallback" not in executable
+    assert "curl.exe -fsSk" in executable

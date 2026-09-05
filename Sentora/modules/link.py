@@ -115,9 +115,20 @@ class AgentLinkClient:
     """
 
     def __init__(self, server_url: str, agent_key: str, dispatch,
-                 *, agent_name: str = "", open_stream=None):
+                 *, agent_name: str = "", open_stream=None, ca_cert=None):
         self.server_url = (server_url or "").rstrip("/")
         self.agent_key = agent_key
+        # PEM bundle for a self-signed server, or None to verify against the
+        # system trust store.
+        #
+        # This was missing, and the shape of the failure is why it matters
+        # more than it looks. `server_ca` reached the telemetry socket and
+        # stopped there, so against a self-signed server the agent shipped
+        # telemetry over TLS quite happily and could not open its channel at
+        # all - and since the endpoint no longer listens on a port of its own,
+        # that is an agent which reports and cannot be reached. Config,
+        # console, SOAR and the screen stream all travel here.
+        self.ca_cert = ca_cert or None
         self.dispatch = dispatch
         # `open_stream(kind, args) -> object with read/write/close`, supplied
         # by the caller so this module stays ignorant of what a console or a
@@ -138,6 +149,10 @@ class AgentLinkClient:
         #: continuous capture from pushing a reply past the server's deadline.
         self._control_waiting = 0
         self._control_lock = threading.Lock()
+        #: One diagnostic, not one per reconnect. The condition it reports
+        #: does not change between attempts, and a reconnect loop that prints
+        #: the same paragraph every two seconds buries the thing it explains.
+        self._explained_tls = False
         self.connected = False
         self.last_error = ""
 
@@ -178,6 +193,7 @@ class AgentLinkClient:
             except Exception as e:
                 self.last_error = str(e)
                 print(f"[link] channel closed: {e}", flush=True)
+                self._explain_once_if_the_server_speaks_tls()
 
             if self._stop.is_set():
                 return
@@ -187,6 +203,52 @@ class AgentLinkClient:
             wait = min(delay, RECONNECT_MAX_S)
             self._stop.wait(wait * (0.5 + random.random()))
             delay = min(delay * 2, RECONNECT_MAX_S)
+
+    def _explain_once_if_the_server_speaks_tls(self) -> None:
+        """Name the cause when a plain `ws://` agent meets an HTTPS server.
+
+        Turning on TLS breaks the channel of every agent already installed:
+        `config.json` still says `http://`, so this dials `ws://`, and the
+        server now answers only TLS on that port. What the agent reports is
+
+            [link] channel closed: Connection to remote host was lost.
+
+        which is true and useless. Telemetry keeps flowing on its own port, so
+        the host looks healthy while being uncommandable - and with no
+        listener on the endpoint any more, uncommandable is unreachable.
+
+        So: probe once, and only after a failure. If a TLS handshake succeeds
+        against the same address this just failed to reach in the clear, the
+        answer is not ambiguous and the agent should say it rather than leave
+        an operator reading a reconnect loop.
+        """
+        import socket
+        import ssl as _ssl
+
+        if self._explained_tls or not self.channel_url().startswith("ws://"):
+            return
+        self._explained_tls = True
+
+        target = self.channel_url()[len("ws://"):].split("/", 1)[0]
+        host, _, port = target.partition(":")
+        try:
+            with socket.create_connection((host, int(port or 80)), timeout=5) as raw:
+                # Verification deliberately off: the question is "does anything
+                # here speak TLS", not "do we trust it", and a self-signed
+                # certificate is the likeliest thing on the other end.
+                context = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+                context.check_hostname = False
+                context.verify_mode = _ssl.CERT_NONE
+                with context.wrap_socket(raw, server_hostname=host):
+                    pass
+        except Exception:
+            return      # not a TLS server; the failure is something else
+
+        print(f"[link] {host}:{port or 80} is serving TLS, and this agent is "
+              f"configured for http:// - so telemetry still flows and no "
+              f"command can reach this host. Set server_url to https://{target} "
+              f"in config.json and give it the server's CA as server_ca "
+              f"(GET /api/agent/ca), then restart the agent.", flush=True)
 
     # -- one session -------------------------------------------------------
 
@@ -205,11 +267,18 @@ class AgentLinkClient:
         # would leave a window where the agent is connected and unidentified -
         # short, but it is the window a reconnect storm lives in, and the
         # version is most wanted exactly when something is going wrong.
+        # Only when we have one: `websocket-client` verifies against the
+        # system trust store by default, which is right for a real
+        # certificate, and passing `ca_certs=None` explicitly is not the same
+        # thing on every version of the library.
+        sslopt = {"ca_certs": self.ca_cert} if self.ca_cert else None
+
         ws = websocket.create_connection(
             url,
             header=[f"X-Agent-Key: {self.agent_key}",
                     f"X-Agent-Version: {AGENT_VERSION}"],
-            timeout=SOCKET_TIMEOUT_S)
+            timeout=SOCKET_TIMEOUT_S,
+            **({"sslopt": sslopt} if sslopt else {}))
         self._ws = ws
         self.connected = True
         self.last_error = ""

@@ -201,6 +201,76 @@ def mark_sent(table: str, ids: list):
             cur.execute(query, (ids,))
         conn.commit()
 
+def reoffer_recent(table: str, limit: int) -> int:
+    """Mark the newest `limit` rows unsent again, and say how many.
+
+    For one situation: the server's database for this agent has been recreated
+    and no longer holds what `sent` claims it does. `sent` is the agent's
+    private record of the server's contents, so a server-side reset is
+    invisible from here - and a row marked sent is never offered again. Tables
+    that produce rows constantly refill on their own, so the damage lands
+    entirely on the quiet ones: a host sat holding 93 port-scan rows against a
+    server holding none, with nothing wrong at either end.
+
+    Bounded, and that bound is the point. `hardware_inventory` on one host
+    holds 530,000 rows; re-offering all of them at fifty per batch is a replay
+    measured in days, during which nothing current gets through. The newest
+    rows are the ones worth having back, and the tables this actually rescues
+    are small enough to be covered completely.
+
+    The resend is safe because the server deduplicates: rows it already holds
+    are recognised and skipped rather than stored twice.
+    """
+    query = (f"UPDATE {table} SET sent = FALSE WHERE id IN "
+             f"(SELECT id FROM {table} ORDER BY id DESC LIMIT %s)")
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, (limit,))
+            changed = cur.rowcount
+        conn.commit()
+    return changed if changed and changed > 0 else 0
+
+
+def prune_sent(table: str, keep: int) -> int:
+    """Drop rows the server already has, beyond the newest `keep`.
+
+    Nothing pruned this table before, and the agent is append-only, so the
+    local database grew for the life of the install. On one host after a few
+    weeks: 530,428 rows of `hardware_inventory`, 225,145 of
+    `network_connections`, 88,201 of `fim_data` - every one of them marked
+    sent, none of them ever read again. That is disk on a monitored endpoint,
+    which is the one place a monitoring tool has no business consuming.
+
+    It also constrains recovery. `reoffer_recent` has to be bounded because
+    replaying half a million rows at fifty a batch takes days, so the backlog
+    was actively limiting how much could be rescued after a server reset.
+
+    Two rules, and both matter:
+
+    Only `sent` rows. An unsent row has not reached the server, and deleting
+    it is the data loss this whole module has spent the day preventing.
+
+    Always keep the newest `keep`, which is set comfortably above
+    `_REOFFER_LIMIT` so a server-side reset still has rows to offer again.
+
+    The delete is bounded by a threshold id rather than `NOT IN (...)`: one
+    index lookup and a range scan instead of a comparison against a five
+    thousand row list, on a table that may hold half a million.
+    """
+    query = (
+        f"DELETE FROM {table} WHERE sent = TRUE AND id < "
+        f"(SELECT id FROM {table} ORDER BY id DESC LIMIT 1 OFFSET %s)"
+    )
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # Fewer rows than `keep` means the subquery is NULL, `id < NULL`
+            # is NULL, and nothing is deleted - which is the right answer.
+            cur.execute(query, (keep,))
+            removed = cur.rowcount
+        conn.commit()
+    return removed if removed and removed > 0 else 0
+
+
 def fetch_one(table: str, where: str = "1=1", params: tuple = (), order_by: str = None):
     query = f"SELECT * FROM {table} WHERE {where}"
     if order_by:
