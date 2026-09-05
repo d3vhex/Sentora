@@ -114,6 +114,18 @@ services:
       OLLAMA_BASE_URL: http://ollama:11434/api
       OLLAMA_MODEL: llama3.2:3b
       WORKERS: 1
+      # Generated TLS material goes in the data volume, beside data/fernet.key
+      # and for the same reasons: it is state, it has to survive a rebuild,
+      # and it is the one directory this image prepares for the unprivileged
+      # user the container runs as.
+      #
+      # `/app/certs` is where it went first, and that failed on the first boot
+      # with TLS on: the directory ships inside the image owned by root, the
+      # server runs as `sentora`, and generation died with
+      # "Permission denied: '/app/certs/rootCA.key'". Refusing to fall back to
+      # plain HTTP is correct, so the container restart-looped instead - the
+      # right behaviour making a packaging mistake impossible to miss.
+      TLS_DIR: /app/data/certs
       # core/mq.py falls back to guest:guest when this is unset, which would
       # silently break publishing the moment the broker credentials change.
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-sentora}:${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set in .env}@rabbitmq/
@@ -130,18 +142,6 @@ services:
       # made all previously encrypted agent telemetry unreadable. Back this
       # volume up — there is no key rotation path.
       - sentora_data:/app/data
-      # TLS material, on the same footing as the Fernet key above: generated
-      # on first boot by this container and needed for the life of the
-      # deployment. Without a volume it lived in the image layer and was
-      # regenerated on every `--build`, which changes the deployment's TLS
-      # identity - every agent that had been given the CA to trust would stop
-      # verifying, and stop reporting, after a routine rebuild.
-      #
-      # `app` mounts it read-write and is the only writer. `ingest` mounts the
-      # same volume read-only, for exactly the reason the data volume gives:
-      # a second process that can generate its own would hold a certificate
-      # the first one does not.
-      - sentora_certs:/app/certs
     # The whole host filesystem used to be bind-mounted here as
     # `/:/host_disk:ro`, so that the dashboard could show one disk-usage
     # percentage. That handed /etc/shadow, every SSH key and every other
@@ -168,6 +168,11 @@ services:
     environment:
       OLLAMA_BASE_URL: http://ollama:11434/api
       OLLAMA_MODEL: llama3.2:3b
+      # The same directory `app` writes the certificate to. A container path,
+      # not a deployment preference, which is why it is here rather than in
+      # .env - and it has to be on both services or this one looks in
+      # /app/certs and reports a certificate that was never missing.
+      TLS_DIR: /app/data/certs
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-sentora}:${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set in .env}@rabbitmq/
     depends_on:
       db:
@@ -195,10 +200,12 @@ services:
       # `app` owns the volume and creates the key on first boot. Mounting it
       # read-only here means a container that starts before that cannot
       # quietly generate a different one and decrypt nothing.
+      # Read-only, which is also what makes the TLS arrangement work: `app`
+      # generates the certificate into this volume and this process only reads
+      # it. Two processes generating independently would each hold a
+      # certificate the other does not, and an agent that verified the console
+      # would then fail against ingest for no visible reason.
       - sentora_data:/app/data:ro
-      # Same arrangement, same reason: `app` generates the certificate, this
-      # process reads it. See `server._ingest_tls_context`.
-      - sentora_certs:/app/certs:ro
 
   rabbitmq:
     image: rabbitmq:3-management
@@ -365,8 +372,8 @@ services:
 volumes:
   mysql_data:
   opensearch_data:
+  # Holds data/fernet.key and data/certs/. Losing the key makes previously
+  # encrypted telemetry unreadable; losing the certificates is survivable - a
+  # new pair is generated - but every agent holding the old CA stops verifying
+  # the server and stops sending until it is re-pointed.
   sentora_data:
-  # Back this up with the Fernet key. Losing it is not fatal - a new
-  # certificate is generated - but every agent holding the old CA stops
-  # verifying the server and stops sending until it is re-pointed.
-  sentora_certs:
