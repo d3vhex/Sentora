@@ -42,6 +42,10 @@ const STATE_TONE: Record<string, Tone> = {
   'send failing': 'critical',
   'not collected': 'high',
   'no table': 'medium',
+  // Not critical: the rows went to a database that has since been recreated,
+  // which is history rather than an active fault. It used to be reported as
+  // `lost in transit` and sent people hunting a bug that was not there.
+  'server reset': 'low',
   queued: 'low',
   empty: 'neutral',
   flowing: 'ok',
@@ -52,9 +56,10 @@ const STATE_RANK: Record<string, number> = {
   'send failing': 1,
   'not collected': 2,
   'no table': 3,
-  queued: 4,
-  empty: 5,
-  flowing: 6,
+  'server reset': 4,
+  queued: 5,
+  empty: 6,
+  flowing: 7,
 };
 
 const rank = (s: string) => STATE_RANK[s] ?? 99;

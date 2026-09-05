@@ -386,8 +386,12 @@ async def download_ca(request):
     PEM written to disk fails later with a message about the certificate
     format, at a point far from the cause.
     """
-    ca = pathlib.Path(__file__).resolve().parent / "certs" / "rootCA.crt"
-    if not ca.exists():
+    # Resolved through `core.tls`, not from a path written out again here. The
+    # directory moves with TLS_DIR, and a second copy of the path is how the
+    # route that hands out the CA comes to look somewhere the generator never
+    # wrote to.
+    ca = product_tls.ca_certificate()
+    if ca is None:
         return json({
             "error": "no_local_ca",
             "message": "This server has no self-signed CA. That is expected "
@@ -737,14 +741,59 @@ async def enroll_agent(request):
     proto = "https" if request.scheme == "https" else "http"
     host = request.host
     base = f"{proto}://{host}"
+
+    # A command that cannot work is worse than no command.
+    #
+    # These were emitted unconditionally, and on a self-signed deployment
+    # neither one can fetch the script it is supposed to run:
+    #
+    #   iwr : Temel alinan baglanti kapatildi: SSL/TLS guvenli kanali icin
+    #         guven iliskisi kurulamadi.
+    #
+    # Nothing on the endpoint trusts this CA yet - the installer is what puts
+    # it there - so enrolment cannot begin. The console handed out a broken
+    # one-liner and said nothing about why.
+    #
+    # So when this server signs with its own CA, the snippet fetches the
+    # script with certificate validation suspended for that one request. That
+    # is the same trust on first use the enrolment token in this URL already
+    # depends on; the script it fetches installs the CA properly, and
+    # everything after that verifies.
+    #
+    # `curl.exe` on Windows, not Invoke-WebRequest with a validation callback.
+    # The obvious form,
+    #
+    #   [Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
+    #
+    # is a PowerShell script block, and .NET invokes it on an I/O thread with
+    # no runspace. The callback itself throws, and what reaches the operator
+    # is "an unexpected error occurred on a send" - which reads as a TLS
+    # failure and sends you looking at protocol versions and cipher suites.
+    # It cost an hour of exactly that. `curl.exe` ships with Windows 10 1803
+    # and later, runs out of process, and leaves no static state to restore.
+    self_signed = product_tls.ca_certificate() is not None
+    linux = f"curl -fsSL '{base}/api/agent/deploy/linux?token={token}' | sudo bash"
+    windows = f"iwr -useb '{base}/api/agent/deploy/windows?token={token}' | iex"
+    if self_signed and proto == "https":
+        linux = (f"curl -fsSLk '{base}/api/agent/deploy/linux?token={token}' "
+                 f"| sudo bash")
+        windows = (
+            f"iex (curl.exe -fsSk "
+            f"'{base}/api/agent/deploy/windows?token={token}' | Out-String)"
+        )
+
     return sanic_json({
         "status": "success",
         "token": token,
         "expires_at": expires_at.strftime("%Y-%m-%d %H:%M:%S"),
         "server_url": base,
+        # Whether the snippets carry a first-contact exception, so the UI can
+        # say why rather than leaving somebody to wonder what the extra line
+        # is doing.
+        "self_signed": self_signed and proto == "https",
         "install": {
-            "linux":   f"curl -fsSL '{base}/api/agent/deploy/linux?token={token}' | sudo bash",
-            "windows": f"iwr -useb '{base}/api/agent/deploy/windows?token={token}' | iex",
+            "linux": linux,
+            "windows": windows,
         }
     })
 
@@ -7118,7 +7167,58 @@ def _server_table_counts(agent: str, tables) -> dict:
     return counts
 
 
-def _classify_link(agent_side: dict, server_rows) -> tuple[str, str]:
+def _agent_db_created_at(agent: str):
+    """When this agent's database on the server was created, or None.
+
+    The missing half of the "lost in transit" verdict. A table the agent has
+    shipped and the server does not hold reads as "accepted and discarded",
+    and that is one of two very different situations:
+
+      the server took the rows and threw them away        - a real fault
+      the server's database was recreated after they were sent
+
+    The second is ordinary - a re-enrolment, a deleted agent, a fresh volume -
+    and the rows are simply gone rather than being dropped on the floor now.
+    Reporting it as the first sent somebody hunting a bug that is not there,
+    twice in one day, so the timestamp is worth one query.
+    """
+    db = _agent_name_forms(agent)[1] + "_db"
+    try:
+        with sync_mysql_conn() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    f"SELECT created_at FROM {_quote_identifier(db)}"
+                    f".ingest_epoch WHERE id = 1")
+                row = cursor.fetchone()
+                return row[0] if row else None
+            finally:
+                cursor.close()
+    except Exception:
+        # No epoch table means a database older than the stamp. Unknown is a
+        # fine answer; it just costs the sharper wording below.
+        return None
+
+
+def _shipped_before(last_sent_at, db_created_at) -> bool:
+    """Whether this table was last shipped before the server's database existed.
+
+    `last_sent_at` is a unix timestamp from the agent; `db_created_at` is a
+    MySQL DATETIME. Both are naive UTC on every deployment this runs on, and a
+    comparison that cannot be made confidently returns False - the sharper
+    wording is a bonus, and claiming a reset that did not happen would be a
+    worse error than the vague verdict it replaces.
+    """
+    if last_sent_at is None or db_created_at is None:
+        return False
+    try:
+        created = db_created_at.timestamp()
+    except AttributeError:
+        return False
+    return float(last_sent_at) < created
+
+
+def _classify_link(agent_side: dict, server_rows, db_created_at=None) -> tuple[str, str]:
     """Where the chain is broken for one table, if it is.
 
     The whole point of this file. Each of these states looked identical from
@@ -7142,6 +7242,14 @@ def _classify_link(agent_side: dict, server_rows) -> tuple[str, str]:
     if shipped == 0 and unsent > 0:
         return ("queued", f"{unsent} row(s) collected and none shipped yet")
     if shipped > 0 and server_rows == 0:
+        # Two very different situations look identical here, and calling both
+        # of them "discarded" sent somebody hunting a bug that was not there.
+        if _shipped_before(agent_side.get("last_sent_at"), db_created_at):
+            return ("server reset",
+                    f"the agent last shipped this before this server's "
+                    f"database for it was created - the {shipped} row(s) went "
+                    f"to a database that no longer exists, and rows already "
+                    f"marked sent are re-offered once, bounded")
         # The state that was invisible. The agent's log says "sent (50 rows)"
         # every cycle and the server holds none of them.
         return ("lost in transit",
@@ -7188,12 +7296,15 @@ async def get_telemetry_health(request, agent):
     agent_tables = (body or {}).get("tables") or {}
     server = await asyncio.to_thread(
         _server_table_counts, agent, sorted(agent_tables))
+    # One query, so "shipped to a database that no longer exists" can be told
+    # apart from "shipped and discarded".
+    db_created_at = await asyncio.to_thread(_agent_db_created_at, agent)
 
     report = []
     for table in sorted(agent_tables):
         side = agent_tables[table] or {}
         rows = server.get(table, {}).get("rows")
-        state, detail = _classify_link(side, rows)
+        state, detail = _classify_link(side, rows, db_created_at)
         report.append({
             "table": table,
             "state": state,
@@ -7206,6 +7317,9 @@ async def get_telemetry_health(request, agent):
             "server_rows": rows,
         })
 
+    # `server reset` is deliberately not counted as broken. The rows are gone
+    # and nothing is wrong now - counting it would keep the banner red over a
+    # condition that resolves itself on the next re-offer.
     broken = [r for r in report if r["state"] in
               ("lost in transit", "send failing", "not collected")]
     return sanic_json({

@@ -185,117 +185,357 @@ attribute the source IP.
 
 ## 3. TLS / Certificate Handling
 
-> **These settings did nothing until recently.** `TLS_ENABLED`, `TLS_CERT` and
-> `TLS_KEY` were described in this guide, in `.env.example`, and in the
-> instructions `certs/generate_certs.py` prints when it finishes — and read by
-> no line of code. Setting `TLS_ENABLED=1` produced a console that came up
-> cleanly on plain HTTP while its operator had every reason to believe it was
-> HTTPS, with the login form and the session cookie crossing the network in
-> clear text. If you are upgrading from a build before this section changed,
-> **assume the console was never encrypted** and rotate any credential that was
-> typed into it.
+> **If you are upgrading from a build before this section changed, assume the
+> console was never encrypted.** `TLS_ENABLED`, `TLS_CERT` and `TLS_KEY` were
+> described in this guide, in `.env.example`, and in the instructions
+> `certs/generate_certs.py` prints when it finishes — and read by no line of
+> code. Setting `TLS_ENABLED=1` produced a console that came up cleanly on
+> plain HTTP while its operator had every reason to believe it was HTTPS, with
+> the login form and the session cookie crossing the network in clear text.
+> Rotate any credential that was typed into it.
 
-### 3.1 Three patterns
+Everything below was verified by turning it on against a running stack, and
+then against a real agent. Six things were wrong that no test caught, because
+each needed a real container, a real certificate and a real handshake to
+appear; they are called out in place, because each is a way the same mistake
+gets made again.
 
-1. **Reverse proxy terminates TLS (recommended).** App listens on plain HTTP
-   at `:8000`, ingest plain TCP at `:5001`. Rotation is a proxy reload. Set
-   `SESSION_COOKIE_SECURE=1` by hand — TLS terminating at a proxy is invisible
-   from inside the app, so nothing can infer it for you.
-2. **App container terminates TLS.** Cert at `certs/server.crt` + `.key`, and
-   in `.env`:
-   ```ini
-   TLS_ENABLED=1
-   TLS_CERT=/app/certs/server.crt
-   TLS_KEY=/app/certs/server.key
-   ```
-   Rotation requires `docker compose restart app ingest`. Both read the same
-   pair; `app` is the only writer.
-3. **Self-signed, lab only.** With `TLS_ENABLED=1` and no certificate
-   present, the app generates one on first boot into the `sentora_certs`
-   volume; `python certs/generate_certs.py --force` replaces it. Each
-   deployment gets its own key, and the key never leaves the machine that made
-   it — nothing is bundled any more, because a committed private key gave
-   every install the same published TLS identity. Browsers will warn: the CA
-   is self-signed and trusts nothing. Use a real certificate for anything
-   reachable beyond your own network.
+Three of the six were the same defect in different clothes: the agent's CA
+reaching one connection and not the next. If you take one thing from this
+section, take that -- trust is a property of the host, and wiring it per
+connection guarantees you will miss one.
 
-**A certificate that cannot be loaded stops the server.** `TLS_ENABLED=1` with
-a missing, unreadable or mismatched pair exits with a message naming the file,
-rather than falling back to plain HTTP. Falling back is how the original
-problem would come back wearing an error nobody reads in a container log.
+### 3.1 What TLS covers
 
-### 3.1.1 What the agent has to trust
+Three connections, and **all three have to work or the deployment is worse
+than it was**:
 
-Against a self-signed server the agent verifies and therefore fails, which is
-correct — an unverified TLS connection is encrypted to whoever answered. Give
-it the CA:
+| Connection | Plain | TLS | Carries |
+| :--- | :--- | :--- | :--- |
+| Operator → console | `http://host:8000` | `https://host:8000` | The session cookie and every credential |
+| Agent → ingest | `host:5001` | `host:5011` | All telemetry: logs, paths, process names, hostnames |
+| Agent → channel | `ws://host:8000/agent-link` | `wss://host:8000/agent-link` | Config push, SOAR execute, console, screen stream |
+
+The third is the one that bites. The agent opens the channel; the server never
+dials an endpoint, and since the agent stopped listening on a port of its own
+there is no second route to a host. **An agent whose channel is down but whose
+telemetry still flows looks healthy and cannot be commanded** — the console
+shows it reporting, and nothing reaches it.
+
+### 3.2 Turning it on
+
+```ini
+# .env
+TLS_ENABLED=1
+TLS_CN=soc.example.com          # the name agents and browsers will use
+```
+
+That is enough. On first boot `app` generates a CA and a server certificate
+for this deployment, `ingest` reads the same pair and opens `5011`, and the
+channel URL becomes `wss://` because the agent derives it from `server_url`.
+
+`INGEST_TLS_PORT` moves the encrypted telemetry port off `5011`. Both sides
+have to agree, and only one of them reads this variable — the agent derives
+`5011` from the `https://` scheme and has no way to learn you changed it — so
+an agent pointed at a moved port needs `--ingest-port` to match. Leave it
+alone unless something else already owns `5011`.
+
+For a certificate you already have:
+
+```ini
+TLS_ENABLED=1
+TLS_CERT=/app/data/certs/fullchain.pem
+TLS_KEY=/app/data/certs/privkey.pem
+```
+
+Both or neither. Setting one alone is refused at startup — half a
+configuration looks deliberate, and filling the other half from a generated
+certificate would serve TLS the operator did not configure and will not know
+is in use.
+
+**A certificate that cannot be loaded stops the server.** Missing, unreadable
+or mismatched, it exits with a message naming the file rather than falling
+back to plain HTTP. Falling back is how the original problem comes back
+wearing an error nobody reads in a container log.
+
+#### Where the generated material lives
+
+`TLS_DIR`, which compose sets to `/app/data/certs` — inside the `sentora_data`
+volume, beside `data/fernet.key` and for the same reasons: it is state, it has
+to survive a rebuild, and it is the one directory the image prepares for the
+unprivileged user the container runs as.
+
+> **This is the first thing that was wrong.** It went to `/app/certs`, which
+> ships inside the image owned by root while the server runs as `sentora`.
+> The first boot with TLS on died with
+> `Permission denied: '/app/certs/rootCA.key'`, and because refusing to
+> downgrade is correct, the container restart-looped instead of serving
+> something weaker. The right behaviour turned a packaging mistake into an
+> outage rather than a silent downgrade — which is the trade this whole
+> section is built on.
+
+A regenerated certificate is a **new identity for the deployment**. Every
+agent holding the old CA stops verifying and stops reporting. Keep `TLS_DIR`
+on a volume, and back that volume up.
+
+`ingest` mounts the volume read-only and only ever reads. Two processes
+generating independently would each hold a certificate the other does not, and
+an agent that verified the console would then fail against ingest for no
+visible reason. On a cold start `ingest` may lose the race and log
+
+```
+[!] ingest TLS was requested and cannot be served: no certificate at
+    certs/server.crt yet. `app` generates it on first boot...
+```
+
+`restart: always` brings it back once `app` has written the pair. One or two
+of those lines on a first boot is expected; a stream of them means the two
+services are not sharing a volume.
+
+### 3.3 What the agent has to trust
+
+Against a self-signed server the agent verifies and therefore **fails**, which
+is correct — an unverified TLS connection is encrypted to whoever answered,
+which against an attacker on the path is what not encrypting it would have
+achieved. So the agent needs the CA:
 
 ```jsonc
 // config.json, beside agent_name / agent_key / server_url
 {
   "server_url": "https://soc.example.com:8000",
-  "server_ca": "C:\Sentora\rootCA.crt"
+  "server_ca":  "C:\\Program Files\\Sentora-Agent\\rootCA.crt"
 }
 ```
 
-`SENTORA_CA_CERT` and `--ca` do the same thing. Copy `certs/rootCA.crt` from
-the server — the certificate, never `rootCA.key`.
+`SENTORA_CA_CERT` and `--ca` do the same thing. The installer fetches it
+automatically from `/api/agent/ca` when `server_url` is `https://`.
 
-The transport is derived from `server_url`, not configured separately: an
-`https://` console means telemetry goes to `5011` inside TLS and the channel
-goes to `wss://`. Two settings that had to agree, with nothing making them
-agree, would be wrong in exactly the deployment that believed it was
+For an agent you are **re-pointing** rather than reinstalling, take the CA out
+of the server instead of downloading it:
+
+```powershell
+cd C:\path\to\Sentora
+docker compose cp app:/app/data/certs/rootCA.crt "$env:USERPROFILE\Desktop\rootCA.crt"
+
+# then, from an *elevated* shell - the step above cannot do this one:
+Copy-Item "$env:USERPROFILE\Desktop\rootCA.crt" "C:\Program Files\Sentora-Agent\rootCA.crt" -Force
+```
+
+Two commands, because `docker compose cp` writes the file as *you*, not as the
+Docker daemon, and that fails against `C:\Program Files` even from an elevated
+shell — `open ...: Access is denied`. Land it somewhere you own, then move it
+with a shell that can write there.
+
+That is out of band — it never crosses the network — so it sidesteps the
+trust-on-first-use caveat above entirely, and it avoids a trap on Windows:
+`Invoke-WebRequest -SkipCertificateCheck` is PowerShell 7+ only. On Windows
+PowerShell 5.1 that parameter does not exist, the download fails, and if you
+have already rewritten `config.json` the agent is now pointed at `https://`
+with a `server_ca` that is not there. Put the file in place **before**
+restarting the agent.
+
+That endpoint serves the CA **certificate** and never `rootCA.key`. The
+certificate is the half of the pair whose purpose is to be distributed, and
+publishing it grants nothing — it lets a client check a signature it could not
+otherwise check. Fetching it over the connection it is meant to secure is
+trust on first use, and it is the same trust the enrolment token and the agent
+binary already travel on in the same installer run. Ship `rootCA.crt` out of
+band if that is not acceptable.
+
+> **Second, third and fourth things wrong, all found here.**
+> `/api/agent/ca` read `certs/rootCA.crt` directly while the generator wrote
+> to `TLS_DIR`, so the endpoint an installer depends on for trust answered
+> 404 on every containerised deployment.
+>
+> Then `server_ca` turned out to be reaching one connection at a time. The
+> telemetry socket had it; the channel did not, so the agent shipped
+> telemetry over TLS quite happily and could not open its channel at all --
+> reporting, and unreachable. Fixing that left the `requests` calls, which
+> failed on the first thing the agent does:
+>
+> ```
+> [!] Agent bootstrap attempt 1 failed: SSLError(SSLCertVerificationError(
+>     certificate verify failed: unable to get local issuer certificate))
+> ```
+>
+> Three fixes for one defect. `server_ca` is a statement about the *host*,
+> so the agent now installs it once at startup -- as a bundle of the system
+> trust store **plus** this CA, written beside the CA and pointed at by
+> `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` and `SSL_CERT_FILE`. Every client
+> in the process picks it up, including any added later. Trusting the
+> private CA *instead of* the system roots would have been the easier
+> change, and would have made the agent distrust every other HTTPS
+> endpoint on the machine.
+
+The port and the scheme are derived from `server_url`, not configured
+separately: `https://` means telemetry goes to `5011` inside TLS and the
+channel goes to `wss://`. Two settings that have to agree, with nothing making
+them agree, would be wrong in exactly the deployment that believed it was
 encrypted. `--ingest-port` still overrides the port for a bastion setup.
 
-With a real certificate from a public CA, `server_ca` is unnecessary — the
-system trust store already has it.
+With a certificate from a public CA, leave `server_ca` unset — the endpoint's
+trust store already has what it needs.
 
-### 3.2 Session cookies require this
+### 3.4 Migrating a fleet, in this order
 
-Whichever pattern you choose, **set `SESSION_COOKIE_SECURE=1` once TLS is
-terminating anywhere in front of the UI.** The session cookie is what
-authenticates the operator; without `Secure` it can travel over plain HTTP.
+**Turning on TLS breaks the channel of every agent already installed.** Their
+`config.json` still says `http://`, so they dial `ws://` against a port that
+now answers only TLS. Telemetry keeps flowing on `5001`, so nothing looks
+wrong — and no command reaches any host.
 
-The inverse is also a trap: setting it to `1` while serving plain HTTP means
-the browser silently drops the cookie and nobody can log in.
+The agent says so, once, rather than leaving a reconnect loop to be read:
 
-Unset, it now follows `TLS_ENABLED` rather than defaulting to `0`. The two had
-to agree and nothing made them, so turning on TLS and leaving this alone gave
-an HTTPS console whose session cookie was still allowed onto plain HTTP. An
-explicit value still wins — which is what pattern 1 above needs, because a
-proxy terminating TLS is invisible from inside this process.
+```
+[link] channel closed: Connection to remote host was lost.
+[link] soc.example.com:8000 is serving TLS, and this agent is configured for
+       http:// - so telemetry still flows and no command can reach this host.
+       Set server_url to https://... and give it the server's CA as server_ca
+       (GET /api/agent/ca), then restart the agent.
+```
+
+Do it in this order:
+
+1. **Enable TLS on the server.** `TLS_ENABLED=1`, `TLS_CN=<the name agents
+   will use>`, then `docker compose up -d --build app ingest`. Leave `5001`
+   published; both ingest listeners run.
+2. **Confirm the server is serving what it says** — §3.7.
+3. **Re-point the agents.** Set `server_url` to `https://…` and `server_ca` to
+   the CA, then restart each agent. Reinstalling does both for you.
+4. **Watch the plaintext listener go quiet.** `ingest` names each agent still
+   arriving in the clear, once each:
+   ```
+   [!] web-01 is sending telemetry in the clear on port 5001. Its logs,
+       hostnames and process names cross the network unencrypted...
+   ```
+5. **Close the plaintext path** when nothing is named any more: set
+   `INGEST_TLS_REQUIRED=1` **and remove the `"5001:5001"` line from
+   `docker-compose.yaml`.**
+
+> **Both halves of step 5, or you get the fourth thing that was wrong.**
+> `INGEST_TLS_REQUIRED=1` closes the listener *inside the container*; Docker
+> goes on publishing the host port. A connection is then accepted by the
+> proxy, the batch is written into a socket nobody reads, and the close looks
+> exactly like a server that stored everything. Verified on a live stack: the
+> bytes were accepted, nothing was ingested, and the batch reported as sent.
+>
+> The agent now refuses to be fooled by this — once a server has acknowledged
+> a batch, silence from it is treated as a failure and the rows are kept — but
+> a refused connection is still the honest answer, and that means removing the
+> port mapping.
+
+Setting `INGEST_TLS_REQUIRED=1` without `TLS_ENABLED=1` is a startup failure:
+it would close the plaintext port and open nothing, leaving an ingest service
+listening on nothing at all, which from the fleet's side is indistinguishable
+from a quiet week.
+
+### 3.5 Session cookies
+
+**Unset, `SESSION_COOKIE_SECURE` now follows `TLS_ENABLED`.** It used to
+default to `0` regardless, so turning on TLS and leaving it alone gave an
+HTTPS console whose session cookie was still allowed onto plain HTTP.
+
+Set it explicitly to `1` when a **reverse proxy** terminates TLS — that is
+invisible from inside this process, so nothing can infer it for you.
+
+The inverse is a real outage: `1` while serving plain HTTP means the browser
+silently drops the cookie and nobody can log in.
 
 `SESSION_COOKIE_SAMESITE` defaults to `Lax`, which blocks the cross-site
 POST/XHR that CSRF needs. Only a split-origin deployment needs `None`, and
 that requires `SESSION_COOKIE_SECURE=1`.
 
-### 3.3 Rotation
+### 3.6 Terminating at a reverse proxy instead
 
-Reverse proxy:
+Leave `TLS_ENABLED` unset, serve plain HTTP at `:8000` and plain TCP at
+`:5001`, and put nginx in front (§2.3). Rotation is a proxy reload, and agents
+verify the proxy's certificate against the system trust store with no
+`server_ca`.
+
+Two things this deployment still has to do by hand:
+
+- `SESSION_COOKIE_SECURE=1`, per §3.5.
+- Terminate TLS for **ingest** too, or leave it in the clear knowingly. It is
+  binary TCP, not HTTP — nginx `stream`, not a `location` block.
+
+### 3.7 Rotating a certificate
+
+Replacing the **server certificate** is server-side only:
 
 ```bash
-nginx -t && nginx -s reload      # no downtime
-```
-
-App-terminated:
-
-```bash
-docker compose cp new.crt app:/app/certs/server.crt
-docker compose cp new.key app:/app/certs/server.key
+docker compose cp new.crt app:/app/data/certs/server.crt
+docker compose cp new.key app:/app/data/certs/server.key
 docker compose restart app ingest
 ```
 
-`ingest` reads the same volume read-only, so it has to be restarted too — a
-console on the new certificate and telemetry still presenting the old one is
-the kind of half-migration that shows up as a few hosts going quiet.
+Restart both. `ingest` reads the same pair read-only, and a console on the new
+certificate with telemetry still presenting the old one is the kind of
+half-migration that shows up as a few hosts going quiet.
 
-**Agent trust:** agents verify against the system trust store, plus `server_ca`
-if one is configured. Rotating a certificate issued by a public CA is
-server-side only. Rotating the *self-signed CA* — which `--force` does — is
-not: every agent holding the old `rootCA.crt` will refuse the new server and
-stop sending. Replace the file on the endpoints first, or re-enrol them.
+Replacing the **CA** is not server-side only, and this is the trap.
+`python certs/generate_certs.py --force` issues a new CA as well as a new
+certificate, so every agent holding the old `rootCA.crt` refuses the new
+server and stops sending. It is a new identity for the deployment, not a
+renewal. Replace `rootCA.crt` on the endpoints first — or re-enrol them, which
+does it for you.
 
-### 3.4 Why not mTLS, and what it would take
+Agents pin nothing: they verify against the system trust store plus
+`server_ca` if one is set. With a certificate from a public CA, renewal needs
+nothing on the endpoints at all.
+
+### 3.8 Verifying it, rather than assuming it
+
+Run these after enabling TLS. Every one of them found something the first time.
+
+**The console is actually HTTPS, and only HTTPS:**
+
+```bash
+curl -sk -o /dev/null -w "https=%{http_code}\n" https://localhost:8000/health
+curl -s  -o /dev/null -w "http=%{http_code}\n"  --max-time 5 http://localhost:8000/health
+# expect: https=200, http=000
+```
+
+**The CA the server hands out verifies the certificate it presents.** This is
+the test that matters, because it is what every agent does:
+
+```bash
+curl -sk https://localhost:8000/api/agent/ca -o /tmp/rootCA.crt
+python - <<'EOF'
+import socket, ssl
+ctx = ssl.create_default_context(cafile="/tmp/rootCA.crt")
+for port in (8000, 5011):
+    with socket.create_connection(("localhost", port), timeout=8) as raw:
+        with ctx.wrap_socket(raw, server_hostname="localhost") as tls:
+            print(port, tls.version(),
+                  dict(x[0] for x in tls.getpeercert()["subject"])["commonName"])
+EOF
+# expect TLSv1.3 and the CN from TLS_CN on both ports
+```
+
+Use Python rather than `curl --cacert` on Windows: curl's schannel backend
+cannot check revocation for a private CA and reports
+`CERT_TRUST_REVOCATION_STATUS_UNKNOWN` against a chain that is perfectly
+valid. Python's `ssl` is what the agent uses, so it is also the honest test.
+
+**The plaintext listener still answers during the migration:**
+
+```bash
+docker compose logs ingest | grep "ingest listening"
+# expect both: TLS ingest on 5011, and TCP ingest on 5001 (in the clear)
+```
+
+**Every agent has actually moved** — this is what tells you step 5 is safe:
+
+```bash
+docker compose logs ingest | grep "in the clear on port"
+# expect nothing once the fleet has migrated
+```
+
+**Channels are up, not just telemetry.** The dashboard's agent list carries
+`channel_connected` per host; an agent that is reporting with no channel is
+the failure this section keeps warning about. Check it there rather than
+inferring health from row counts.
+
+### 3.9 Why not mTLS, and what it would take
 
 Client certificates were considered for agent authentication and deliberately
 not implemented. The reasoning, so it does not have to be reconstructed later:
@@ -336,8 +576,7 @@ and mTLS is the thing that would help.
 | Path | Contains | Priority | Restore |
 | :--- | :--- | :--- | :--- |
 | Volume `mysql_data` | All telemetry, agents, AI insights, automations, sessions | High | `mysqldump --all-databases` daily |
-| Volume `sentora_data` | `data/fernet.key` — the **agent** telemetry key | **Critical** | Encrypted vault |
-| Volume `sentora_certs` | The deployment's TLS certificate and self-signed CA | High | Encrypted vault (it holds `server.key`) |
+| Volume `sentora_data` | `data/fernet.key` — the **agent** telemetry key, and `data/certs/` — this deployment's TLS certificate and CA | **Critical** | Encrypted vault (it holds two private keys) |
 | File `.env` | `FERNET_KEY` (server key), DB and broker passwords, agent shared secret | **Critical** | Encrypted vault |
 | Volume `opensearch_data` | Log search index | Medium | Rebuildable from MySQL |
 | Volume `ollama` | Model weights | Low | Re-pull, or restore for air-gap |
@@ -351,11 +590,14 @@ telemetry. If you are restoring a deployment from before that change, expect
 some historical rows to be undecryptable — the UI marks them
 `<decryption failed — key mismatch>` rather than showing ciphertext.
 
-Losing `sentora_certs` is recoverable but not free: a new certificate and a
-new CA are generated, and every agent holding the old `rootCA.crt` refuses the
-new server and stops sending until the file is replaced on the endpoint. The
-backup script tars every volume `docker-compose.yaml` declares, so this one is
-picked up without anybody having to remember it.
+Losing `data/certs/` is recoverable but not free: a new certificate and a new
+CA are generated, and every agent holding the old `rootCA.crt` refuses the new
+server and stops sending until the file is replaced on the endpoint. It lives
+in `sentora_data` beside the Fernet key rather than in a volume of its own,
+because `certs/` inside the image is owned by root and the server runs
+unprivileged — see §3.2. The backup script tars every volume
+`docker-compose.yaml` declares, so both are picked up without anybody having
+to remember them.
 
 ### 4.2 Backup script
 

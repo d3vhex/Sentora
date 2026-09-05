@@ -9,6 +9,7 @@ import threading
 import json
 import subprocess
 import os
+import pathlib
 import signal
 import requests
 import sys
@@ -17,7 +18,8 @@ import re
 from datetime import datetime, timedelta
 import ipaddress
 
-from modules.db import insert_record, fetch_unsent, mark_sent, fetch_one
+from modules.db import (insert_record, fetch_unsent, mark_sent, fetch_one,
+                        reoffer_recent, prune_sent)
 import modules.enc_db as enc_db
 import modules.screen_capture as screen_capture
 import modules.agent_paths as agent_paths
@@ -338,6 +340,105 @@ INGEST_CA = None
 SERVER_HOSTNAME = None
 #: An unbounded blocking read is how a collector thread disappears for good.
 INGEST_TIMEOUT_S = 30
+
+#: Whether this server has ever acknowledged a batch.
+#:
+#: The receipt frame is optional, because an agent can be pointed at a server
+#: older than it - and for that case "no reply" has to mean "mark them sent",
+#: or the agent retries the same rows for ever. Once a server has replied even
+#: once, that reasoning no longer applies and silence is a fault.
+_SERVER_ACKNOWLEDGES = False
+
+#: How many rows per table to offer again when the server's database turns out
+#: to have been recreated.
+#:
+#: Bounded on purpose. `hardware_inventory` on one host holds 530,000 rows, and
+#: re-offering all of them at fifty a batch is a replay measured in days during
+#: which nothing current gets through. The tables this rescues - port scans,
+#: process events, SOAR actions, permission changes - hold tens or hundreds,
+#: so they are covered completely.
+_REOFFER_LIMIT = 1000
+
+#: The server database identity last seen. Empty until a receipt carries one;
+#: a server older than the epoch sends none, and that has to keep working.
+_SERVER_EPOCH = ""
+
+
+def _epoch_file() -> str:
+    """Where the last-seen server identity is remembered.
+
+    Beside config.json, because it belongs to this enrolment: re-point the
+    agent at a different server and it should notice that too.
+    """
+    return os.path.join(agent_paths.persistent_config_dir(), "..",
+                        ".server_epoch")
+
+
+def _remember_epoch(epoch: str) -> None:
+    try:
+        with open(_epoch_file(), "w", encoding="utf-8") as fh:
+            fh.write(epoch)
+    except OSError as e:
+        # Not fatal, but it means the reset will be detected again on the next
+        # start - the resend is deduplicated server-side, so the cost is a
+        # repeated offer rather than duplicated data.
+        print(f"[!] could not record the server epoch: {e}", flush=True)
+
+
+def _load_epoch() -> str:
+    try:
+        with open(_epoch_file(), "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _handle_server_epoch(epoch: str) -> None:
+    """Notice that the server has forgotten, and offer the rows again.
+
+    `sent` is this agent's only record of what the server holds, and a
+    server-side database reset is invisible from here. Every table that does
+    not produce new rows constantly then stays empty on the server for ever,
+    which is exactly what happened: 93 port-scan rows held locally, none on
+    the server, and nothing wrong at either end.
+    """
+    global _SERVER_EPOCH
+    if not epoch or epoch == _SERVER_EPOCH:
+        return
+
+    previous, _SERVER_EPOCH = _SERVER_EPOCH, epoch
+    _remember_epoch(epoch)
+
+    if previous:
+        why = (f"The server's database for this agent was recreated "
+               f"({previous[:8]} -> {epoch[:8]}). Everything it held is gone")
+    else:
+        # First sighting, and it re-offers too.
+        #
+        # The tempting rule is "nothing to compare against, so do nothing" -
+        # but the agents that most need this are precisely the ones that have
+        # been running since before the epoch existed, holding rows marked
+        # sent against a server that may never have received them. That is the
+        # state this was written for.
+        #
+        # It costs nothing on a fresh install: an agent with an empty local
+        # database has no rows to offer, so the sweep finds none. And the
+        # resend is deduplicated server-side, so the worst case on an agent
+        # that was already in sync is a batch of rows the server recognises
+        # and skips.
+        why = ("This agent has no record of which server database it has been "
+               "talking to, so rows already marked sent may never have "
+               "arrived")
+
+    print(f"[!] {why}. Re-offering the most recent {_REOFFER_LIMIT} row(s) "
+          f"per table; the server skips anything it already holds.", flush=True)
+    for table in TABLES:
+        try:
+            count = reoffer_recent(table, _REOFFER_LIMIT)
+            if count:
+                print(f"    {table}: {count} row(s) queued again", flush=True)
+        except Exception as e:
+            print(f"    {table}: could not re-offer ({e})", flush=True)
 AUTOMATIONS_API_URL = None
 AUTOMATIONS_MODE = "auto"
 AGENT_SHARED_SECRET = None
@@ -377,8 +478,16 @@ TABLES = [
     'network_connections',
     'process_events',
     'hardware_inventory',
-    'security_audit',
     'docker_containers',
+    # `security_audit` was here and is not any more. Nothing in this agent
+    # ever wrote a row to it - no collector, not a broken one - so it was
+    # shipped empty every cycle and the console showed it permanently as
+    # NOT COLLECTED, which reads as a sensor that failed rather than one that
+    # was never built.
+    #
+    # The server keeps the table and its ALLOWED_TABLES entry, so a collector
+    # can be added later without touching the server. What is not kept is the
+    # claim that this agent reports it.
 ]
 
 MAX_WORKERS = 6
@@ -643,6 +752,35 @@ def send_table(table: str):
                       f"({receipt['error']}); rows kept for retry")
             return
 
+        global _SERVER_ACKNOWLEDGES
+        if receipt is not None:
+            _SERVER_ACKNOWLEDGES = True
+            # After the batch is decided, before it is marked sent: a reset
+            # noticed here re-offers rows, and marking this batch sent
+            # immediately afterwards is correct - the server has just
+            # confirmed it stored them.
+            _handle_server_epoch(receipt.get("epoch") or "")
+        elif _SERVER_ACKNOWLEDGES:
+            # Silence from a server that has acknowledged before is a failure,
+            # not an old build.
+            #
+            # "No receipt means an older server, so mark the rows sent" is
+            # right exactly once - before this server has ever replied. After
+            # that it becomes a way to lose data quietly, and there is a real
+            # configuration that produces it: `INGEST_TLS_REQUIRED=1` closes
+            # the plaintext listener, but Docker keeps publishing the port, so
+            # a connection is accepted by the proxy, the batch is written into
+            # a socket nobody reads, and the close looks exactly like an old
+            # server that stored everything.
+            telemetry_health.record_send_failure(
+                table, "the server accepted the connection and did not "
+                       "acknowledge the batch; it has acknowledged before, so "
+                       "this is a broken path rather than an older server")
+            if debug:
+                print(f"[!] {table}: no acknowledgement from a server that has "
+                      f"acknowledged before - rows kept for retry")
+            return
+
         mark_sent(table, [r['id'] for r in rows])
         telemetry_health.record_send(table, len(rows), receipt=receipt)
         if debug:
@@ -678,6 +816,46 @@ def db_sender_loop():
                 if debug:
                     print(f"[!] db_sender error on {table}: {e}")
         time.sleep(10)
+
+
+#: How many rows to keep per table locally once the server has them.
+#:
+#: Above `_REOFFER_LIMIT` on purpose: pruning must not eat the material a
+#: server-side reset needs to offer again. Below that and recovery would be
+#: quietly capped by whatever the cleaner happened to leave behind.
+_RETENTION_ROWS = 5000
+
+
+def retention_loop():
+    """Keep the agent's local database from growing for ever.
+
+    Nothing pruned it, and the agent is append-only, so it grew for the life
+    of the install: 530,428 rows of `hardware_inventory` on one host after a
+    few weeks, every one already shipped and never read again. Disk on a
+    monitored endpoint is the one place a monitoring tool should not be
+    quietly consuming.
+
+    Hourly rather than per cycle. Deleting is cheap here but not free, and
+    nothing about this is urgent - a table that overshoots by an hour's
+    collection is not a problem, whereas a delete competing with the send loop
+    for the same rows is.
+    """
+    while True:
+        # An hour before the first pass. On a fresh install there is nothing
+        # to prune, and on an upgrade the first thing this process should be
+        # doing is shipping the backlog, not deleting it.
+        time.sleep(3600)
+        total = 0
+        for table in TABLES:
+            try:
+                total += prune_sent(table, _RETENTION_ROWS)
+            except Exception as e:
+                # One table failing must not stop the rest - the same rule the
+                # collectors follow, and for the same reason.
+                print(f"[!] retention failed on {table}: {e}", flush=True)
+        if total:
+            print(f"[*] Retention: removed {total} already-shipped row(s); "
+                  f"keeping the newest {_RETENTION_ROWS} per table", flush=True)
 
 
 #: How many consecutive failures between repeat reports, once a collector has
@@ -1521,6 +1699,11 @@ def start_threads():
         daemon=True
     ).start()
 
+    threading.Thread(
+        target=retention_loop,
+        daemon=True
+    ).start()
+
     start_server_channel()
 
 
@@ -1742,9 +1925,16 @@ def start_server_channel() -> None:
               "the server will reach this agent over HTTP.", flush=True)
         return
 
+    # The same CA the telemetry socket verifies with. One `server_ca` for the
+    # host, because the two connections go to the same server - giving it to
+    # only one of them produced an agent that shipped telemetry over TLS and
+    # could not open its channel at all, which since the endpoint stopped
+    # listening on a port of its own means an agent that reports and cannot
+    # be reached.
     client = link.AgentLinkClient(
         server_url, AGENT_SHARED_SECRET, dispatch_channel_request,
-        agent_name=AGENT_NAME, open_stream=open_channel_stream)
+        agent_name=AGENT_NAME, open_stream=open_channel_stream,
+        ca_cert=INGEST_CA)
     threading.Thread(target=client.run_forever, daemon=True).start()
     print(f"[link] channel opening to {client.channel_url()}", flush=True)
 
@@ -1826,6 +2016,65 @@ def _parse_args():
                              'Needed when the server uses the self-signed CA '
                              'from certs/generate_certs.py.')
     return parser.parse_args()
+
+
+def _install_trust_bundle(ca_path):
+    """Make one CA visible to every outbound client in this process.
+
+    `server_ca` is a statement about the host, not about one socket, and it
+    was being wired in per connection. That cost three separate fixes for the
+    same defect: the telemetry socket had it, the channel did not, and the
+    `requests` calls - bootstrap, automations polling, enrolment - did not
+    either. Each failure looked different and each needed the same answer.
+
+    So it is installed once, here, before anything connects. Anything added
+    later that speaks TLS inherits it without having to be told.
+
+    The bundle is the system trust store *plus* this CA rather than this CA
+    alone. Replacing the store would make the agent distrust every other HTTPS
+    endpoint on the machine in order to solve a problem with one of them, and
+    that failure would arrive somewhere far from this line.
+    """
+    if not ca_path or not os.path.exists(ca_path):
+        return None
+
+    try:
+        private = pathlib.Path(ca_path).read_bytes()
+    except OSError as e:
+        print(f"[!] cannot read server_ca at {ca_path}: {e}", flush=True)
+        return None
+
+    system = b""
+    try:
+        import certifi
+        system = pathlib.Path(certifi.where()).read_bytes()
+    except Exception as e:
+        # Not fatal, but worth saying: without the system roots the agent
+        # trusts this CA and nothing else.
+        print(f"[!] system trust store unavailable ({e}); trusting only "
+              f"{ca_path}", flush=True)
+
+    payload = (system + b"\n" + private) if system else private
+    bundle = pathlib.Path(ca_path).with_name("sentora-trust-bundle.pem")
+    try:
+        bundle.write_bytes(payload)
+    except OSError:
+        # A read-only install directory is a real deployment, and a temp file
+        # is fine here: the bundle is derived, not state.
+        import tempfile
+        bundle = pathlib.Path(tempfile.gettempdir()) / "sentora-trust-bundle.pem"
+        try:
+            bundle.write_bytes(payload)
+        except OSError as e:
+            print(f"[!] could not write a trust bundle: {e}", flush=True)
+            return None
+
+    # `requests` reads the first two; `ssl.create_default_context()` with no
+    # cafile reads the third. Between them that is every client in this
+    # process, including any added after this was written.
+    for name in ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSL_CERT_FILE"):
+        os.environ[name] = str(bundle)
+    return str(bundle)
 
 
 def _resolve_ingest_transport(cfg: dict, args) -> tuple[bool, int, str | None, str | None]:
@@ -2203,6 +2452,18 @@ def main():
 
     INGEST_TLS, SERVER_PORT, INGEST_CA, SERVER_HOSTNAME = _resolve_ingest_transport(
         cfg, args)
+
+    # Before anything connects. Bootstrap runs a few lines below and is the
+    # first thing in this process to speak TLS.
+    _trust_bundle = _install_trust_bundle(INGEST_CA)
+    if _trust_bundle:
+        print(f"[*] Trusting {INGEST_CA} for every outbound connection")
+
+    # What the server's database identity was last time this agent ran. Loaded
+    # rather than assumed empty, so a reset that happened while the agent was
+    # stopped is still noticed on the first receipt after it starts.
+    global _SERVER_EPOCH
+    _SERVER_EPOCH = _load_epoch()
 
     if not AGENT_NAME:
         AGENT_NAME = "agent"

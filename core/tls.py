@@ -47,6 +47,34 @@ def tls_enabled(env=None) -> bool:
     return str(env.get("TLS_ENABLED", "")).strip().lower() in TRUTHY
 
 
+def material_dir(env=None) -> str:
+    """Where a generated certificate and its CA live.
+
+    Defaults to `certs/` beside this checkout, which is right for someone
+    running the server directly and is where `certs/generate_certs.py` writes
+    when run by hand.
+
+    `TLS_DIR` moves it, and the container sets it to the data volume. That is
+    not a preference: `certs/` ships inside the image, owned by root, and the
+    server runs as an unprivileged user - so the first boot with TLS on failed
+    with
+
+        could not generate a certificate:
+        [Errno 13] Permission denied: '/app/certs/rootCA.key'
+
+    and, correctly refusing to fall back to plain HTTP, took the container
+    into a restart loop. A generated key is state, like `data/fernet.key`
+    beside it: it belongs in the volume that survives a rebuild, not in the
+    source directory that is replaced by one.
+    """
+    env = os.environ if env is None else env
+    configured = (env.get("TLS_DIR") or "").strip()
+    if configured:
+        return configured
+    return os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "certs")
+
+
 def resolve(env=None, generate=True, log=print) -> dict | None:
     """The `ssl` argument for `app.run()`, or None to serve plain HTTP.
 
@@ -124,8 +152,18 @@ def _generate(env, log) -> tuple[str, str]:
         ) from e
 
     cn = (env.get("TLS_CN") or "").strip() or "localhost"
+    outdir = material_dir(env)
     try:
-        paths = ensure_certs(cn=cn, log=log)
+        os.makedirs(outdir, exist_ok=True)
+        paths = ensure_certs(outdir=outdir, cn=cn, log=log)
+    except OSError as e:
+        # Named, because the bare errno gives no clue which of the two
+        # plausible causes it is - and they need opposite fixes.
+        raise TLSConfigError(
+            f"cannot write TLS material to {outdir!r}: {e}. Either point "
+            f"TLS_DIR at a directory this process owns, or set "
+            f"TLS_CERT/TLS_KEY at a certificate somebody else manages."
+        ) from e
     except Exception as e:
         raise TLSConfigError(f"could not generate a certificate: {e}") from e
 
@@ -133,8 +171,8 @@ def _generate(env, log) -> tuple[str, str]:
         "warn, because nothing trusts this CA - that warning is accurate. "
         "Point TLS_CERT/TLS_KEY at a real certificate for anything reachable "
         "beyond your own network.")
-    log(f"[tls] Agents need certs/rootCA.crt to verify this server; see "
-        f"SENTORA_CA_CERT in the agent configuration.")
+    log(f"[tls] Agents need {paths['root_crt']} to verify this server; the "
+        f"installer fetches it from /api/agent/ca, or set server_ca by hand.")
     return paths["crt"], paths["key"]
 
 
@@ -155,13 +193,27 @@ def existing(env=None) -> dict | None:
     cert = (env.get("TLS_CERT") or "").strip()
     key = (env.get("TLS_KEY") or "").strip()
     if not cert or not key:
-        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        cert = os.path.join(here, "certs", "server.crt")
-        key = os.path.join(here, "certs", "server.key")
+        # The same directory `_generate` writes to, resolved the same way -
+        # two copies of this path is how the reader and the writer come to
+        # disagree about where the certificate is.
+        outdir = material_dir(env)
+        cert = os.path.join(outdir, "server.crt")
+        key = os.path.join(outdir, "server.key")
 
     if not (os.path.exists(cert) and os.path.exists(key)):
         return None
     return {"cert": cert, "key": key}
+
+
+def ca_certificate(env=None) -> str | None:
+    """The self-signed CA an agent needs in order to verify this server.
+
+    None when there is none, which is the ordinary answer for a deployment
+    using a certificate from a real CA - the endpoint's trust store already
+    has what it needs.
+    """
+    path = os.path.join(material_dir(env), "rootCA.crt")
+    return path if os.path.exists(path) else None
 
 
 def describe(env=None) -> str:

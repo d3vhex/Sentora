@@ -91,8 +91,34 @@ if [ -z "$TOKEN" ]; then
   echo "[!] Missing enrollment token"; exit 1
 fi
 
+# Trust before anything else touches the network.
+#
+# This used to be fetched at the end, after registration and after the binary
+# download - so against a self-signed server every one of those calls failed
+# first, and the CA that would have fixed them arrived two steps too late.
+#
+# `-k` for this one request only: it is the same trust-on-first-use the
+# enrolment token and the agent binary already travel on in this script. Every
+# call after it passes --cacert and verifies properly.
+SERVER_CA=""
+CURL_CA=""
+mkdir -p "$INSTALL_DIR"
+case "$SERVER_URL" in
+  https://*)
+    if curl -fsSk -o "$INSTALL_DIR/rootCA.crt" "$SERVER_URL/api/agent/ca" \\
+       && [ -s "$INSTALL_DIR/rootCA.crt" ]; then
+      SERVER_CA="$INSTALL_DIR/rootCA.crt"
+      CURL_CA="--cacert $SERVER_CA"
+      echo "[+] Stored the server CA; the rest of this install verifies against it."
+    else
+      rm -f "$INSTALL_DIR/rootCA.crt"
+      echo "[i] No local CA at $SERVER_URL/api/agent/ca - the server is using a certificate this host already trusts."
+    fi
+    ;;
+esac
+
 echo "[*] Registering with server..."
-REG_RESP="$(curl -fsSL -X POST "$SERVER_URL/api/agents/register" \\
+REG_RESP="$(curl -fsSL $CURL_CA -X POST "$SERVER_URL/api/agents/register" \\
   -H 'Content-Type: application/json' \\
   -d "{{\\"token\\":\\"$TOKEN\\",\\"hostname\\":\\"$HOSTNAME_VAL\\",\\"os_type\\":\\"$OS_TYPE\\"}}")"
 
@@ -110,29 +136,9 @@ mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
 
 echo "[*] Downloading agent binary..."
-curl -fsSL -H "X-Agent-Key: $AGENT_KEY" -o agent.zip "$SERVER_URL/api/agent/download/linux"
+curl -fsSL $CURL_CA -H "X-Agent-Key: $AGENT_KEY" -o agent.zip "$SERVER_URL/api/agent/download/linux"
 unzip -q -o agent.zip
 chmod +x main 2>/dev/null || true
-
-# The CA this server signs with, if it signs with its own.
-#
-# Only for an https server: against http there is nothing to verify, and
-# against a certificate from a real CA the endpoint's trust store already has
-# it (the server answers 404 and this stays empty). Fetching it over the
-# connection it secures is trust on first use - the same trust the enrolment
-# token and the agent binary above already travel on in this very script.
-SERVER_CA=""
-case "$SERVER_URL" in
-  https://*)
-    if curl -fsSk -o "$INSTALL_DIR/rootCA.crt" "$SERVER_URL/api/agent/ca"        && [ -s "$INSTALL_DIR/rootCA.crt" ]; then
-      SERVER_CA="$INSTALL_DIR/rootCA.crt"
-      echo "[*] Stored the server CA for certificate verification."
-    else
-      rm -f "$INSTALL_DIR/rootCA.crt"
-      echo "[i] Server has no local CA; verifying against the system trust store."
-    fi
-    ;;
-esac
 
 # Write identity config
 #
@@ -305,6 +311,71 @@ def _render_windows_install(server_url: str, server_ip: str, token: str) -> str:
             return
         }}
 
+        # Trust before anything else touches the network.
+        #
+        # This used to happen near the end, after registration and after the
+        # binary download, which meant a self-signed server broke enrolment
+        # at the first call with
+        #
+        #   Temel alinan baglanti kapatildi: SSL/TLS guvenli kanali icin
+        #   guven iliskisi kurulamadi.
+        #
+        # and the CA that would have fixed it was fetched two steps later.
+        # Even the one-liner that downloads this script could not run.
+        #
+        # So: fetch the CA with validation suspended for that single request,
+        # then put it in the machine store. Everything after this line - here,
+        # in the agent, and in a browser on this host - verifies normally.
+        #
+        # Suspending validation for the fetch is the same trust-on-first-use
+        # the enrolment token and the agent binary already travel on in this
+        # very script.
+        #
+        # `curl.exe` rather than Invoke-WebRequest with a validation callback.
+        # The obvious form,
+        #
+        #   [Net.ServicePointManager]::ServerCertificateValidationCallback = {{ $true }}
+        #
+        # does not work here and fails in a way that hides its own cause: the
+        # callback is a PowerShell script block, .NET invokes it on an I/O
+        # thread that has no runspace, and the resulting
+        # PSInvalidOperationException surfaces as
+        #
+        #   Temel alinan baglanti kapatildi: Gonderme isleminde beklenmeyen
+        #   hata olustu.
+        #
+        # which reads as a TLS failure and sends you looking at protocol
+        # versions and cipher suites. `curl.exe` ships with Windows 10 1803
+        # and later, runs out of process, and confines the exception to that
+        # one request with no static state to restore.
+        $ServerCa = ""
+        if ($ServerUrl -like "https://*") {{
+            $CaPath = Join-Path $InstallDir "rootCA.crt"
+            if (!(Test-Path $InstallDir)) {{ New-Item -ItemType Directory -Path $InstallDir | Out-Null }}
+            if (Get-Command curl.exe -ErrorAction SilentlyContinue) {{
+                curl.exe -fsSk -o "$CaPath" "$ServerUrl/api/agent/ca" 2>$null
+            }} else {{
+                Write-Host "[!] curl.exe is not available, so the server CA cannot be fetched on first contact." -ForegroundColor Yellow
+                Write-Host "    Copy rootCA.crt from the server to $CaPath and re-run." -ForegroundColor Yellow
+            }}
+            if (-not (Test-Path $CaPath)) {{
+                Write-Host "[i] No local CA at $ServerUrl/api/agent/ca - the server is using a certificate the system already trusts." -ForegroundColor DarkGray
+            }}
+
+            if ((Test-Path $CaPath) -and ((Get-Item $CaPath).Length -gt 0)) {{
+                $ServerCa = $CaPath
+                try {{
+                    Import-Certificate -FilePath $CaPath -CertStoreLocation "Cert:\\LocalMachine\\Root" | Out-Null
+                    Write-Host "[+] Server CA installed in the machine trust store." -ForegroundColor Green
+                }} catch {{
+                    # Not fatal. The agent is given the CA by path in
+                    # config.json and verifies with it either way; what is
+                    # lost is browsers on this host trusting the console.
+                    Write-Host "[i] Could not add the CA to the machine store ($($_.Exception.Message)); the agent will still use it by path." -ForegroundColor DarkGray
+                }}
+            }}
+        }}
+
         # An upgrade is not an enrolment. This used to call /register
         # unconditionally, and the server allocates a fresh name whenever the
         # requested one is taken - so re-running this one-liner on a machine
@@ -433,23 +504,6 @@ def _render_windows_install(server_url: str, server_ip: str, token: str) -> str:
         if (-not (Test-Path (Join-Path $InstallDir "main.exe"))) {{
             Write-Host "[!] main.exe missing after extraction. Server did not ship a binary." -ForegroundColor Red
             return
-        }}
-
-        # See the Linux script for the reasoning. Only for an https server,
-        # and trust on first use over the same connection that just delivered
-        # main.exe.
-        $ServerCa = ""
-        if ($ServerUrl -like "https://*") {{
-            $CaPath = Join-Path $InstallDir "rootCA.crt"
-            try {{
-                Invoke-WebRequest -Uri "$ServerUrl/api/agent/ca" -OutFile $CaPath -UseBasicParsing -TimeoutSec 30
-                if ((Test-Path $CaPath) -and ((Get-Item $CaPath).Length -gt 0)) {{
-                    $ServerCa = $CaPath
-                    Write-Host "[*] Stored the server CA for certificate verification."
-                }}
-            }} catch {{
-                Write-Host "[i] Server has no local CA; verifying against the system trust store." -ForegroundColor DarkGray
-            }}
         }}
 
         # `ingest_port` is deliberately absent. It was pinned to 5001 here,

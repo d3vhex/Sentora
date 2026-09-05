@@ -307,3 +307,47 @@ def test_rejected_rows_are_not_retried_for_ever():
     success = success[:success.index("except Exception")]
     assert "'error': None" in success or '"error": None' in success, \
         "a batch with rejected rows reports an error and will be resent for ever"
+
+
+# --------------------------------------------------------------------------
+# Silence means different things at different times
+# --------------------------------------------------------------------------
+
+def test_silence_from_a_server_that_has_replied_before_is_a_failure():
+    """"No receipt means an older server, so mark them sent" is right exactly
+    once - before this server has ever replied.
+
+    After that it is a way to lose data quietly, and there is a real
+    configuration that produces it. `INGEST_TLS_REQUIRED=1` closes the
+    plaintext listener inside the container, but Docker keeps publishing the
+    port: a connection is accepted by the proxy, the batch is written into a
+    socket nobody reads, and the close is indistinguishable from an old server
+    that stored everything. Verified on a live stack - the bytes were
+    accepted, nothing was ingested, and the batch reported as sent.
+    """
+    body = _send_table_body()
+    assert "_SERVER_ACKNOWLEDGES" in body, (
+        "the agent cannot tell an old server from a broken path, so a "
+        "silently discarded batch is reported as sent"
+    )
+
+    # The rows have to be kept, which means returning before mark_sent.
+    guard = body[:body.index("mark_sent")]
+    assert guard.count("return") >= 2, \
+        "the unacknowledged-but-should-have-been path does not keep the rows"
+
+
+def test_the_first_silence_is_still_treated_as_an_older_server():
+    """The case the flag must not break: an agent pointed at a server built
+    before the reply frame. Treating that as failure makes it retry the same
+    rows for ever."""
+    main = MAIN.read_text(encoding="utf-8")
+    tree = ast.parse(main)
+    assign = next(n for n in tree.body
+                  if isinstance(n, ast.Assign)
+                  and any(getattr(t, "id", "") == "_SERVER_ACKNOWLEDGES"
+                          for t in n.targets))
+    assert ast.literal_eval(assign.value) is False, (
+        "the agent starts out assuming the server acknowledges, so a "
+        "genuinely old server would never have its batches marked sent"
+    )

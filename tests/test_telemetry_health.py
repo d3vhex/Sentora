@@ -36,12 +36,21 @@ HEALTH = ROOT / "Sentora" / "modules" / "telemetry_health.py"
 
 
 def _classifier():
-    """`_classify_link`, compiled without importing app.py."""
+    """`_classify_link`, compiled without importing app.py.
+
+    With the helpers it calls. Compiling the function alone raised
+    `NameError: _shipped_before` the moment it grew a dependency, which reads
+    as a bug in app.py rather than in this harness - so the helpers are lifted
+    with it by name.
+    """
     tree = ast.parse(APP.read_text(encoding="utf-8"))
-    fn = next(n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef) and n.name == "_classify_link")
+    wanted = ("_classify_link", "_shipped_before")
+    fns = [n for n in ast.walk(tree)
+           if isinstance(n, ast.FunctionDef) and n.name in wanted]
+    assert len(fns) == len(wanted), f"missing one of {wanted} in app.py"
+
     namespace: dict = {}
-    exec(compile(ast.Module(body=[fn], type_ignores=[]), "<app.py>", "exec"),
+    exec(compile(ast.Module(body=fns, type_ignores=[]), "<app.py>", "exec"),
          namespace)
     return namespace["_classify_link"]
 

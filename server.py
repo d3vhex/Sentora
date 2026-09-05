@@ -615,6 +615,16 @@ def create_tables_if_not_exist(db_name):
             print(f"[!] encrypted-width migration skipped: {e}")
 
         try:
+            # Stamped once per incarnation of this database. INSERT IGNORE, so
+            # a database that already has an identity keeps it and only a
+            # freshly created one gets a new value - which is exactly the
+            # event the agent needs to hear about.
+            cursor.execute(
+                "INSERT IGNORE INTO ingest_epoch (id, epoch) VALUES (1, UUID())")
+        except mysql.connector.Error as e:
+            print(f"[!] could not stamp the ingest epoch: {e}")
+
+        try:
             # Every column update_agent_info's INSERT names is declared here.
             #
             # hostname, mac_address and reported_ip used to be added by ALTERs
@@ -750,6 +760,29 @@ def _parse_os_info_tail(os_info: str | None):
         elif p.startswith("MAC="):
             mac = p[4:].strip() or None
     return base, hostname, mac
+
+
+def _ingest_epoch(cursor) -> str:
+    """Which incarnation of this agent's database the server is on.
+
+    Returned with every receipt so the agent can notice a reset. `sent` lives
+    on the agent and is its only record of what the server holds; when this
+    database is recreated the agent has no way to learn that, and by design it
+    never re-offers a row it marked sent. Tables that produce rows constantly
+    refill on their own, so the damage lands exactly on the quiet ones - a
+    host held 93 port-scan rows against a server holding none, with nothing
+    wrong at either end.
+
+    Empty on failure rather than raising. An unknown epoch has to read as "no
+    information", because the alternative - the agent treating a hiccup as a
+    reset - would re-ship its whole history on a bad query.
+    """
+    try:
+        cursor.execute("SELECT epoch FROM ingest_epoch WHERE id = 1")
+        row = cursor.fetchone()
+        return row[0] if row else ""
+    except Exception:
+        return ""
 
 
 async def insert_data(agent: str, table: str, data: list, public_ip: str = None, os_info: str = None,
@@ -923,7 +956,8 @@ async def insert_data(agent: str, table: str, data: list, public_ip: str = None,
             print(f"[!] {agent}/{table}: stored {stored}, rejected {rejected} "
                   f"({first_error})", flush=True)
         return {"stored": stored, "duplicates": duplicates,
-                "rejected": rejected, "error": None}
+                "rejected": rejected, "error": None,
+                "epoch": _ingest_epoch(cursor)}
     except Exception as e:
         # Printed unconditionally, not behind `debug`. A batch that fails to
         # store is the single most important thing this process can say, and

@@ -461,3 +461,24 @@ CREATE TABLE IF NOT EXISTS security_audit (
     KEY idx_audit_sev (severity),
     KEY idx_audit_dup (dup_fp)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ================== ingest_epoch ==================
+--
+-- Which incarnation of this agent's database the server is on.
+--
+-- `sent` lives on the agent and is its only record of what the server holds.
+-- When this database is dropped and recreated - a re-enrolment, a deleted
+-- agent, a fresh volume - the agent has no way to learn that, and by design
+-- it never re-offers a row it has marked sent. Tables that produce new rows
+-- constantly refill on their own; tables that rarely change stay empty for
+-- ever. That is how a host sat with 93 port-scan rows held locally and none
+-- on the server, with nothing wrong at either end.
+--
+-- One row, written once, carrying a value that is new every time this table
+-- is created. It rides back on every ingest receipt, and an agent that sees
+-- it change knows the server has forgotten and offers its rows again.
+CREATE TABLE IF NOT EXISTS ingest_epoch (
+    id         TINYINT UNSIGNED NOT NULL PRIMARY KEY,
+    epoch      CHAR(36) NOT NULL,
+    created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
