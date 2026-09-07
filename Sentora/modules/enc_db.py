@@ -137,6 +137,36 @@ def _dec_value(v: Any) -> Any:
         return v
 
 
+def is_readable(table: str, row: Dict[str, Any]) -> bool:
+    """Whether this agent can still decrypt its own stored row.
+
+    It cannot, for anything encrypted before the Fernet key last changed. The
+    key comes from the server's bootstrap, and there is no rotation path - so
+    an agent that has outlived one key holds a local history it can no longer
+    read, and neither can the server.
+
+    That matters when rows are offered again after a server-side reset. Those
+    rows arrive, store, and render as `<decryption failed - key mismatch>`
+    for ever: a recovery that fills the console with markers and spends its
+    bounded budget on rows nobody can read. Measured on a live host, the
+    boundary was exact - the newest 28 rows readable, every older one not.
+
+    Rows with nothing encrypted are readable by definition, which is the
+    common case and costs one dictionary lookup.
+    """
+    fields = ENCRYPT_FIELDS_MAP.get(table) or []
+    for field in fields:
+        value = row.get(field)
+        if not isinstance(value, str) or not value.startswith(ENC_PREFIX):
+            continue                     # plaintext, or absent
+        if _dec_value(value) is value:
+            # `_dec_value` hands the input straight back when the token will
+            # not open. Identity rather than equality: a value that decrypts
+            # to itself is vanishingly unlikely and would be harmless anyway.
+            return False
+    return True
+
+
 def _encrypt_row(table: str, data: Dict[str, Any]) -> Dict[str, Any]:
     return {k: (_enc_value(v) if _should_encrypt(table, k) else v) for k, v in data.items()}
 

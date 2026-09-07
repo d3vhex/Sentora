@@ -187,9 +187,23 @@ services:
       # that went quiet looks exactly like a host with nothing to say.
       #
       # server.py names every agent still arriving in the clear, once each.
-      # When that list is empty, set INGEST_TLS_REQUIRED=1 and drop the 5001
-      # line below; a connection refused is a symptom somebody can see.
-      - "5001:5001"
+      # When that list is empty, close the plaintext path with two settings in
+      # .env, both of which are needed:
+      #
+      #   INGEST_TLS_REQUIRED=1          stops the listener inside the container
+      #   INGEST_PLAINTEXT_BIND=127.0.0.1  stops Docker publishing the port
+      #
+      # The second is not tidiness. INGEST_TLS_REQUIRED alone closes the
+      # listener while Docker goes on answering on the host port: the proxy
+      # accepts the connection, the batch is written into a socket nobody
+      # reads, and the close looks exactly like a server that stored
+      # everything. Verified on a live stack - the bytes were accepted and
+      # nothing was ingested.
+      #
+      # Bound rather than removed, because this file is tracked and a fresh
+      # install that is not on TLS yet still needs 5001. Same mechanism as
+      # BIND_ADDR above.
+      - "${INGEST_PLAINTEXT_BIND:-0.0.0.0}:5001:5001"
       - "5011:5011"
     volumes:
       # Read-only, and required. The agent encrypts `message` before sending;

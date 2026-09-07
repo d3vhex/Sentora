@@ -73,6 +73,25 @@ import uuid
 # operator is not left watching a spinner over a host that has gone quiet.
 DEFAULT_TIMEOUT_S = 20.0
 
+# How long to wait for an agent to actually have a console or a screen.
+#
+# Longer than the ordinary request timeout, because opening one is not an
+# ordinary request: on Windows the agent tries a pseudoconsole in its own
+# process, then a helper in the interactive session, then a shell behind
+# pipes, and only the last of those works when the agent runs as a service.
+#
+# This was 15s and the chain takes about that long to fail its way to the
+# strategy that works. Measured on a live host: the attempt began at
+# 17:25:03, the fall through to pipes happened at 17:25:18, and the console
+# came up a second or two later - to nobody, because the server had already
+# given up and told the operator the agent "would not open a console". It
+# would; it was still trying.
+#
+# The agent now remembers which strategy worked, so the common case is a
+# second or two. This deadline covers the first open after a restart, which
+# is the one that has to pay for the discovery.
+STREAM_OPEN_TIMEOUT_S = 45.0
+
 # Refused rather than queued past this. A caller that cannot be served now is
 # better told so: the alternative is an unbounded map fed by whatever the
 # agent chooses not to answer.
@@ -232,12 +251,15 @@ class AgentLink:
     # -- streams -----------------------------------------------------------
 
     async def open_stream(self, kind: str, args: dict | None = None,
-                          timeout: float = 15.0) -> StreamChannel:
+                          timeout: float = STREAM_OPEN_TIMEOUT_S) -> StreamChannel:
         """Ask the agent to start a console or a screen, and wait for it.
 
         Waiting matters: "the frame was sent" and "the agent has a shell" are
         different facts, and the console spent a while reporting the first as
         though it were the second.
+
+        The deadline has to be longer than the work it is waiting for, and it
+        was not - see `STREAM_OPEN_TIMEOUT_S`.
         """
         if self._closed:
             raise LinkError(f"{self.agent} is not connected")

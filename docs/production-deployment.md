@@ -407,21 +407,33 @@ Do it in this order:
    [!] web-01 is sending telemetry in the clear on port 5001. Its logs,
        hostnames and process names cross the network unencrypted...
    ```
-5. **Close the plaintext path** when nothing is named any more: set
-   `INGEST_TLS_REQUIRED=1` **and remove the `"5001:5001"` line from
-   `docker-compose.yaml`.**
+5. **Close the plaintext path** when nothing is named any more. Two
+   settings in `.env`, and both are needed:
 
-> **Both halves of step 5, or you get the fourth thing that was wrong.**
-> `INGEST_TLS_REQUIRED=1` closes the listener *inside the container*; Docker
-> goes on publishing the host port. A connection is then accepted by the
-> proxy, the batch is written into a socket nobody reads, and the close looks
-> exactly like a server that stored everything. Verified on a live stack: the
-> bytes were accepted, nothing was ingested, and the batch reported as sent.
+   ```ini
+   INGEST_TLS_REQUIRED=1            # stops the listener in the container
+   INGEST_PLAINTEXT_BIND=127.0.0.1  # stops Docker publishing the port
+   ```
+
+> **Both, or you get the fourth thing that was wrong.**
+> `INGEST_TLS_REQUIRED=1` closes the listener *inside the container*;
+> Docker goes on publishing the host port. A connection is then accepted
+> by the proxy, the batch is written into a socket nobody reads, and the
+> close looks exactly like a server that stored everything. Verified on a
+> live stack: the bytes were accepted, nothing was ingested, and the batch
+> reported as sent.
 >
-> The agent now refuses to be fooled by this — once a server has acknowledged
-> a batch, silence from it is treated as a failure and the rows are kept — but
-> a refused connection is still the honest answer, and that means removing the
-> port mapping.
+> The agent no longer falls for this - once a server has acknowledged a
+> batch, silence from it keeps the rows - but a refused connection is
+> still the honest answer, and that means unpublishing the port.
+
+   Verify from another machine, not from the server itself: the loopback
+   binding still answers there, which is the point of it.
+
+   ```bash
+   nc -vz soc.example.com 5001   # expect: connection refused
+   nc -vz soc.example.com 5011   # expect: succeeded
+   ```
 
 Setting `INGEST_TLS_REQUIRED=1` without `TLS_ENABLED=1` is a startup failure:
 it would close the plaintext port and open nothing, leaving an ingest service
