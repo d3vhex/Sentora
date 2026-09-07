@@ -1,0 +1,61 @@
+title: Local Data Collected Into An Archive In A World-Writable Directory
+id: 6d91b28c-3a47-4e5f-9c02-8b7ae1d43c05
+status: stable
+description: >
+    The Linux half of the same step. Data is gathered into one object before
+    it moves, and on a server that object lands somewhere the account can
+    write without being noticed - /tmp, /dev/shm, /var/tmp.
+
+    /dev/shm is worth its own mention. It is memory, not disk, so an archive
+    staged there leaves nothing for a later forensic image to recover and
+    disappears on reboot. A backup script has no reason to use it; somebody
+    who does not want the file found does.
+
+    The rule is on the pairing. tar and zip are how this machine is
+    administered, and /tmp is where ordinary work happens. An archive being
+    *created* in one of those directories out of a home directory, /etc or a
+    database path is the shape that matters.
+references:
+    - https://attack.mitre.org/techniques/T1560/001/
+    - https://attack.mitre.org/techniques/T1074/001/
+author: Sentora
+date: 2026/09/07
+logsource:
+    product: linux
+    category: process_creation
+detection:
+    archive_create:
+        CommandLine|contains:
+            - 'tar -c'
+            - 'tar c'
+            - 'tar --create'
+            - 'zip -r'
+            - '7z a'
+            - 'gzip -c'
+    staging_location:
+        CommandLine|contains:
+            - '/tmp/'
+            - '/dev/shm/'
+            - '/var/tmp/'
+    sensitive_source:
+        CommandLine|contains:
+            - '/home/'
+            - '/root/'
+            - '/etc/'
+            - '/var/lib/mysql'
+            - '/var/lib/postgresql'
+            - '/opt/'
+            - '/srv/'
+    memory_backed:
+        CommandLine|contains: '/dev/shm/'
+    condition: archive_create and (staging_location or sensitive_source) and
+        (sensitive_source or memory_backed)
+falsepositives:
+    - Backup jobs staging in /var/tmp. They recur on a schedule from cron,
+      which is what separates them from a single collection.
+    - Package builds archiving out of /opt or /srv.
+level: high
+tags:
+    - attack.collection
+    - attack.t1560.001
+    - attack.t1074.001
