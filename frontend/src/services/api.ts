@@ -54,6 +54,14 @@ api.interceptors.response.use(
 
 export const authService = {
   login: (credentials: any) => api.post('/login', credentials).then(res => {
+    // A password that is correct but not sufficient. Returned to the caller
+    // rather than thrown: this used to fall through to the `throw` below and
+    // surface as "Login failed", so switching on two-factor would have locked
+    // every operator out of the console with a message saying their password
+    // was wrong.
+    if (res.data.status === 'second_factor_required') {
+      return res.data;
+    }
     if (res.data.status === 'success') {
       localStorage.setItem('userId', res.data.user.id.toString());
       localStorage.setItem('user', JSON.stringify(res.data.user));
@@ -68,6 +76,33 @@ export const authService = {
     }
     throw new Error(res.data.message || 'Login failed');
   }),
+
+  /** Finish a login that passed its password. */
+  completeSecondFactor: (token: string, code: string) =>
+    api.post('/login/2fa', { token, code }).then(res => {
+      if (res.data.status !== 'success') {
+        throw new Error(res.data.message || 'That code is not valid.');
+      }
+      // The same bookkeeping `login` does on success. Duplicated rather than
+      // shared because the two paths return different shapes and a helper
+      // that flattened them would hide which one issued the session.
+      localStorage.setItem('userId', res.data.user.id.toString());
+      localStorage.setItem('user', JSON.stringify(res.data.user));
+      if (res.data.user.must_change_password) {
+        localStorage.setItem('mustChangePassword', '1');
+      } else {
+        localStorage.removeItem('mustChangePassword');
+      }
+      return res.data;
+    }),
+
+  twoFactorStatus: () => api.get('/api/2fa/status').then(r => r.data),
+  twoFactorEnrol: () => api.post('/api/2fa/enrol').then(r => r.data),
+  twoFactorConfirm: (code: string) =>
+    api.post('/api/2fa/confirm', { code }).then(r => r.data),
+  twoFactorDisable: (password: string) =>
+    api.post('/api/2fa/disable', { password }).then(r => r.data),
+
   logout: async () => {
     // Revoke server-side first; clearing localStorage alone used to leave the
     // session valid for anyone who still had the cookie.

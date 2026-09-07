@@ -69,11 +69,41 @@ KINDS: dict[str, tuple[str, str]] = {
         "HIGH",
         "An enrolment token was presented after it had already been used. The "
         "token is a one-time credential, so a second use means it leaked."),
-    "TLS_DOWNGRADE_REFUSED": (
+    "TOTP_CODE_REPLAYED": (
+        "HIGH",
+        "A second-factor code that had already been used was presented again. "
+        "The code is valid for its whole thirty-second step, so this is what "
+        "somebody watching one being typed would try."),
+    "RECOVERY_CODE_USED": (
         "MEDIUM",
-        "An agent tried the plaintext ingest port after this deployment "
-        "required TLS."),
+        "Somebody signed in with a recovery code instead of an authenticator. "
+        "Usually an honest lost phone; the other reading is a stolen password "
+        "and a stolen list."),
+    "TOTP_DISABLE_REFUSED": (
+        "HIGH",
+        "A wrong password was given when turning off two-factor. A hijacked "
+        "session trying to remove the control that would have stopped it "
+        "looks exactly like this."),
 }
+
+# `TLS_DOWNGRADE_REFUSED` was defined here and is deliberately gone.
+#
+# It described an agent trying the plaintext ingest port after the deployment
+# required TLS - and `INGEST_TLS_REQUIRED=1` does not open that listener at
+# all, so the server never sees the connection. The kind could not be raised
+# by design.
+#
+# Making it raisable would mean binding the port and refusing politely, and
+# that is worse for exactly the agents it would report. A build older than the
+# receipt frame marks its rows sent once `sendall` returns; a clean close
+# after we read its name would let it do that and lose the batch. ECONNREFUSED
+# raises inside `sendall`, so the rows stay put.
+#
+# The visibility is not lost, it is on the other side: a refused send becomes
+# `record_send_failure` on the agent, and the telemetry health view reports
+# the table as `send failing` with the connection error and counts it as
+# broken. That is the same fact, reported by the half of the system that can
+# report it without risking anybody's data.
 
 #: Severity order, so a caller can compare without hardcoding a list.
 SEVERITY_RANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}

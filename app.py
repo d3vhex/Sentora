@@ -111,6 +111,7 @@ app.static("/vite.svg", "./frontend/dist/vite.svg", name="frontend_logo")
 from ai.utils import load_ai_config, is_critical_log, save_ai_results
 from security import session as session_store
 from security import ssrf
+from security import totp as totp_store
 from core import agent_link
 from core import attack
 from core import config_validation
@@ -886,6 +887,14 @@ async def register_agent(request):
                 if not row:
                     return sanic_json({"status": "error", "message": "Token not recognized"}, status=404)
                 if row["used_at"] is not None:
+                    # A one-time credential presented a second time. The
+                    # ordinary cause is an installer re-run, and the one that
+                    # matters is a token that leaked - they are the same
+                    # request, so this is recorded rather than judged.
+                    await _platform_event(
+                        "ENROLMENT_TOKEN_REUSED", subject=token[:8] + "...",
+                        source_ip=_client_ip(request),
+                        detail=f"first used at {row['used_at']}")
                     return sanic_json({"status": "error", "message": "Token already used"}, status=409)
                 if row["expires_at"] and row["expires_at"] < datetime.now():
                     return sanic_json({"status": "error", "message": "Token expired"}, status=410)
@@ -1236,6 +1245,8 @@ _PUBLIC_HANDLERS = {
     # before the agent polled them, so they never ran and the UI showed them
     # green. They authenticate now — see _require_agent.
     "download_agent", "register_agent", "agent_bootstrap",
+    # See the path list above: the pending token is the credential.
+    "complete_second_factor",
     # The CA certificate, and only the certificate. It is the half of the pair
     # whose purpose is to be handed out, an installer needs it before it holds
     # any credential, and publishing it grants nothing - it lets a client check
@@ -1277,6 +1288,11 @@ _PUBLIC_EXACT_PATHS = {
     # here only because the operator session middleware would otherwise reject
     # the handshake before the handler is ever reached.
     "/agent-link",
+    # The second half of a login. There is no session yet by definition - the
+    # credential is the pending token, minted moments earlier by a correct
+    # password, single-use, five-minute lifetime, and able to do exactly one
+    # thing. Gating it on a session would make the second factor unreachable.
+    "/login/2fa",
     # The CA *certificate*, so an agent can verify a self-signed server.
     # Public on purpose: a certificate is the half of the pair meant to be
     # handed out, and an installer needs it before it has any credential.
@@ -1328,6 +1344,17 @@ def require_permission(permission_name):
             # The middleware already resolved this; skip the duplicate query.
             if not getattr(request.ctx, "permission_checked", False):
                 if not await user_has_permission(current_user_id(request), permission_name):
+                    # One is a mis-click. A run of them from one session is
+                    # somebody mapping what they can touch, and that only
+                    # looks like anything once the attempts are counted
+                    # together - which is what the fold in `self_defence`
+                    # does.
+                    await _platform_event(
+                        "PERMISSION_DENIED",
+                        subject=str(current_user_id(request) or "unknown"),
+                        source_ip=_client_ip(request),
+                        detail=f"reached for {permission_name!r} on "
+                               f"{request.path}")
                     return sanic_json({
                         "status": "error",
                         "message": f"Permission denied: '{permission_name}' required"
@@ -5211,6 +5238,32 @@ async def login(request):
                 # database this never happened. With a pool that failed to
                 # build at startup it happened every time, and told the person
                 # with the right password that it was wrong.
+                # The second factor, if this account has a confirmed one.
+                #
+                # Before the session, not after it. Issuing one and
+                # "upgrading" it once a code arrives leaves a window in which
+                # a single factor is a logged-in operator, and every bug in
+                # that window is a bypass.
+                async with userdb_conn() as f_cnx:
+                    f_cur = await f_cnx.cursor()
+                    try:
+                        needs_second = await _totp_required(f_cur, user_id)
+                    finally:
+                        await f_cur.close()
+                if needs_second:
+                    pending = await _begin_second_factor(
+                        request, user_id=user_id, username=db_username,
+                        auth_type="local")
+                    await log_login_attempt(username, "local", "pending",
+                                            "password accepted, second factor "
+                                            "required", ip)
+                    return response.json({
+                        "status": "second_factor_required",
+                        "token": pending,
+                        "expires_in": totp_store.PENDING_TTL_SECONDS,
+                        "message": "Enter the code from your authenticator.",
+                    })
+
                 try:
                     user_perms = await get_user_permissions(user_id)
                     raw_token = await _issue_session(
@@ -5348,9 +5401,34 @@ async def login(request):
                     print(f"[!] LDAP role lookup failed for {username!r}: {e}",
                           flush=True)
 
-                await log_login_attempt(username, "ldap", "success", "", ip)
                 user_perms = await get_role_permissions(app_role)
                 ldap_uid = await _upsert_ldap_user(username, app_role)
+
+                # The same gate as the local branch, and it has to be here
+                # too. A second factor that protects one login path and not
+                # the other protects nothing: an attacker with a password
+                # picks the path without it.
+                async with userdb_conn() as f_cnx:
+                    f_cur = await f_cnx.cursor()
+                    try:
+                        needs_second = await _totp_required(f_cur, ldap_uid)
+                    finally:
+                        await f_cur.close()
+                if needs_second:
+                    pending = await _begin_second_factor(
+                        request, user_id=ldap_uid, username=username,
+                        auth_type="ldap")
+                    await log_login_attempt(username, "ldap", "pending",
+                                            "password accepted, second factor "
+                                            "required", ip)
+                    return response.json({
+                        "status": "second_factor_required",
+                        "token": pending,
+                        "expires_in": totp_store.PENDING_TTL_SECONDS,
+                        "message": "Enter the code from your authenticator.",
+                    })
+
+                await log_login_attempt(username, "ldap", "success", "", ip)
                 raw_token = await _issue_session(
                     request, user_id=ldap_uid, username=username,
                     role=app_role, auth_type="ldap",
@@ -7405,6 +7483,436 @@ async def get_telemetry_health(request, agent):
         "tables": report,
         "broken_count": len(broken),
     })
+
+
+# ---------------------------------------------------------------------------
+# Second factor
+# ---------------------------------------------------------------------------
+
+async def _totp_tables(cur) -> None:
+    """Create the three tables on first use.
+
+    Alongside the rest of this file's guarded DDL rather than in
+    init_userdb.sql, so a deployment that predates two-factor gets them
+    without a migration step somebody has to remember to run.
+    """
+    for statement in (totp_store.DDL_SECRETS, totp_store.DDL_RECOVERY,
+                      totp_store.DDL_PENDING):
+        await cur.execute(statement)
+
+
+async def _totp_secret_for(cur, user_id: int) -> tuple[str | None, bool]:
+    """(secret, confirmed) for a user, decrypted, or (None, False).
+
+    An unreadable secret is reported as absent rather than raised. The one
+    situation that produces it is a Fernet key that has changed, and the
+    honest consequence is that the user has to enrol again - not that they
+    cannot log in at all.
+    """
+    await _totp_tables(cur)
+    await cur.execute(
+        "SELECT secret, confirmed_at FROM user_totp WHERE user_id = %s",
+        (user_id,))
+    row = await cur.fetchone()
+    if not row:
+        return None, False
+    try:
+        secret = fernet.decrypt(row[0].encode()).decode()
+    except Exception:
+        print(f"[2fa] the stored secret for user {user_id} cannot be "
+              f"decrypted; they will have to enrol again", flush=True)
+        return None, False
+    return secret, row[1] is not None
+
+
+async def _totp_required(cur, user_id: int) -> bool:
+    """Whether this user has a *confirmed* second factor.
+
+    Confirmed, not merely enrolled. A secret written when the QR code was
+    displayed and never proved would lock out everybody who scanned it into an
+    app they then deleted.
+    """
+    _, confirmed = await _totp_secret_for(cur, user_id)
+    return confirmed
+
+
+async def _begin_second_factor(request, *, user_id: int, username: str,
+                               auth_type: str) -> str:
+    """Park a half-authenticated login and return its one-use token.
+
+    Deliberately not a session. Issuing a real one and upgrading it later
+    leaves a window in which one factor is a logged-in operator, and every
+    bug in that window is a bypass.
+    """
+    raw = totp_store.new_pending_token()
+    async with userdb_conn() as cnx:
+        cur = await cnx.cursor()
+        try:
+            await _totp_tables(cur)
+            await cur.execute(
+                "INSERT INTO totp_pending (token_hash, user_id, username, "
+                "auth_type, ip, expires_at) VALUES (%s, %s, %s, %s, %s, "
+                "DATE_ADD(NOW(), INTERVAL %s SECOND))",
+                (totp_store.hash_pending(raw), user_id, username, auth_type,
+                 _client_ip(request), totp_store.PENDING_TTL_SECONDS))
+            # Opportunistic, and cheap: without it this table only grows, and
+            # an abandoned login is exactly the row nobody comes back for.
+            await cur.execute("DELETE FROM totp_pending WHERE expires_at < NOW()")
+            await cnx.commit()
+        finally:
+            await cur.close()
+    return raw
+
+
+@app.post("/login/2fa")
+async def complete_second_factor(request):
+    """Finish a login that passed its password.
+
+    Public in the session sense and not in any other: the pending token is a
+    credential minted moments ago by a correct password, and it can do exactly
+    one thing.
+    """
+    data = request.json or {}
+    raw_token = (data.get("token") or "").strip()
+    code = (data.get("code") or "").strip()
+    ip = _client_ip(request)
+
+    if not raw_token or not code:
+        return response.json({"status": "error",
+                              "message": "Both the login token and a code are "
+                                         "required."}, status=400)
+
+    async with userdb_conn() as cnx:
+        cur = await cnx.cursor()
+        try:
+            await _totp_tables(cur)
+            await cur.execute(
+                "SELECT user_id, username, auth_type, attempts FROM "
+                "totp_pending WHERE token_hash = %s AND expires_at > NOW()",
+                (totp_store.hash_pending(raw_token),))
+            pending = await cur.fetchone()
+            if not pending:
+                # Expired, already spent, or never existed - one message for
+                # all three, because telling them apart tells an attacker
+                # which half of a captured pair is still good.
+                return response.json({
+                    "status": "error",
+                    "message": "This login has expired. Sign in again.",
+                }, status=401)
+
+            user_id, username, auth_type, attempts = pending
+            if attempts >= totp_store.MAX_PENDING_ATTEMPTS:
+                await cur.execute("DELETE FROM totp_pending WHERE token_hash = %s",
+                                  (totp_store.hash_pending(raw_token),))
+                await cnx.commit()
+                await log_login_attempt(username, auth_type, "failure",
+                                        "too many second-factor attempts", ip)
+                return response.json({
+                    "status": "error",
+                    "message": "Too many attempts. Sign in again.",
+                }, status=429)
+
+            secret, confirmed = await _totp_secret_for(cur, user_id)
+            if not secret or not confirmed:
+                return response.json({
+                    "status": "error",
+                    "message": "This account has no second factor configured.",
+                }, status=409)
+
+            step = totp_store.verify(secret, code)
+            used_recovery = False
+            if step is None:
+                # A recovery code, maybe. Checked second so a normal login
+                # never touches the recovery table.
+                await cur.execute(
+                    "UPDATE user_recovery_codes SET used_at = NOW() "
+                    " WHERE user_id = %s AND code_hash = %s AND used_at IS NULL",
+                    (user_id, totp_store.hash_recovery(code)))
+                used_recovery = cur.rowcount == 1
+                if not used_recovery:
+                    await cur.execute(
+                        "UPDATE totp_pending SET attempts = attempts + 1 "
+                        " WHERE token_hash = %s",
+                        (totp_store.hash_pending(raw_token),))
+                    await cnx.commit()
+                    await log_login_attempt(username, auth_type, "failure",
+                                            "second factor rejected", ip)
+                    return response.json({
+                        "status": "error",
+                        "message": "That code is not valid.",
+                    }, status=401)
+            else:
+                # Single use, and this is the line that makes it so.
+                #
+                # TOTP is a shared secret and a clock: the same six digits are
+                # valid for the whole step, so without this anyone who watches
+                # a code being typed has thirty seconds to use it themselves.
+                # The comparison is `>=` rather than `=` so a code from
+                # *earlier* in the accepted window cannot be replayed either.
+                await cur.execute(
+                    "UPDATE user_totp SET last_step = %s "
+                    " WHERE user_id = %s AND (last_step IS NULL OR last_step < %s)",
+                    (step, user_id, step))
+                if cur.rowcount == 0:
+                    await cur.execute(
+                        "UPDATE totp_pending SET attempts = attempts + 1 "
+                        " WHERE token_hash = %s",
+                        (totp_store.hash_pending(raw_token),))
+                    await cnx.commit()
+                    await log_login_attempt(username, auth_type, "failure",
+                                            "second-factor code reused", ip)
+                    await _platform_event(
+                        "TOTP_CODE_REPLAYED", subject=username, source_ip=ip,
+                        detail="a code already used for this account was "
+                               "presented again")
+                    return response.json({
+                        "status": "error",
+                        "message": "That code has already been used. Wait for "
+                                   "the next one.",
+                    }, status=401)
+
+            # Spent, whichever factor it was.
+            await cur.execute("DELETE FROM totp_pending WHERE token_hash = %s",
+                              (totp_store.hash_pending(raw_token),))
+            await cur.execute(
+                "SELECT role, must_change_password, created_at FROM users "
+                " WHERE id = %s", (user_id,))
+            role_row = await cur.fetchone()
+            await cnx.commit()
+        finally:
+            await cur.close()
+
+    role = role_row[0] if role_row else None
+    must_change = bool(role_row[1]) if role_row else False
+
+    try:
+        user_perms = await get_user_permissions(user_id)
+        raw_session = await _issue_session(
+            request, user_id=user_id, username=username, role=role,
+            auth_type=auth_type)
+    except Exception as e:
+        print(f"[!] {username} passed both factors but the session could not "
+              f"be created: {e}", flush=True)
+        return response.json({
+            "status": "error",
+            "message": "Both factors were accepted, but this server could not "
+                       "start a session. This is a server fault, not a "
+                       "credential one.",
+        }, status=503)
+
+    await log_login_attempt(
+        username, auth_type, "success",
+        "recovery code" if used_recovery else "second factor", ip)
+    if used_recovery:
+        # Worth its own line and its own event: a recovery code means the
+        # normal factor was unavailable, which is either an honest lost phone
+        # or somebody who has the password and a stolen list.
+        await _platform_event("RECOVERY_CODE_USED", subject=username,
+                              source_ip=ip,
+                              detail="signed in with a recovery code rather "
+                                     "than an authenticator")
+
+    resp = response.json({
+        "status": "success",
+        "message": "Login successful.",
+        "user": {
+            "id": user_id, "username": username, "auth_type": auth_type,
+            "role": role, "permissions": user_perms,
+            "must_change_password": must_change,
+            "used_recovery_code": used_recovery,
+        },
+    })
+    _set_session_cookie(resp, raw_session)
+    return resp
+
+
+@app.get("/api/2fa/status")
+async def second_factor_status(request):
+    """Whether the signed-in operator has a second factor, and how many
+    recovery codes are left."""
+    user_id = current_user_id(request)
+    if not user_id:
+        return sanic_json({"status": "error", "message": "Unauthorized"},
+                          status=401)
+    async with userdb_conn() as cnx:
+        cur = await cnx.cursor()
+        try:
+            _, confirmed = await _totp_secret_for(cur, user_id)
+            await cur.execute(
+                "SELECT COUNT(*) FROM user_recovery_codes "
+                " WHERE user_id = %s AND used_at IS NULL", (user_id,))
+            remaining = (await cur.fetchone())[0]
+        finally:
+            await cur.close()
+    return sanic_json({"status": "success", "enabled": confirmed,
+                       "recovery_codes_remaining": int(remaining or 0)})
+
+
+@app.post("/api/2fa/enrol")
+async def second_factor_enrol(request):
+    """Start enrolment: a new secret and the URI to scan.
+
+    Nothing is enforced by this. The secret is written unconfirmed, and only
+    `/api/2fa/confirm` - which requires a working code from it - turns it on.
+    Enrolling in one step would lock out anybody whose app did not keep it.
+    """
+    user_id = current_user_id(request)
+    if not user_id:
+        return sanic_json({"status": "error", "message": "Unauthorized"},
+                          status=401)
+
+    secret = totp_store.new_secret()
+    async with userdb_conn() as cnx:
+        cur = await cnx.cursor()
+        try:
+            await _totp_tables(cur)
+            await cur.execute("SELECT username FROM users WHERE id = %s",
+                              (user_id,))
+            row = await cur.fetchone()
+            username = row[0] if row else str(user_id)
+            # Replaces any unconfirmed attempt. Re-scanning a QR code that was
+            # abandoned halfway is the ordinary case, not an error.
+            await cur.execute(
+                "INSERT INTO user_totp (user_id, secret, confirmed_at) "
+                "VALUES (%s, %s, NULL) ON DUPLICATE KEY UPDATE "
+                "secret = IF(confirmed_at IS NULL, VALUES(secret), secret)",
+                (user_id, fernet.encrypt(secret.encode()).decode()))
+            await cur.execute(
+                "SELECT confirmed_at FROM user_totp WHERE user_id = %s",
+                (user_id,))
+            already = (await cur.fetchone())[0] is not None
+            await cnx.commit()
+        finally:
+            await cur.close()
+
+    if already:
+        # Re-enrolling with one confirmed already would silently invalidate
+        # the factor they are using. Disabling is a separate, deliberate act.
+        return sanic_json({
+            "status": "error",
+            "message": "Two-factor is already enabled for this account. "
+                       "Disable it first if you want to enrol a new device.",
+        }, status=409)
+
+    return sanic_json({
+        "status": "success",
+        "secret": secret,
+        "uri": totp_store.provisioning_uri(secret, account=username,
+                                           issuer="Sentora"),
+        "digits": totp_store.DIGITS,
+        "period": totp_store.STEP_SECONDS,
+    })
+
+
+@app.post("/api/2fa/confirm")
+async def second_factor_confirm(request):
+    """Prove a code from the new secret, and receive the recovery codes.
+
+    The recovery codes are returned here and nowhere else, ever. They are
+    stored as hashes, so the server genuinely cannot show them again - which
+    is the property that makes them safe to store at all.
+    """
+    user_id = current_user_id(request)
+    if not user_id:
+        return sanic_json({"status": "error", "message": "Unauthorized"},
+                          status=401)
+    code = ((request.json or {}).get("code") or "").strip()
+
+    async with userdb_conn() as cnx:
+        cur = await cnx.cursor()
+        try:
+            secret, confirmed = await _totp_secret_for(cur, user_id)
+            if not secret:
+                return sanic_json({"status": "error",
+                                   "message": "Start enrolment first."},
+                                  status=409)
+            if confirmed:
+                return sanic_json({"status": "error",
+                                   "message": "Two-factor is already enabled."},
+                                  status=409)
+            step = totp_store.verify(secret, code)
+            if step is None:
+                return sanic_json({
+                    "status": "error",
+                    "message": "That code is not valid. Check the time on the "
+                               "device running your authenticator.",
+                }, status=400)
+
+            codes = totp_store.new_recovery_codes()
+            await cur.execute(
+                "UPDATE user_totp SET confirmed_at = NOW(), last_step = %s "
+                " WHERE user_id = %s", (step, user_id))
+            await cur.execute("DELETE FROM user_recovery_codes WHERE user_id = %s",
+                              (user_id,))
+            for one in codes:
+                await cur.execute(
+                    "INSERT INTO user_recovery_codes (user_id, code_hash) "
+                    "VALUES (%s, %s)", (user_id, totp_store.hash_recovery(one)))
+            await cnx.commit()
+        finally:
+            await cur.close()
+
+    await audit_log(request, "2FA_ENABLED", str(user_id),
+                    "second factor confirmed and recovery codes issued")
+    return sanic_json({
+        "status": "success",
+        "recovery_codes": codes,
+        "message": "Two-factor is on. Save these recovery codes now - they "
+                   "are stored as hashes and cannot be shown again.",
+    })
+
+
+@app.post("/api/2fa/disable")
+async def second_factor_disable(request):
+    """Turn it off, with the current password.
+
+    The password is required because a hijacked session must not be able to
+    remove the control that would have stopped it. That is the whole reason
+    this endpoint is not simply "delete the row".
+    """
+    user_id = current_user_id(request)
+    if not user_id:
+        return sanic_json({"status": "error", "message": "Unauthorized"},
+                          status=401)
+    password = ((request.json or {}).get("password") or "")
+    if not password:
+        return sanic_json({"status": "error",
+                           "message": "Your password is required to turn off "
+                                      "two-factor."}, status=400)
+
+    async with userdb_conn() as cnx:
+        cur = await cnx.cursor()
+        try:
+            await cur.execute("SELECT password FROM users WHERE id = %s",
+                              (user_id,))
+            row = await cur.fetchone()
+            ok = False
+            if row:
+                try:
+                    ok = bcrypt.checkpw(password.encode("utf-8"),
+                                        row[0].encode("utf-8"))
+                except ValueError:
+                    ok = False       # an LDAP placeholder hash
+            if not ok:
+                await _platform_event(
+                    "TOTP_DISABLE_REFUSED", subject=str(user_id),
+                    source_ip=_client_ip(request),
+                    detail="wrong password given when turning off two-factor")
+                return sanic_json({"status": "error",
+                                   "message": "That password is not correct."},
+                                  status=403)
+            await cur.execute("DELETE FROM user_totp WHERE user_id = %s",
+                              (user_id,))
+            await cur.execute("DELETE FROM user_recovery_codes WHERE user_id = %s",
+                              (user_id,))
+            await cnx.commit()
+        finally:
+            await cur.close()
+
+    await audit_log(request, "2FA_DISABLED", str(user_id),
+                    "second factor removed by the account holder")
+    return sanic_json({"status": "success",
+                       "message": "Two-factor is off for this account."})
 
 
 @app.route("/api/platform/events")

@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { NavLink, Link } from 'react-router-dom';
-import { Activity, BrainCircuit, ChevronRight, ClipboardList, Database, Download, Grid3x3, Key, LayoutDashboard, LogOut, Monitor, PlaySquare, Radar, Save, Search, Settings, ShieldAlert, Users, X, Zap } from 'lucide-react';
+import { Activity, BrainCircuit, ChevronRight, ClipboardList, Database, Download, Grid3x3, Key, LayoutDashboard, LogOut, Monitor, PlaySquare, Radar, Save, Search, Settings, ShieldAlert, ShieldCheck, Users, X, Zap } from 'lucide-react';
 import { authService } from '../services/api';
 
 interface SidebarProps {
@@ -157,6 +157,9 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen }) => {
           {authService.hasPermission('manage_db') && <SidebarLink to="/admin/databases" icon={<Database size={18} />} label="Databases" />}
           {authService.hasPermission('read_telemetry') && <SidebarLink to="/admin/login-logs" icon={<Key size={18} />} label="Access Logs" />}
           {authService.hasPermission('read_telemetry') && <SidebarLink to="/admin/audit" icon={<ClipboardList size={18} />} label="Activity Logs" />}
+          {/* Ungated on purpose - see the route. A link only some roles can
+              see would leave the rest unable to secure their own account. */}
+          <SidebarLink to="/account/security" icon={<ShieldCheck size={18} />} label="My Security" />
         </div>
       </nav>
 
