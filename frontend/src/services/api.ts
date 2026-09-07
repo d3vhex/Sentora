@@ -256,6 +256,11 @@ export const adminService = {
 
   getLoginLogs: () => api.get('/login-logs').then(res => res.data),
   getAuditLogs: () => api.get('/audit-logs').then(res => res.data),
+  // Attacks on the platform itself, as opposed to on the fleet. Separate from
+  // the audit log: that records what operators did, this records what was
+  // attempted against them.
+  getPlatformEvents: (hours = 24) =>
+    api.get('/api/platform/events', { params: { hours } }).then(res => res.data),
 };
 
 export default api;

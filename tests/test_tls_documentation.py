@@ -125,14 +125,42 @@ def test_the_ports_table_covers_the_tls_listener():
 def test_closing_the_plaintext_path_documents_both_halves():
     """`INGEST_TLS_REQUIRED=1` closes the listener inside the container while
     Docker goes on publishing the port. A connection is then accepted by the
-    proxy and the batch written into a socket nobody reads - which is why the
-    port mapping has to go too, and why the guide has to say so."""
+    proxy and the batch written into a socket nobody reads - so the port has
+    to be unpublished too, and the guide has to say both.
+
+    Asserted as the property rather than the mechanism. The first version
+    checked for the literal `"5001:5001"`, because the instruction then was to
+    delete that line from a tracked compose file - which is a bad thing to ask
+    an operator to do, and the moment it became an environment variable this
+    test failed against a guide that had just got better.
+    """
     section = _tls_section()
-    assert "INGEST_TLS_REQUIRED=1" in section
-    assert '"5001:5001"' in section, (
+    assert "INGEST_TLS_REQUIRED=1" in section, \
+        "the guide never says how to stop the listener"
+    assert "INGEST_PLAINTEXT_BIND" in section, (
         "the guide tells the operator to require TLS without telling them to "
         "stop publishing the plaintext port"
     )
+
+
+def test_unpublishing_the_port_is_something_compose_can_actually_do():
+    """A documented setting that no file reads is what this whole suite exists
+    for."""
+    import yaml
+
+    compose = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
+    published = compose["services"]["ingest"]["ports"]
+    plaintext = [p for p in published if str(p).endswith("5001:5001")]
+    assert plaintext, "the plaintext port is no longer published at all"
+    assert "INGEST_PLAINTEXT_BIND" in str(plaintext[0]), (
+        "the guide names INGEST_PLAINTEXT_BIND and compose ignores it, so "
+        "following the migration leaves the port open"
+    )
+
+    # And the default still publishes, because a fresh install that is not on
+    # TLS yet needs 5001 to work without editing a tracked file.
+    assert ":-0.0.0.0}" in str(plaintext[0]), \
+        "the default now hides the plaintext port from every new deployment"
 
 
 def test_the_agent_side_of_that_trap_is_implemented():
