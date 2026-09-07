@@ -80,6 +80,13 @@ const TECHNIQUE_TACTIC: Record<string, string> = {
   T1047: 'execution', T1566: 'initial-access',
   T1482: 'discovery', T1546: 'persistence', T1556: 'credential-access',
   T1563: 'lateral-movement',
+  // The end of the kill chain, which the rule set was blind to until the
+  // coverage was measured rather than assumed: nothing at all for collection
+  // or exfiltration, and one rule for impact.
+  T1560: 'collection', T1074: 'collection', T1113: 'collection',
+  T1115: 'collection', T1056: 'collection',
+  T1567: 'exfiltration', T1048: 'exfiltration',
+  T1489: 'impact',
 };
 
 const tacticOf = (technique: string): string =>

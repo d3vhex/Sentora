@@ -1,0 +1,83 @@
+title: File Pushed Off The Host Over A Non-Interactive Channel
+id: a2f37e50-8c94-4d16-b7e3-5f108ca6db29
+status: stable
+description: >
+    A server has fewer excuses than a workstation. Nobody is sitting at it
+    browsing, so an outbound transfer carrying a local file is either a job
+    somebody configured or somebody taking something.
+
+    Two shapes, and each is a different level of deliberate. `curl -T` and
+    `curl --upload-file` say a file is the payload rather than the response.
+    And a file redirected into `nc`, `openssl s_client` or `/dev/tcp` is a raw
+    socket carrying bytes with no protocol to inspect - which is chosen
+    precisely because there is nothing for a proxy to read.
+
+    `scp` and `rsync` were a third branch and are deliberately gone. They are
+    how a server is administered: the sample `rsync -az --delete /srv/data/
+    backup-01:/srv/data/` is a scheduled backup, and a rule that pages on
+    every backup gets muted - which is worse than not having it, because the
+    console still counts it as coverage. Catching that would need to know
+    which destinations belong to the estate, and this rule cannot.
+
+    `/dev/tcp` deserves the attention. It is a bash builtin, so it needs
+    nothing installed, leaves no binary to find, and works on a host stripped
+    of every network tool. On a system where somebody has removed curl to
+    harden it, this is what is left.
+
+    The paste and tunnel services are matched on their own. A managed Linux
+    host has no routine business with them, and naming them catches the
+    transfers that use an ordinary POST rather than a recognisable switch.
+references:
+    - https://attack.mitre.org/techniques/T1048/
+    - https://attack.mitre.org/techniques/T1567/002/
+author: Sentora
+date: 2026/09/07
+logsource:
+    product: linux
+    category: process_creation
+detection:
+    curl_upload:
+        CommandLine|contains|all:
+            - 'curl'
+        CommandLine|contains:
+            - ' -T '
+            - ' -F '
+            - '--upload-file'
+            - '--data-binary @'
+    raw_socket:
+        CommandLine|contains:
+            - '/dev/tcp/'
+            - 'nc -'
+            - 'ncat '
+            - 'openssl s_client'
+    reads_a_file:
+        CommandLine|contains:
+            - ' < '
+            # `cat /` and not `cat `, because `cat ` is a substring of `ncat `
+            # and matched every netcat command line - including the reverse
+            # shell that has its own rule. An absolute path after it is what
+            # actually says a file is being read.
+            - 'cat /'
+            - '@/'
+    known_drop_service:
+        CommandLine|contains:
+            - 'pastebin.com'
+            - 'transfer.sh'
+            - 'file.io'
+            - 'anonfiles'
+            - 'gofile.io'
+            - 'ngrok.io'
+            - 'webhook.site'
+            - 'api.telegram.org'
+            - 'discord.com/api/webhooks'
+    condition: known_drop_service or curl_upload or
+        (raw_socket and reads_a_file)
+falsepositives:
+    - A deployment script posting an artefact to an internal service with
+      `curl -T`. The hostname is what separates it from exfiltration.
+    - Health-check tooling using netcat with a here-string rather than a file.
+level: high
+tags:
+    - attack.exfiltration
+    - attack.t1048
+    - attack.t1567.002

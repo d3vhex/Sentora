@@ -23,6 +23,23 @@ This is deliberately narrow. It cannot tell whether a match *means* an
 intrusion - `vssadmin delete shadows` is run by backup software too. It only
 refuses claims that nothing in the log supports, which is the failure that
 kept coming back.
+
+Narrow in a second sense too, and it is worth writing down because the pull is
+constant. These six are the prompt's definition of CRITICAL, not a catalogue of
+techniques. Every Sigma rule added to the platform is a temptation to add a
+marker beside it - and a marker forces CRITICAL, which bypasses the confidence
+gate and puts the event in front of a person. `net user /add` is a real
+technique and also what the helpdesk does all morning; `net group "Domain
+Admins"` is reconnaissance and also the first thing an administrator types.
+Those belong to the rules, which can score and be tuned. What belongs here is
+evidence that is hard to produce accidentally.
+
+The markers must also match what the *agent* ships. The Windows collector sends
+`StringInserts` joined with " | " and never calls the message formatter, so
+"The audit log was cleared" and "A service was installed in the system" - both
+of which were markers here - are text this platform does not produce. They
+matched hand-written corpus lines and nothing else. The `eid=` forms below are
+the same intent against the real message.
 """
 
 from __future__ import annotations
@@ -43,6 +60,12 @@ CRITERIA: dict[str, tuple[str, list[list[str]]]] = {
         ["reg", "save", "hklm\\system"],
         ["ntds.dit"],
         ["lsass.dmp"],
+        # `ntds.dit` above is the file, and the supported way of extracting it
+        # never names it: `ntdsutil "ac i ntds" "ifm" "create full C:\..."`
+        # writes the database and the SYSTEM hive that decrypts it into a
+        # directory of your choosing. Every domain hash, from a signed tool
+        # that is meant to be run on a domain controller.
+        ["ntdsutil", "ifm"],
     ]),
     "C2": ("remote execution", [
         # Administrative shares specifically. The marker here was
@@ -57,12 +80,32 @@ CRITERIA: dict[str, tuple[str, list[list[str]]]] = {
     ]),
     "C3": ("evidence destruction", [
         # Not a bare "1102": that is four digits and appears in process IDs,
-        # byte counts and timestamps. The phrase is what identifies the event.
+        # byte counts and timestamps. `EID=1102` is how the agent writes the
+        # event id and cannot be a byte count.
+        #
+        # The three phrases below were the only markers here, and 1102 never
+        # matched one. They are the message *template*; the collector sends
+        # StringInserts, which for 1102 are four fields naming the account that
+        # did it and no prose at all. The phrases stay for producers that do
+        # render - a forwarded syslog line, a pasted log - and `eid=1102` is
+        # the same event as it actually arrives.
+        ["eid=1102"],
         ["audit log was cleared"],
         ["event log was cleared"],
         ["the system log was cleared"],
+        # The command rather than the record it leaves. `wevtutil archive` is
+        # log rotation and runs nightly on managed estates, so ` cl ` is
+        # required: that is the clear subcommand and nothing else spells it.
+        ["wevtutil", " cl "],
         ["add-mppreference", "exclusionpath"],
         ["set-mppreference", "disablerealtimemonitoring"],
+        # Not destruction of evidence but prevention of it, which is what the
+        # two mppreference markers above already are. Turning the scanner,
+        # the in-process scan interface or the firewall off is a step taken so
+        # that the next step produces nothing to find.
+        ["amsiinitfailed"],
+        ["advfirewall", "state off"],
+        ["stop", "windefend"],
     ]),
     "C4": ("persistence to a writable path", [
         # A path is a location, not a mechanism, and this used to match on
@@ -77,7 +120,18 @@ CRITERIA: dict[str, tuple[str, list[list[str]]]] = {
         # that will run again; a file in a writable directory is not.
         ["currentversion\\run", "users\\public"],
         ["currentversion\\run", "\\temp\\"],
-        ["currentversion\\run", "\\appdata\\"],
+        # A Run key into AppData is deliberately absent, and it was still here
+        # paired with the key path - which is the same alternative the comment
+        # above says was removed, written longer. The corpus case for it
+        # spells the key out in full (`HKLM\SOFTWARE\Microsoft\Windows\
+        # CurrentVersion\Run\Updater` -> `AppData\Roaming\updater.exe`, which
+        # is what Sysmon EID 13 actually contains), so it matched, and this
+        # criterion forces CRITICAL. Its expected verdict is SUSPICIOUS: the
+        # eval could never score it right whatever the model said, and nothing
+        # reported that because the only test of it elided `CurrentVersion`
+        # from the path and the benign-corpus test looks at NOT_CRITICAL rows
+        # only. Badly packaged software installs Run keys into AppData; the
+        # model gets to judge that one.
         ["currentversion\\run", "programdata"],
         ["schtasks", "/create", "users\\public"],
         ["schtasks", "/create", "\\temp\\"],
@@ -85,6 +139,13 @@ CRITERIA: dict[str, tuple[str, list[list[str]]]] = {
         ["scheduled task was created", "\\temp\\"],
         ["service was installed", "users\\public"],
         ["service was installed", "\\temp\\"],
+        # Same correction as C3's 1102. "A service was installed in the
+        # system" is the template; 7045 arrives as five inserts - service
+        # name, image path, type, start type, account - and the sentence is
+        # not among them. The pairing is unchanged: a service is a mechanism,
+        # and the path is what makes this one worth waking somebody for.
+        ["eid=7045", "users\\public"],
+        ["eid=7045", "\\temp\\"],
     ]),
     "C5": ("obfuscated execution", [
         # `-enc` alone was here and is not an indicator - the corpus makes
@@ -98,6 +159,13 @@ CRITERIA: dict[str, tuple[str, list[list[str]]]] = {
         ["iex(", "new-object"],
         ["iex (", "new-object"],
         ["frombase64string", "invoke-expression"],
+        # `downloadstring` above is already a fetch rather than an
+        # obfuscation, so this criterion has held "remote code arrives and
+        # runs" from the start. certutil is the same act through a binary
+        # Microsoft signed, which is the whole reason it is chosen -
+        # application allow-listing does not stop it. `-urlcache` is required
+        # because certutil's ordinary work is certificates, not downloads.
+        ["certutil", "-urlcache"],
     ]),
     "C6": ("destruction of recovery", [
         ["vssadmin", "delete", "shadows"],

