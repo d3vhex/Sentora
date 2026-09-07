@@ -1,0 +1,80 @@
+title: Local Data Collected Into An Archive In A Staging Directory
+id: 3f8a1d64-7c52-4e09-b3d7-9a1e6f0c58b2
+status: stable
+description: >
+    Data almost never leaves a host as loose files. It is gathered, compressed
+    into one object, and then moved - because one upload is quicker, quieter
+    and far less likely to be interrupted halfway than three thousand.
+
+    The rule is on the pairing, not on the tools. rar, 7-Zip, tar and
+    Compress-Archive are ordinary; so is writing to %TEMP%. What is not
+    ordinary is an archive being *created* in a directory nobody keeps
+    documents in - Temp, ProgramData, the Public profile, a Recycle Bin - and
+    that combination is what an operator needs to see.
+
+    Password-protected archives get their own branch and no location
+    requirement. `rar a -hp` exists to make an archive whose contents cannot
+    be inspected in transit, which is a reason a backup script does not have.
+
+    This is the step before exfiltration, and it is the last one that still
+    happens on a host you control. After this the data is a single file and
+    the next event is it leaving.
+references:
+    - https://attack.mitre.org/techniques/T1560/001/
+    - https://attack.mitre.org/techniques/T1074/001/
+author: Sentora
+date: 2026/09/07
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    rar_create:
+        CommandLine|contains|all:
+            - 'rar'
+            - ' a '
+    sevenzip_create:
+        CommandLine|contains|all:
+            - '7z'
+            - ' a '
+    tar_create:
+        # `tar -c` as one string, not `tar` and `-c` separately. `Start-Sleep`
+        # contains "tar", and any PowerShell line with `-c` in it then matched
+        # - a clipboard-stealing loop fired this rule for no reason. Same
+        # class as `cat ` matching inside `ncat `.
+        CommandLine|contains:
+            - 'tar -c'
+            - 'tar.exe -c'
+            - 'tar cf'
+            - 'tar czf'
+    powershell_archive:
+        CommandLine|contains: 'Compress-Archive'
+    makecab:
+        CommandLine|contains: 'makecab'
+    staging_location:
+        CommandLine|contains:
+            - '\Temp\'
+            - '\Windows\Temp'
+            - '\ProgramData\'
+            - '\Users\Public'
+            - '\$Recycle.Bin'
+            - '\PerfLogs'
+            - 'C:\Windows\Tasks'
+    password_protected:
+        CommandLine|contains:
+            - ' -hp'
+            - ' -p'
+    condition: >
+        ((rar_create or sevenzip_create) and password_protected) or
+        ((rar_create or sevenzip_create or tar_create or powershell_archive or
+          makecab) and staging_location)
+falsepositives:
+    - A backup or packaging job that legitimately stages in %TEMP%. Those
+      repeat on a schedule from the same parent, which is what tells them
+      apart from a one-off collection.
+    - Installers unpacking into ProgramData. Those extract rather than create,
+      and this rule keys on the create switch.
+level: high
+tags:
+    - attack.collection
+    - attack.t1560.001
+    - attack.t1074.001

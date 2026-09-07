@@ -18,6 +18,7 @@ decision into code.
 """
 from __future__ import annotations
 
+import json
 import types
 
 import pytest
@@ -195,35 +196,149 @@ def test_both_callers_use_it():
 # What these markers do and do not demonstrate
 # --------------------------------------------------------------------------
 
-def test_the_markers_cover_the_constructed_attacks():
-    """8/8 on the corpus, and that number proves less than it looks.
+# Corpus positives the six criteria do not cover, each with the reason. This
+# list is the point of the three tests below: it is short, it is argued, and
+# adding to it is a decision somebody has to write down rather than a test
+# quietly going green.
+#
+# The corpus outgrew this file. It began as eight cases built alongside these
+# markers and is now also what proves every Sigma rule fires, so it grows every
+# time a rule is added - and "every corpus positive must match a marker" then
+# reads as "every new rule needs a marker beside it". That is the wrong
+# direction. A marker forces CRITICAL and skips the confidence gate, so the bar
+# is evidence that is hard to produce by accident, not evidence that a
+# technique was used.
+OUTSIDE_THE_CRITERIA = {
+    "constructed:t1560-archive-staged":
+        "Collection. `rar a -hp` in Temp is a strong signal and `rar a` is a "
+        "backup job; separating them needs the location and the parent, which "
+        "is rule work.",
+    "constructed:t1115-clipboard-capture":
+        "Collection. `Get-Clipboard` is a documented cmdlet with ordinary "
+        "uses; the loop and the hidden window are what make it theft.",
+    "constructed:t1567-web-upload":
+        "Exfiltration. `Invoke-RestMethod -Method Post` is how half of this "
+        "estate's own automation talks to its own APIs. The destination is "
+        "what separates them and this cannot know which hosts are ours.",
+    "constructed:t1087-domain-recon":
+        "Discovery. `net group \"Domain Admins\"` is the first thing an "
+        "administrator types and the first thing an intruder types.",
+    "constructed:t1136-local-admin-added":
+        "Account creation. The helpdesk does this all morning.",
+    "constructed:t1566-office-spawns-shell":
+        "The evidence is a parent-child relationship, not a string. WINWORD "
+        "spawning cmd is damning and neither name is suspicious alone.",
+    "constructed:t1546-wmi-subscription":
+        "Fileless persistence. `__EventFilter` in `root\\subscription` looks "
+        "specific until you remember ConfigMgr is built on WMI subscriptions.",
+    "constructed:t1563-rdp-session-hijack":
+        "`tscon /dest:` takes over another user's session. Rare, but it is "
+        "also how an administrator reconnects a hung session, and there is no "
+        "second string that says which happened.",
+}
 
-    The markers and the corpus positives were written by the same person from
-    the same list of techniques, so matching all of them is close to
-    circular - the cases were built around the strings the markers look for.
 
-    The half that is evidence is the negatives: four of them are events this
-    deployment actually produced, and none was in view when the markers were
-    written. `test_the_observed_false_positives_match_nothing` is the test
-    that carries weight.
-    """
-    import json
+def _corpus_rows():
     import pathlib
 
     corpus = (pathlib.Path(__file__).resolve().parent.parent
               / "evals" / "corpus_attacks.jsonl")
-    rows = [json.loads(l) for l in corpus.read_text(encoding="utf-8").splitlines()
-            if l.strip()]
-    positives = [r for r in rows if r["expected"] == "CRITICAL"]
+    return [json.loads(l) for l
+            in corpus.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+def _matches_any_criterion(row) -> bool:
+    return any(criteria.supported_by(tag, json.dumps(row["event"]))
+               for tag in criteria.CRITERIA)
+
+
+def test_the_markers_cover_every_attack_they_claim_to():
+    """Everything the criteria are meant to catch, minus what is argued out
+    above.
+
+    The number this produces proves less than it looks: the markers and most
+    of the corpus positives were written by the same person from the same list
+    of techniques, so matching them is close to circular. The half that is
+    evidence is the negatives - four of them are events this deployment
+    actually produced, and none was in view when the markers were written.
+    `test_the_observed_false_positives_match_nothing` is the test that carries
+    weight.
+
+    What this one is still good for is the day a marker stops matching. Three
+    did, silently: "the audit log was cleared" and "a service was installed"
+    are message templates, and the collector ships StringInserts.
+    """
+    positives = [r for r in _corpus_rows() if r["expected"] == "CRITICAL"]
     assert positives, "the corpus has no positives"
 
-    matched = [r for r in positives
-               if any(criteria.supported_by(tag, json.dumps(r["event"]))
-                      for tag in criteria.CRITERIA)]
-    assert len(matched) == len(positives), (
-        "attacks with no marker: "
-        + ", ".join(r["id"] for r in positives if r not in matched)
+    in_scope = [r for r in positives if r["id"] not in OUTSIDE_THE_CRITERIA]
+    missing = [r["id"] for r in in_scope if not _matches_any_criterion(r)]
+    assert not missing, (
+        "attacks with no marker: " + ", ".join(missing) + ". Either add the "
+        "marker or add the case to OUTSIDE_THE_CRITERIA with the reason."
     )
+
+
+def test_the_uncovered_attacks_are_a_decision_and_not_an_oversight():
+    """Both directions, because the list rots either way.
+
+    An id that leaves the corpus leaves a stale excuse behind. And an entry
+    that starts matching means a marker widened until it covers a case
+    somebody argued should stay out - which is how `appdata` got back in,
+    written longer.
+    """
+    rows = {r["id"]: r for r in _corpus_rows()}
+    stale = sorted(set(OUTSIDE_THE_CRITERIA) - set(rows))
+    assert not stale, f"no longer in the corpus: {stale}"
+
+    now_matching = sorted(i for i in OUTSIDE_THE_CRITERIA
+                          if _matches_any_criterion(rows[i]))
+    assert not now_matching, (
+        f"markers now cover cases argued out: {now_matching}. If that is "
+        f"deliberate, delete the entry; if not, the marker is too wide."
+    )
+
+
+def test_nothing_argued_out_of_the_criteria_falls_through_the_rules_too():
+    """The reason the list above is acceptable.
+
+    Each of those cases is left to the Sigma rules, which can score and be
+    tuned rather than forcing CRITICAL. That is only true while a rule
+    actually fires on it - otherwise "the rules handle it" is an assumption,
+    and the case is covered by nothing at all.
+    """
+    from core.sigma_loader import load_dir, match_all
+
+    from tests.test_sigma_builtin_rules import RULES_DIR, _as_event, _message
+
+    rules = load_dir(RULES_DIR).rules
+    rows = {r["id"]: r for r in _corpus_rows()}
+    unwatched = sorted(i for i in OUTSIDE_THE_CRITERIA
+                       if not match_all(rules, _as_event(_message(rows[i]))))
+    assert not unwatched, (
+        f"no criterion and no rule: {unwatched}. Nothing sees these."
+    )
+
+
+def test_no_case_below_critical_is_forced_to_critical():
+    """`apply()` promotes a supported criterion to CRITICAL, so a marker that
+    reaches a case the corpus grades SUSPICIOUS makes it unscoreable - the
+    eval compares against `expected` exactly, and no answer from the model can
+    win.
+
+    The other benign test looks at NOT_CRITICAL rows only, which left the two
+    SUSPICIOUS ones unwatched. A Run key into AppData sat there being forced
+    to CRITICAL by a marker whose own comment said it had been removed.
+    """
+    for row in _corpus_rows():
+        if row["expected"] == "CRITICAL":
+            continue
+        verdict = v(claimed="none", verdict=row["expected"])
+        criteria.apply(verdict, json.dumps(row["event"]))
+        assert verdict.verdict != "CRITICAL", (
+            f"{row['id']} is graded {row['expected']} and a criterion forces "
+            f"it to CRITICAL"
+        )
 
 
 def test_no_benign_case_matches_a_marker():
@@ -302,9 +417,66 @@ def test_a_run_key_into_appdata_is_not_forced_to_critical():
     Removing it cost nothing measurable - all eight attack cases still match a
     criterion - and a Run key into AppData is still worth a look. That is a
     judgement, which is the model's half of this.
+
+    It was not removed. `currentversion\\run` + `\\appdata\\` survived as a
+    pair, which is the same alternative written longer, and this test did not
+    notice because its sample elides the key path as `HKLM\\...\\Run` - so the
+    first marker was missing and the assertion passed for the wrong reason.
+    The full path below is what Sysmon EID 13 writes, and it is the corpus
+    case `constructed:t1547-run-key`, graded SUSPICIOUS.
     """
+    key = (r"TargetObject=HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion"
+           r"\Run\Updater | Details=C:\Users\jdoe\AppData\Roaming\updater.exe")
+    assert not criteria.supported_by("C4", key)
+
+
+def test_the_markers_match_what_the_agent_ships_not_what_event_viewer_renders():
+    """Three markers here could never have fired in production.
+
+    "The audit log was cleared" and "A service was installed in the system"
+    are message *templates*. Windows stores the fields and renders the
+    sentence when something asks it to; the collector joins `StringInserts`
+    with " | " and never asks. For 1102 those inserts are four fields naming
+    the account, and for 7045 they are the service name, image path, type,
+    start type and account. No prose in either.
+
+    So C3 matched clearing the audit log only in hand-written corpus lines,
+    and C4's service branch the same. Both events have their own Sigma rule
+    keyed on the event id, which is why nobody noticed - one layer covered it
+    and the other reported coverage it did not have.
+
+    These two strings are the real shape, and neither contains the sentence.
+    """
+    cleared = ("[Security] EID=1102, Cat=13568 | "
+               r"S-1-5-21-1111111111-2222222222-3333333333-1001 | jdoe | "
+               "CORP | 0x3e7")
+    assert "cleared" not in cleared.lower(), "the sentence is not in the event"
+    assert criteria.supported_by("C3", cleared)
+
+    installed = ("[System] EID=7045, Cat=0 | WinHelpSvc | "
+                 r"C:\Windows\Temp\svc.exe | user mode service | "
+                 "auto start | LocalSystem")
+    assert "installed" not in installed.lower(), "nor in this one"
+    assert criteria.supported_by("C4", installed)
+
+
+def test_a_service_from_a_normal_location_is_still_not_persistence():
+    """The 7045 pairing is unchanged by the format fix: the event id alone is
+    not the evidence. Software arrives on a managed estate as a service
+    installed from the distribution point, and that is the benign corpus
+    case."""
+    ordinary = ("[System] EID=7045, Cat=0 | NinjaRMMAgent | "
+                r"\\corp-sccm01\SoftwareDist$\NinjaRMMAgent.exe | "
+                "user mode service | auto start | LocalSystem")
+    assert not criteria.supported_by("C4", ordinary)
+
+
+def test_log_rotation_is_not_log_clearing():
+    """`wevtutil` is both. The nightly job archives the Application log and
+    this deployment produced one; ` cl ` is the subcommand that destroys."""
     assert not criteria.supported_by(
-        "C4", r"TargetObject=HKLM\...\Run\Updater Details=C:\Users\jdoe\AppData\Roaming\updater.exe")
+        "C3", r"CommandLine=wevtutil.exe archive-log C:\Logs\App.evtx")
+    assert criteria.supported_by("C3", "CommandLine=wevtutil.exe cl Security")
 
 
 def test_a_writable_path_needs_a_mechanism_beside_it():

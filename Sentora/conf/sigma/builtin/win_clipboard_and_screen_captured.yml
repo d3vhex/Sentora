@@ -1,0 +1,64 @@
+title: Clipboard Or Screen Captured From A Script Host
+id: 8b2c7f19-64ad-4f83-a5e1-0d3b96c7e4f8
+status: stable
+description: >
+    Two things on a workstation carry credentials that never touch a file: the
+    clipboard, which is where a password manager puts a password for the
+    fifteen seconds before it is pasted, and the screen, which is where it is
+    displayed.
+
+    Both are reachable from PowerShell in one line, with no dropped binary and
+    nothing to allow-list against. `Get-Clipboard` is a supported cmdlet.
+    `CopyFromScreen` is one call on a Graphics object. Neither needs
+    privileges beyond the user's own, which is the point - this is what an
+    attacker does *after* landing as an ordinary user and before finding
+    anything worth escalating to.
+
+    Scoped to script hosts rather than to the calls alone. A person copying
+    text is not this; a script reading what they copied is.
+
+    Repetition is what separates a helper script from surveillance, and this
+    rule cannot see it - `core.correlation` counts recurrence across events,
+    and one hit here is worth looking at rather than acting on.
+references:
+    - https://attack.mitre.org/techniques/T1115/
+    - https://attack.mitre.org/techniques/T1113/
+author: Sentora
+date: 2026/09/07
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    script_host:
+        CommandLine|contains:
+            - 'powershell'
+            - 'pwsh'
+            - 'cscript'
+            - 'wscript'
+    clipboard_read:
+        CommandLine|contains:
+            - 'Get-Clipboard'
+            - 'Windows.Forms.Clipboard'
+            - 'GetText()'
+    screen_capture:
+        CommandLine|contains:
+            - 'CopyFromScreen'
+            - 'Drawing.Bitmap'
+            - 'PrimaryScreen'
+    keystroke_hooks:
+        CommandLine|contains:
+            - 'GetAsyncKeyState'
+            - 'SetWindowsHookEx'
+    condition: keystroke_hooks or (script_host and (clipboard_read or screen_capture))
+falsepositives:
+    - A remote-support or screenshot utility driven from PowerShell. Those are
+      usually the same script on a schedule; a one-off from an unexpected
+      parent is not.
+    - Clipboard helpers in developer tooling.
+level: high
+tags:
+    - attack.collection
+    - attack.credential_access
+    - attack.t1115
+    - attack.t1113
+    - attack.t1056.001

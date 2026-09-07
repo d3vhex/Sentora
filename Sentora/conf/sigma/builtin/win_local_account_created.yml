@@ -22,8 +22,17 @@ detection:
         EventID: 4720
     net_user_add:
         CommandLine|contains|all:
-            - 'net user'
+            - 'user'
             - '/add'
+        # `net user` and `net.exe user` are the same command, and matching the
+        # first spelling alone missed every command line that carries the
+        # extension - which is most of them. Split so either works: `net`
+        # here, `user` and `/add` above.
+        CommandLine|contains:
+            - 'net user'
+            - 'net.exe user'
+            - 'net1 user'
+            - 'net1.exe user'
     localgroup_add:
         CommandLine|contains|all:
             - 'localgroup'

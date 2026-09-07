@@ -1,0 +1,79 @@
+title: File Uploaded To A Web Service From A Script Host
+id: c47e0a35-9d18-4b62-8fa0-71c3d6e295ab
+status: stable
+description: >
+    The last step, and the one the rest of the chain exists to reach. Once
+    data is a single archive, it leaves - and it leaves over HTTPS to a
+    service the network already permits, because a proxy that blocks
+    Dropbox is rarer than one that blocks a raw socket.
+
+    What makes this detectable is direction. The same tools that fetch a
+    payload also send one, and this platform already watches the fetch
+    (`win_lolbin_remote_payload`); what it did not watch was the push.
+    `-Method Post`, `-InFile`, `curl -T`, `curl -F` and a WebClient upload all
+    say the data is going out.
+
+    The paste and file-sharing hosts are listed separately and need no upload
+    switch. Nothing on a managed endpoint has a routine reason to talk to
+    pastebin or a transfer service from a script, and naming them catches the
+    cases that use a plain POST body rather than a recognisable switch.
+
+    Deliberately not gated on an archive existing first. Exfiltration that
+    skips staging is still exfiltration, and tying the two together would
+    mean missing the small, targeted theft entirely.
+references:
+    - https://attack.mitre.org/techniques/T1567/002/
+    - https://attack.mitre.org/techniques/T1048/003/
+author: Sentora
+date: 2026/09/07
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    script_host:
+        CommandLine|contains:
+            - 'powershell'
+            - 'pwsh'
+            - 'curl'
+            - 'bitsadmin'
+            - 'certutil'
+    upload_intent:
+        CommandLine|contains:
+            - 'Method Post'
+            - 'Method PUT'
+            - '-InFile'
+            - 'UploadFile'
+            - 'UploadString'
+            - '--upload-file'
+            - '--form'
+            - '/upload'
+    remote_target:
+        CommandLine|contains:
+            - 'http://'
+            - 'https://'
+            - 'ftp://'
+    known_drop_service:
+        CommandLine|contains:
+            - 'pastebin.com'
+            - 'paste.ee'
+            - 'hastebin'
+            - 'transfer.sh'
+            - 'file.io'
+            - 'anonfiles'
+            - 'gofile.io'
+            - 'ngrok.io'
+            - 'requestbin'
+            - 'webhook.site'
+            - 'discord.com/api/webhooks'
+            - 'api.telegram.org'
+    condition: known_drop_service or (script_host and upload_intent and remote_target)
+falsepositives:
+    - A deployment or telemetry agent posting to an internal endpoint. Those
+      go to a hostname the estate owns, which is the thing to check first.
+    - Developers pushing to an internal artefact store from a script.
+level: high
+tags:
+    - attack.exfiltration
+    - attack.command_and_control
+    - attack.t1567.002
+    - attack.t1048.003

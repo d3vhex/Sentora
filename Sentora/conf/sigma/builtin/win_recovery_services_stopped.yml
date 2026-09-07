@@ -1,0 +1,88 @@
+title: Backup Or Security Services Stopped Before Encryption
+id: 5e83b1a7-2fc6-49d8-a041-6b9e72d3c8f4
+status: stable
+description: >
+    Ransomware cannot encrypt a file another process holds open, and it cannot
+    finish at all if something is watching. So the minutes before the
+    encryption are spent shutting things down: the database that has the
+    tables locked, the backup agent that would preserve a copy, and the
+    endpoint protection that would object.
+
+    `win_shadow_copy_deletion` already covers destroying the local restore
+    points. This is the other half of the same preparation, and it usually
+    comes first - a batch of `net stop` or `sc stop` against service names
+    that have nothing in common except that they are in the way.
+
+    Two branches, and the security one needs no company. Stopping SQL Server
+    to run maintenance is a real thing an administrator does at two in the
+    morning; stopping Defender, Sophos or CrowdStrike is not maintenance in
+    any story that ends well.
+
+    One service stopped is administration. The signal is the sweep, and this
+    rule sees one event at a time - `core.correlation` is what counts a run
+    of them, and that is the number worth waking somebody for.
+references:
+    - https://attack.mitre.org/techniques/T1489/
+    - https://attack.mitre.org/techniques/T1562/001/
+author: Sentora
+date: 2026/09/07
+logsource:
+    product: windows
+    category: process_creation
+detection:
+    stop_command:
+        CommandLine|contains:
+            # With and without the extension. A real command line carries
+            # `net.exe stop`, and matching only `net stop` missed every one
+            # of them - found by the corpus case for this rule failing to
+            # fire on the command an attacker actually types.
+            - 'net stop'
+            - 'net.exe stop'
+            - 'net1 stop'
+            - 'net1.exe stop'
+            - 'sc stop'
+            - 'sc.exe stop'
+            - 'sc config'
+            - 'Stop-Service'
+            - 'Set-Service'
+            - 'taskkill'
+    backup_or_database:
+        CommandLine|contains:
+            - 'MSSQL'
+            - 'SQLSERVERAGENT'
+            - 'MSExchange'
+            - 'Veeam'
+            - 'BackupExec'
+            - 'AcronisAgent'
+            - 'VSS'
+            - 'SQLWriter'
+            - 'MongoDB'
+            - 'postgresql'
+            - 'OracleService'
+    security_product:
+        CommandLine|contains:
+            - 'WinDefend'
+            - 'Sense'
+            - 'SecurityHealthService'
+            - 'Sophos'
+            - 'CSFalcon'
+            - 'CylanceSvc'
+            - 'SentinelAgent'
+            - 'McAfee'
+            - 'SAVService'
+            - 'wuauserv'
+    disable_startup:
+        CommandLine|contains: 'start= disabled'
+    condition: (stop_command and (backup_or_database or security_product)) or
+        (disable_startup and (backup_or_database or security_product))
+falsepositives:
+    - Scheduled maintenance stopping a database service. Those run from a
+      known job at a known hour; the security branch has no equivalent excuse.
+    - An uninstall or upgrade of the security product itself, which stops it
+      before replacing it.
+level: critical
+tags:
+    - attack.impact
+    - attack.defense_evasion
+    - attack.t1489
+    - attack.t1562.001
