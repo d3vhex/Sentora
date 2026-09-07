@@ -15,6 +15,7 @@ import Playbooks from './pages/Playbooks';
 import Databases from './pages/Databases';
 import LoginLogs from './pages/LoginLogs';
 import AuditLogs from './pages/AuditLogs';
+import AccountSecurity from './pages/AccountSecurity';
 import Automations from './pages/Automations';
 import GlobalAlerts from './pages/GlobalAlerts';
 import Agents from './pages/Agents';
@@ -146,6 +147,15 @@ const App: React.FC = () => {
         <Route path="/admin/audit" element={
           <ProtectedRoute>
             <AuditLogs />
+          </ProtectedRoute>
+        } />
+
+        {/* No permission gate. Two-factor protects the account rather than
+            the tenancy, so an operator whose role can do nothing else still
+            has to be able to secure their own login. */}
+        <Route path="/account/security" element={
+          <ProtectedRoute>
+            <AccountSecurity />
           </ProtectedRoute>
         } />
         

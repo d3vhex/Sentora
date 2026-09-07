@@ -804,10 +804,102 @@ Every route is deny-by-default. The exceptions are the login endpoint, the SPA
 shell, static assets and the agent-facing endpoints, which authenticate with
 `X-Agent-Key` or an enrolment token.
 
-### 6.2 Hardening checklist
+### 6.2 Two-factor authentication
+
+Off per account until an operator turns it on, at **My Security** in the
+sidebar. There is no permission gate on that page and there deliberately is
+not one: two-factor protects the account, not the tenancy, so an operator
+whose role can do nothing else still has to be able to secure their own login.
+
+An account that has it on cannot be signed into with a password alone by
+anybody, including an administrator. There is no override.
+
+#### What it protects against
+
+Nothing about the password changes. Guessing was already covered by
+`core.login_guard`, which locks out per user and per address. What a second
+factor adds is the case a lockout cannot touch: a password that is *correct*
+and in the wrong hands - reused from a breached site, phished, or read out of
+a browser. This console can isolate a host, run a command as SYSTEM on every
+endpoint, and read every log the fleet has produced, and one string is enough
+for all of it.
+
+#### Enrolling
+
+1. **My Security** -> *Turn on two-factor*.
+2. Scan the QR with any authenticator, or type the key by hand - a QR is no
+   use on the machine you are already sitting at.
+3. Enter a code to confirm. **Nothing changes about the login until this
+   step**: a secret written when the QR appeared, with no proof it was kept,
+   would lock out everybody who scanned it into an app they then deleted.
+4. Save the recovery codes. They are shown exactly once.
+
+#### Recovery codes
+
+Ten, each good for one sign-in, stored as SHA-256 hashes. The server cannot
+show them again - that is the property that makes storing them safe, and it is
+also the thing to tell operators before they close the tab.
+
+**If they are lost and the authenticator is gone, the account cannot sign in.**
+There is no support path that recovers it, by design: any mechanism that let
+an administrator bypass somebody's second factor would be a bypass an attacker
+could use too. The way back is a `users` row edit against the database, which
+is deliberately awkward:
+
+```sql
+-- Only from a shell on the database host, and audit-log the fact you did it.
+DELETE FROM userdb.user_totp          WHERE user_id = <id>;
+DELETE FROM userdb.user_recovery_codes WHERE user_id = <id>;
+```
+
+Signing in with a recovery code raises `RECOVERY_CODE_USED` on the platform
+events panel (see §6.4). It is usually an honest lost phone; the other reading
+is a stolen password and a stolen list, and the two look identical from here.
+
+#### Settings
+
+There are none. The step is 30 seconds, codes are 6 digits, and the accepted
+drift is one step either side - the interoperable values, and not worth being
+unusual about. One step is 30 seconds of clock skew in each direction, which
+covers a phone that has not synchronised recently; widening it would hand an
+attacker more time to reuse a code they watched being typed.
+
+A code works once. TOTP is a shared secret and a clock, so the same six digits
+stay valid for their whole step, and without single use anyone who sees one
+entered has the rest of that step to use it themselves. A second attempt
+raises `TOTP_CODE_REPLAYED`.
+
+#### What is stored
+
+| | |
+| :--- | :--- |
+| `user_totp.secret` | The seed, **Fernet-encrypted** with the server key. A dump of `userdb` alone does not hand over everybody's second factor. |
+| `user_recovery_codes.code_hash` | SHA-256. Never the code. |
+| `totp_pending.token_hash` | SHA-256 of the half-authenticated token, like a session. |
+
+The seed column is `VARCHAR(512)` for ciphertext, not for the ~32 characters a
+base32 seed reads as - see §4.1 for what sizing a column to the human-readable
+value cost this platform once already.
+
+**Losing the Fernet key takes every enrolled second factor with it.** The
+secret becomes undecryptable, the server reports the account as having none,
+and each operator has to enrol again. That is the survivable failure; the
+alternative - refusing the login outright - would lock the whole console out
+of itself. Back the key up (§4.1).
+
+#### LDAP accounts
+
+Gated identically. A second factor that protected the local path and not the
+directory path would protect nothing: an attacker holding a password picks the
+path without it.
+
+### 6.3 Hardening checklist
 
 1. Change `admin / admin123` immediately under **Users & Roles**.
 2. Create per-operator accounts; stop using the shared admin.
+   Have each one turn on two-factor at **My Security** (§6.2) - especially the
+   accounts that can reach SOAR, because those can run a command as SYSTEM on
+   every endpoint.
 3. Map operators to roles:
    - `auditor` — `read_telemetry` only
    - `operator` — read + `manage_soar` (approve shadow, dispatch SOAR)
@@ -823,7 +915,38 @@ shell, static assets and the agent-facing endpoints, which authenticate with
    call. It is a server-side request forgery primitive by nature; empty means
    the endpoint is inert.
 
-### 6.3 Audit retention
+### 6.4 Attacks on the platform itself
+
+`userdb.platform_events`, surfaced under **Activity Logs**. The server already
+detected all of this and told nobody: a lockout went to a container log, a
+rejected agent key went to a container log, a permission denial went to a
+table nobody opens unless they are already investigating. The platform watched
+every host in the fleet and was the one machine nobody watched.
+
+| Kind | Severity | What it means |
+| :--- | :--- | :--- |
+| `FLEET_KEY_ON_CHANNEL` | CRITICAL | The fleet-wide secret was offered on the agent channel. That channel carries `/self_destruct`, so a leaked master key must not open one against every endpoint at once. |
+| `LOGIN_LOCKOUT` | HIGH | Failed logins crossed the threshold. Somebody guessing, or an integration on a credential that changed. |
+| `AGENT_KEY_REJECTED` | HIGH | A channel was opened with a key this server does not know. Any revoked agent does this; so does anyone who found a key that no longer works. |
+| `ENROLMENT_TOKEN_REUSED` | HIGH | A one-time token presented twice. Usually an installer re-run; the other reading is that it leaked. |
+| `TOTP_CODE_REPLAYED` | HIGH | A second-factor code already used was presented again. |
+| `TOTP_DISABLE_REFUSED` | HIGH | A wrong password when turning off two-factor. A hijacked session trying to remove the control that would have stopped it looks exactly like this. |
+| `PERMISSION_DENIED` | MEDIUM | An operator reached past their role. One is a mis-click; a run of them is somebody mapping what they can touch. |
+| `RECOVERY_CODE_USED` | MEDIUM | Signed in with a recovery code rather than an authenticator. |
+
+Repeats fold into one row whose count climbs, within a ten-minute window. A
+brute-force that wrote a row per attempt would make the view meant to reveal
+it into the thing that buries it.
+
+The panel is shown even when empty, and says so. An operator who never sees it
+cannot tell "nothing has attacked us" from "this platform does not watch
+itself" - and on a security view, a quiet twenty-four hours is a finding.
+
+Nothing here records a credential. These rows describe attempts *on* secrets,
+and the obvious fields to include - the password tried, the key presented -
+are exactly the ones that turn an audit trail into a second breach.
+
+### 6.5 Audit retention
 
 `login_logs` and `audit_logs` record every UI login attempt with source IP and
 result, every SOAR dispatch, every shadow approve/reject with operator and
