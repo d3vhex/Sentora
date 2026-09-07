@@ -221,11 +221,41 @@ def reoffer_recent(table: str, limit: int) -> int:
     The resend is safe because the server deduplicates: rows it already holds
     are recognised and skipped rather than stored twice.
     """
-    query = (f"UPDATE {table} SET sent = FALSE WHERE id IN "
-             f"(SELECT id FROM {table} ORDER BY id DESC LIMIT %s)")
+    from modules import enc_db
+
     with get_conn() as conn:
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            cur.execute(f"SELECT * FROM {table} ORDER BY id DESC LIMIT %s",
+                        (limit,))
+            candidates = cur.fetchall()
+
+        # Skip what this agent can no longer read itself.
+        #
+        # The Fernet key comes from the server's bootstrap and there is no
+        # rotation path, so an agent that has outlived one key holds rows it
+        # cannot decrypt - and neither can the server. Offering them again
+        # imports rows that render as `<decryption failed - key mismatch>` for
+        # ever, spending a bounded recovery budget on data nobody can read.
+        #
+        # Found by doing it: the first re-offer on a live host moved about two
+        # thousand such rows onto the server, and the readable/unreadable
+        # boundary in the result was exact.
+        keep = []
+        for row in candidates:
+            try:
+                if enc_db.is_readable(table, dict(row)):
+                    keep.append(row["id"])
+            except Exception:
+                # No key configured yet, or a shape this does not understand.
+                # Offering it is the older behaviour and the safer default:
+                # the cost is an unreadable row, not a lost one.
+                keep.append(row["id"])
+
+        if not keep:
+            return 0
         with conn.cursor() as cur:
-            cur.execute(query, (limit,))
+            cur.execute(f"UPDATE {table} SET sent = FALSE WHERE id = ANY(%s)",
+                        (keep,))
             changed = cur.rowcount
         conn.commit()
     return changed if changed and changed > 0 else 0

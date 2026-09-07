@@ -29,7 +29,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 from . import agent_paths
-from .db import insert_record
+from .enc_db import insert_record_enc
 
 DEFAULT_MONITOR_PATHS = [
     "/etc",
@@ -157,7 +157,20 @@ class FIMHandler(FileSystemEventHandler):
             return
 
         current_hash = calculate_sha256(path) if status != "deleted" else "DELETED"
-        insert_record("fim_data", {
+        # `insert_record_enc`, not `insert_record`.
+        #
+        # `enc_db.ENCRYPT_FIELDS_MAP` lists fim_data's `path` and
+        # `hash_sha256` as encrypted and the server lists them as fields to
+        # decrypt, and this writer - which produces almost every fim_data row
+        # there is - used the plain insert. So the file paths of every
+        # monitored host were stored in the clear, locally and on the server,
+        # while both ends of the design said otherwise.
+        #
+        # It was invisible because plaintext and ciphertext render identically:
+        # the server's `decrypt_value` hands anything without the `enc::`
+        # prefix straight back, so the console showed a perfect table. The only
+        # way to see it was to ask what the stored bytes actually start with.
+        insert_record_enc("fim_data", {
             "path": path,
             "hash_sha256": current_hash or "ERROR",
             "status": status,

@@ -1,7 +1,13 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { User, Activity, Globe, Search, Eye } from 'lucide-react';
 import { adminService, agentService } from '../services/api';
-import { Card } from '../components/ui';
+import { Card, Badge } from '../components/ui';
+
+/** Platform events carry a severity, and a severity is a claim - so it takes
+ *  the semantic colours rather than a series palette. */
+const SEVERITY_TONE: Record<string, any> = {
+  CRITICAL: 'critical', HIGH: 'high', MEDIUM: 'medium', LOW: 'low', INFO: 'neutral',
+};
 import { CategoryBars } from '../components/ui/charts';
 
 const chartNote: React.CSSProperties = {
@@ -27,9 +33,20 @@ const AuditLogs: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
   const [selected, setSelected] = useState<any | null>(null);
+  /* Attacks on this platform. Separate state from the audit log because it
+     answers a different question: that one records what operators did, this
+     records what was attempted against them. */
+  const [platform, setPlatform] = useState<any[] | null>(null);
+  const [decryption, setDecryption] = useState<any | null>(null);
 
   useEffect(() => {
     fetchLogs();
+    adminService.getPlatformEvents(24)
+      .then((r) => { setPlatform(r.events || []); setDecryption(r.decryption || null); })
+      // A role with manage_users but not manage_system gets 403 here. That is
+      // not an error worth showing - the section simply does not apply to
+      // them - so it stays hidden rather than rendering a failure.
+      .catch(() => setPlatform(null));
   }, []);
 
   const fetchLogs = (q: string = '*') => {
@@ -74,6 +91,93 @@ const AuditLogs: React.FC = () => {
         <h2 style={{ fontSize: '1.875rem', marginBottom: '8px' }}>Action Audit Logs</h2>
         <p style={{ color: 'var(--text-secondary)' }}>Comprehensive history of all administrative actions, resource modifications, and system changes.</p>
       </div>
+
+      {/* The platform watches every host in the fleet, and until recently
+          nothing watched the platform. A lockout went to a container log, a
+          rejected agent key went to a container log - so the one machine an
+          attacker has to get through was the one with no view of its own.
+
+          Shown even when empty, which is a correction of the first version.
+          Hiding it read well as an argument - a permanently empty panel is
+          furniture people learn to skip - and it recreated the exact failure
+          the rest of this work spent its time removing: an operator who never
+          sees the panel cannot tell "nothing has attacked us" from "this
+          platform does not watch itself". On a security view, a quiet
+          twenty-four hours is a finding.
+
+          `null` is the third state and stays hidden: the role cannot read
+          this, so it is not an empty result, it is not their question. */}
+      {platform !== null && (
+        <Card title="Attempts against this platform (24h)">
+          <p style={chartNote}>
+            Failed logins past the lockout threshold, agent keys this server
+            does not recognise, and operators reaching past their role.
+            Repeats are folded: one attack is one row whose count climbs, not
+            four hundred rows that bury it.
+          </p>
+          {/* Not an attack, and it belongs on this panel anyway: history
+              nobody can decrypt is a fact about the platform. It was counted
+              and never shown - one log line per field name, so a table where
+              86% of the messages were unreadable produced the same output as
+              one bad row. */}
+          {!!decryption && decryption.undecryptable > 0 && (
+            <p style={{ margin: '0 0 var(--space-3)', padding: 'var(--space-3)',
+                        borderRadius: 'var(--radius-md)',
+                        border: '1px solid var(--sev-medium)',
+                        color: 'var(--text-secondary)', fontSize: 'var(--text-xs)' }}>
+              <strong style={{ color: 'var(--sev-medium)' }}>
+                {decryption.unreadable_percent}% of encrypted values read since
+                this server started could not be decrypted
+              </strong>{' '}
+              ({decryption.undecryptable} of{' '}
+              {decryption.undecryptable + decryption.decrypted}). {decryption.detail}
+            </p>
+          )}
+
+          {platform.length === 0 ? (
+            <p style={{ margin: 0, padding: 'var(--space-4) 0',
+                        color: 'var(--text-secondary)', fontSize: 'var(--text-sm)' }}>
+              Nothing in the last 24 hours. This panel is live — an empty one
+              means no attempts were detected, not that nothing is watching.
+            </p>
+          ) : (
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8125rem' }}>
+              <thead>
+                <tr style={{ textAlign: 'left', color: 'var(--text-secondary)' }}>
+                  <th style={{ padding: '8px 12px' }}>What</th>
+                  <th style={{ padding: '8px 12px' }}>Subject</th>
+                  <th style={{ padding: '8px 12px' }}>From</th>
+                  <th style={{ padding: '8px 12px', textAlign: 'right' }}>Count</th>
+                  <th style={{ padding: '8px 12px' }}>Last seen</th>
+                </tr>
+              </thead>
+              <tbody>
+                {platform.map((e, i) => (
+                  <tr key={i} style={{ borderTop: '1px solid var(--border-color)' }}>
+                    <td style={{ padding: '10px 12px' }}>
+                      <Badge tone={SEVERITY_TONE[e.severity] ?? 'neutral'}>{e.kind}</Badge>
+                      <div style={{ color: 'var(--text-muted)', fontSize: 'var(--text-xs)',
+                                    marginTop: '4px', maxWidth: '52ch' }}>
+                        {e.explanation}
+                      </div>
+                    </td>
+                    <td style={{ padding: '10px 12px' }}>{e.subject || '—'}</td>
+                    <td style={{ padding: '10px 12px' }} className="mono">{e.source_ip || '—'}</td>
+                    <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 700 }}>
+                      {e.occurrences}
+                    </td>
+                    <td style={{ padding: '10px 12px', color: 'var(--text-secondary)' }}>
+                      {formatTs(e.last_seen)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          )}
+        </Card>
+      )}
 
       {/* An audit log is read after something went wrong, and by then the
           question is never "what happened" but "who was doing what". A

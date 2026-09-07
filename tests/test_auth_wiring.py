@@ -330,3 +330,59 @@ def test_the_agent_channel_is_declared_rather_than_counted_as_session_only(tree)
     a false reassurance in the opposite direction from the one this file
     exists to prevent."""
     assert "agent_link_socket" in _literal_set(tree, "_PUBLIC_HANDLERS")
+
+
+# --------------------------------------------------------------------------
+# A permission has to exist to protect anything
+# --------------------------------------------------------------------------
+
+def _seeded_permissions() -> set:
+    """The permission names `db/init_userdb.sql` actually creates."""
+    import re
+
+    sql = (APP_PY.parent / "db" / "init_userdb.sql").read_text(encoding="utf-8")
+    block = sql[sql.index("INSERT INTO permissions"):]
+    block = block[:block.index(";")]
+    return set(re.findall(r"\('([a-z_]+)'", block))
+
+
+def _guarded_permissions() -> set:
+    """Permission names from actual decorators, read off the AST.
+
+    Not from the source text. `_handler_qualname`'s docstring contains a
+    worked example of decorator ordering that uses `require_permission("x")`,
+    and a regex over the file reads that prose as two unreachable routes -
+    the seventh time in this suite that matching text has found a comment
+    warning about the very thing it was looking for.
+    """
+    import ast
+
+    names = set()
+    tree = ast.parse(APP_PY.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for decorator in node.decorator_list:
+            if (isinstance(decorator, ast.Call)
+                    and getattr(decorator.func, "id", "") == "require_permission"
+                    and decorator.args
+                    and isinstance(decorator.args[0], ast.Constant)):
+                names.add(decorator.args[0].value)
+    return names
+
+
+def test_every_guard_names_a_permission_that_exists():
+    """A route guarded by a permission nothing grants is a route nobody can
+    reach - including the admin, and including whoever wrote it.
+
+    It fails closed, which is the right direction, but it fails *silently*:
+    the route 404s or 403s for everyone and looks like a bug in the feature
+    rather than a typo in its guard. `read_audit` was invented for the
+    platform-events view and never existed anywhere; the view would have been
+    unreachable for every role in the product.
+    """
+    invented = sorted(_guarded_permissions() - _seeded_permissions())
+    assert not invented, (
+        f"these guards name permissions that db/init_userdb.sql never "
+        f"creates, so the routes behind them are unreachable: {invented}"
+    )

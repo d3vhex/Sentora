@@ -382,23 +382,29 @@ SERVICE_PROBES = {
     ],
 }
 
-def normalize(value):
-    return value.replace("'", "''") if isinstance(value, str) else value
-
 def is_duplicate(port, protocol, service, product, version):
-    protocol = normalize(protocol)
-    service = normalize(service)
-    product = normalize(product)
-    version = normalize(version)
+    """Have we already recorded this exact service on this port?
 
-    condition = (
-        f"port = {port} AND "
-        f"protocol = '{protocol}' AND "
-        f"service = '{service}' AND "
-        f"product = '{product}' AND "
-        f"version = '{version}'"
-    )
-    return bool(fetch_where(TABLE, condition))
+    Parameterised, and it was not. The condition used to be assembled by
+    interpolation with a hand-rolled `normalize()` that doubled single quotes,
+    and on this host it produced
+
+        [!] portscanner failed: SyntaxError: unterminated quoted string
+            at or near "'"
+
+    every cycle - so no port scan result was written at all. Which input broke
+    it hardly matters: nmap hands back product and version strings containing
+    whatever a service chose to advertise, an attacker-controlled banner among
+    them, and the answer to that is never a better escaping function.
+
+    A security product that builds SQL by string concatenation is running the
+    pattern it exists to detect elsewhere. `fetch_where` has taken a `params`
+    tuple all along.
+    """
+    condition = ("port = %s AND protocol = %s AND service = %s "
+                 "AND product = %s AND version = %s")
+    params = (port, protocol, service, product, version)
+    return bool(fetch_where(TABLE, condition, params))
 
 
 async def smart_recv(reader, size=8192, max_attempts=5):

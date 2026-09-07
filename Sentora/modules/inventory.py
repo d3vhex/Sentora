@@ -5,6 +5,7 @@ import os
 import subprocess
 from datetime import datetime
 from .db import insert_record
+from .enc_db import insert_record_enc
 
 def get_cpu_info():
     cpu_name = platform.processor()
@@ -193,26 +194,26 @@ def scan_inventory():
     gpu = get_gpu_info()
     mobo = get_mobo_info()
     
-    insert_record("hardware_inventory", {
+    insert_record_enc("hardware_inventory", {
         "type": "cpu", "name": cpu, "vendor_id": "CPU", "product_id": "Model",
         "serial_number": "N/A", "status": "active", "timestamp": timestamp, "sent": False
     })
-    insert_record("hardware_inventory", {
+    insert_record_enc("hardware_inventory", {
         "type": "ram", "name": ram, "vendor_id": "System", "product_id": "Memory",
         "serial_number": "N/A", "status": "active", "timestamp": timestamp, "sent": False
     })
-    insert_record("hardware_inventory", {
+    insert_record_enc("hardware_inventory", {
         "type": "gpu", "name": gpu, "vendor_id": "GPU", "product_id": "Display",
         "serial_number": "N/A", "status": "active", "timestamp": timestamp, "sent": False
     })
-    insert_record("hardware_inventory", {
+    insert_record_enc("hardware_inventory", {
         "type": "motherboard", "name": mobo, "vendor_id": "System", "product_id": "BaseBoard",
         "serial_number": "N/A", "status": "active", "timestamp": timestamp, "sent": False
     })
     
     for part in psutil.disk_partitions():
         try:
-            insert_record("hardware_inventory", {
+            insert_record_enc("hardware_inventory", {
                 "type": "disk", "name": part.device, "vendor_id": part.fstype,
                 "product_id": part.mountpoint, "serial_number": "N/A", "status": "active",
                 "timestamp": timestamp, "sent": False

@@ -3,6 +3,7 @@ import json
 import platform
 from datetime import datetime
 from modules.db import insert_record, fetch_where, update_record, delete_all
+from modules.enc_db import insert_record_enc
 
 def bytes_to_gb(byte_value):
     return round(byte_value / (1024**3), 2)
@@ -19,7 +20,10 @@ def send_local_alert(severity, message, metadata=None):
         }
         if metadata:
             rec["message"] += f" | {json.dumps(metadata)}"
-        insert_record("events_alert", rec)
+        # `source` and `message` are declared encrypted, so the plain
+        # insert stored this alert in the clear - and plaintext reads
+        # back identically to ciphertext, so nothing said so.
+        insert_record_enc("events_alert", rec)
     except Exception as e:
         print(f"[DiskMonitor] Failed to send alert: {e}")
 

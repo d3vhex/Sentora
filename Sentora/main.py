@@ -627,10 +627,13 @@ def send_alert(source, severity, message, metadata=None):
             return
         rec["dup_fp"] = fingerprint
 
-        if hasattr(enc_db, "insert_record_enc"):
-            enc_db.insert_record_enc("events_alert", rec)
-        else:
-            insert_record("events_alert", rec)
+        # No fallback to the plain insert. `events_alert` has `source` and
+        # `message` declared encrypted, so writing one unencrypted stores the
+        # alert text in the clear - and plaintext and ciphertext render
+        # identically downstream, so nothing would ever say it happened.
+        # `insert_record_enc` has always existed; the guard only described a
+        # way to fail quietly.
+        enc_db.insert_record_enc("events_alert", rec)
     except Exception as e:
         print(f"[Alert] Failed to send alert: {e}")
 

@@ -1165,6 +1165,14 @@ def new_direct_session(argv: list[str] | None = None):
     raise ConsoleUnavailable(" | ".join(failures) or describe_unavailable())
 
 
+#: The console strategy that worked last time in this process, if any.
+#:
+#: Process-local and forgotten on restart, which is the right lifetime: it
+#: records how *this* process was started, and a restarted agent may have been
+#: started differently.
+_WORKING_STRATEGY = None
+
+
 def new_session(argv: list[str] | None = None) -> "PtySession | WinPtySession":
     """The right session for this host, or a reason there is none.
 
@@ -1180,6 +1188,32 @@ def new_session(argv: list[str] | None = None) -> "PtySession | WinPtySession":
     if argv:
         return WinPtySession(argv)
 
+    # What worked last time, first.
+    #
+    # This chain is not cheap when it fails. On a host where the agent runs as
+    # a service, the in-process pseudoconsole dies with STATUS_CONTROL_C_EXIT
+    # and the session helper then times out after twelve seconds - so roughly
+    # fifteen seconds elapse before the strategy that actually works is even
+    # tried. The server gives up on a console after fifteen. Measured on a
+    # live host: 17:25:03 the first attempt, 17:25:18 the fall through to
+    # pipes, and by then nobody was listening.
+    #
+    # Whether this process can host a pseudoconsole is a property of how it
+    # was started. It cannot change while it is running, so paying fifteen
+    # seconds to rediscover it on every console open is fifteen seconds spent
+    # proving something already known.
+    global _WORKING_STRATEGY
+    if _WORKING_STRATEGY is not None:
+        try:
+            return _WORKING_STRATEGY()
+        except ConsoleUnavailable as e:
+            # The remembered answer stopped being true - a helper that has
+            # since died, a session that logged out. Fall through and work it
+            # out again rather than reporting a failure that may be stale.
+            print(f"[console] the strategy that worked last time no longer "
+                  f"does ({e}); trying the others", flush=True)
+            _WORKING_STRATEGY = None
+
     # Try here first. It costs a few hundred milliseconds and it is the only
     # path that works when the agent is not a service - a developer running
     # it from a terminal, for instance.
@@ -1189,14 +1223,18 @@ def new_session(argv: list[str] | None = None) -> "PtySession | WinPtySession":
     # fail, which is the path whose whole purpose is to explain itself.
     direct_error = ""
     try:
-        return new_direct_session()
+        session = new_direct_session()
+        _WORKING_STRATEGY = new_direct_session
+        return session
     except ConsoleUnavailable as e:
         direct_error = str(e)
         print(f"[console] no console in this process ({direct_error}); "
               f"trying the user's session", flush=True)
 
     try:
-        return HelperSession()
+        session = HelperSession()
+        _WORKING_STRATEGY = HelperSession
+        return session
     except ConsoleUnavailable as e:
         helper_error = str(e)
         print(f"[console] no console in the user's session either "
@@ -1205,7 +1243,9 @@ def new_session(argv: list[str] | None = None) -> "PtySession | WinPtySession":
 
     # Last resort, and honest about it - see PipeSession.
     try:
-        return PipeSession()
+        session = PipeSession()
+        _WORKING_STRATEGY = PipeSession
+        return session
     except ConsoleUnavailable as pipe_error:
         raise ConsoleUnavailable(
             f"no console of any kind could be started. "

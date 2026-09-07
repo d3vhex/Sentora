@@ -1,6 +1,7 @@
 from sanic import Request, Sanic
 import bcrypt
 import aiomysql
+import inspect
 import secrets
 import os, pathlib
 import stat
@@ -115,6 +116,7 @@ from core import attack
 from core import config_validation
 from core import login_guard
 from core import netloc
+from core import self_defence
 from core import threat_feeds
 from core import tls as product_tls
 from core import version as product_version
@@ -2007,9 +2009,39 @@ def _close_sync_quiet(conn):
         pass
 
 async def _close_async_quiet(conn):
+    """Return a connection, whatever kind it is, without ever raising.
+
+    This used to read
+
+        await conn.ensure_closed() if hasattr(conn, "ensure_closed") else conn.close()
+
+    and `await` binds tighter than a conditional expression, so Python parses
+    that as `(await conn.ensure_closed()) if ... else conn.close()`. The else
+    branch was never awaited - and `_PooledConn.close` is a coroutine, so the
+    connection went back to the pool only when the garbage collector got round
+    to `__del__`, with
+
+        RuntimeWarning: coroutine '_PooledConn.close' was never awaited
+
+    the only sign. Not a leak, because `__del__` catches it, but a pool that
+    hands back its slots on GC timing is a pool that runs out under exactly
+    the load that makes GC late.
+
+    `close()` first, deliberately. On `_PooledConn` that is the method that
+    releases the slot; `ensure_closed` would reach through `__getattr__` to the
+    underlying connection and shut the socket without ever telling the pool -
+    turning a warning into the slot leak it was only pretending to be.
+    """
+    if conn is None:
+        return
     try:
-        if conn is not None:
-            await conn.ensure_closed() if hasattr(conn, "ensure_closed") else conn.close()
+        result = conn.close()
+        if inspect.isawaitable(result):
+            await result
+        elif hasattr(conn, "ensure_closed"):
+            # aiomysql: `close()` is synchronous and only marks it; this is
+            # the one that actually waits for the socket.
+            await conn.ensure_closed()
     except Exception:
         pass
 
@@ -2435,6 +2467,7 @@ def decrypt_row_fields(row: dict, encrypted_fields: list, fernet: Fernet) -> dic
             except Exception:
                 decoded = pt.decode("utf-8")
             out[field] = decoded
+            _decrypt_counters["decrypted"] += 1
         except InvalidToken:
             # Returning the raw ciphertext made a key mismatch look exactly
             # like a field nobody decrypted — the operator sees `enc::gAAA...`
@@ -2451,8 +2484,45 @@ def decrypt_row_fields(row: dict, encrypted_fields: list, fernet: Fernet) -> dic
                     f"if it was registered against an older key.",
                     flush=True,
                 )
+            _decrypt_counters["undecryptable"] += 1
             out[field] = "<decryption failed — key mismatch>"
     return out
+
+
+#: How many stored values this process has read, and how many it could not.
+#:
+#: Counted per field, and counted at all, because the scale of a key mismatch
+#: was invisible. One log line per field name was the whole signal - a `set`
+#: of names, printed once each - so a table where 86% of the messages could
+#: not be read produced exactly the same output as one bad row. Measured on a
+#: live host it was 173 of 200 in `siem_events`, 197 of 200 in `events_alert`.
+#:
+#: Process-local and reset on restart, deliberately. This is a health number,
+#: not a ledger: "how much of what I am serving right now is unreadable".
+_decrypt_counters = {"decrypted": 0, "undecryptable": 0}
+
+
+def decryption_health() -> dict:
+    """What proportion of encrypted values this process could actually read.
+
+    Zero of zero is not a problem, and has to say so rather than dividing.
+    """
+    ok = _decrypt_counters["decrypted"]
+    bad = _decrypt_counters["undecryptable"]
+    total = ok + bad
+    return {
+        "decrypted": ok,
+        "undecryptable": bad,
+        "unreadable_percent": round(bad * 100.0 / total, 1) if total else 0.0,
+        "detail": (
+            "Values encrypted with a Fernet key this server no longer holds. "
+            "There is no rotation path, so these cannot be recovered - the "
+            "number matters for knowing how much of the history is readable, "
+            "not as something to fix."
+            if bad else
+            "Every encrypted value read so far opened with the current key."
+        ),
+    }
 
 async def stream_from_db_dec(table: str, agent: str,
                              connect_db_for_agent,
@@ -5102,6 +5172,13 @@ async def login(request):
             await log_login_attempt(username, "local", "failure",
                                     f"locked out: {locked}", ip)
             print(f"[auth] lockout {username!r} from {ip}: {locked}", flush=True)
+            # The conclusion, not every attempt. One failed password is not an
+            # incident and storing it as one is how a security view becomes
+            # noise; the threshold has already been crossed by the time this
+            # branch runs, and that is the thing worth putting in front of
+            # somebody.
+            await _platform_event("LOGIN_LOCKOUT", subject=username,
+                                  source_ip=ip, detail=locked)
             return response.json({
                 "status": "error",
                 "message": "Too many failed attempts. Try again later.",
@@ -7327,6 +7404,64 @@ async def get_telemetry_health(request, agent):
         "agent": agent,
         "tables": report,
         "broken_count": len(broken),
+    })
+
+
+@app.route("/api/platform/events")
+@require_permission("manage_system")
+async def get_platform_events(request):
+    """Attacks on this platform, as opposed to attacks on the fleet.
+
+    Every one of these was already detected. A lockout went to a container
+    log, a rejected agent key went to a container log, a permission denial
+    went to a table nobody opens unless they are already investigating - so
+    the machine that watches every host in the fleet was the one nobody
+    watched.
+
+    Folded rows, not raw attempts: a brute-force is one row whose
+    `occurrences` climbs, because a view that files four hundred rows for one
+    attack is the thing that hides it.
+    """
+    hours = _positive_int(request.args.get("hours"), 24, 24 * 30)
+
+    def _read():
+        with sync_mysql_conn("userdb") as conn:
+            cursor = conn.cursor(dictionary=True)
+            try:
+                cursor.execute(self_defence.DDL)
+                cursor.execute(
+                    "SELECT kind, severity, subject, source_ip, detail, "
+                    "       occurrences, first_seen, last_seen "
+                    "  FROM platform_events "
+                    " WHERE last_seen > (NOW() - INTERVAL %s HOUR) "
+                    " ORDER BY last_seen DESC LIMIT 500", (hours,))
+                return cursor.fetchall() or []
+            finally:
+                cursor.close()
+
+    try:
+        rows = await asyncio.to_thread(_read)
+    except Exception as e:
+        return sanic_json({"status": "error", "message": str(e)}, status=500)
+
+    for row in rows:
+        # What the kind means, sent with it. An operator seeing
+        # FLEET_KEY_ON_CHANNEL for the first time should not have to go
+        # looking for what it implies.
+        row["explanation"] = self_defence.describe(row["kind"])[1]
+        for field in ("first_seen", "last_seen"):
+            if row.get(field) is not None:
+                row[field] = row[field].isoformat()
+
+    return sanic_json({
+        "status": "success",
+        "window_hours": hours,
+        "events": rows,
+        "summary": self_defence.summarise(rows),
+        # Not an attack, and it belongs here anyway: this is the view that
+        # answers "is the platform itself healthy", and history nobody can
+        # decrypt is a fact about the platform rather than about any host.
+        "decryption": decryption_health(),
     })
 
 
@@ -9776,6 +9911,31 @@ async def delete_agent(request, agent):
     })
 
 
+async def _platform_event(kind: str, *, subject: str = "",
+                          source_ip: str = "", detail: str = "") -> None:
+    """Raise one event about an attack on this platform, and never fail.
+
+    Swallowed on purpose, and this is the one place in the file where that is
+    right: every caller is in the middle of refusing something. A server that
+    will not reject a bad login because it could not journal the rejection has
+    turned a monitoring gap into an outage.
+    """
+    def _write():
+        try:
+            with sync_mysql_conn("userdb") as conn:
+                cursor = conn.cursor()
+                try:
+                    self_defence.record(cursor, kind, subject=subject,
+                                        source_ip=source_ip, detail=detail)
+                    conn.commit()
+                finally:
+                    cursor.close()
+        except Exception as e:
+            print(f"[self-defence] could not record {kind}: {e}", flush=True)
+
+    await asyncio.to_thread(_write)
+
+
 AGENT_LINKS = agent_link.LinkRegistry()
 
 
@@ -9794,8 +9954,17 @@ async def agent_link_socket(request, ws):
     """
     agent = await asyncio.to_thread(_validate_agent_auth_sync, request)
     if not agent or agent == "*":
+        # Recorded, not only printed. A container log is where this went, and
+        # nobody reads a container log until they already suspect something -
+        # which is the wrong order for the one signal that says an agent key
+        # is being used after it was revoked.
+        kind = ("FLEET_KEY_ON_CHANNEL" if agent == "*"
+                else "AGENT_KEY_REJECTED")
         print(f"[agent-link] refused a connection from {_client_ip(request)}",
               flush=True)
+        await _platform_event(kind, source_ip=_client_ip(request),
+                              detail="a channel was opened with a key this "
+                                     "server will not accept")
         await ws.close(code=1008, reason="unauthorized")
         return
 
