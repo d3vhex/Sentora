@@ -165,6 +165,20 @@ SESSION_ONLY_HANDLERS = {
     # the fleet-wide secret, which the ordinary agent routes accept, because
     # this channel carries /self_destruct.
     "agent_link_socket",
+    # Two-factor, for the calling account only.
+    #
+    # Each of these reads `current_user_id(request)` and refuses without it,
+    # then acts on that id and no other - there is no user parameter to
+    # confuse. A permission would be the wrong check: enrolling a second
+    # factor is something every operator must be able to do for themselves,
+    # including one whose role can do nothing else.
+    #
+    # `second_factor_disable` additionally demands the account password, so a
+    # hijacked session cannot remove the control that would have stopped it.
+    "second_factor_status",
+    "second_factor_enrol",
+    "second_factor_confirm",
+    "second_factor_disable",
 }
 
 # Named individually so a bulk edit to the list above cannot quietly reopen

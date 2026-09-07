@@ -166,13 +166,58 @@ def test_it_does_not_block_the_event_loop():
 # Detected and recorded is only half of it
 # --------------------------------------------------------------------------
 
-@pytest.mark.parametrize("kind", ["LOGIN_LOCKOUT", "AGENT_KEY_REJECTED",
-                                  "FLEET_KEY_ON_CHANNEL"])
-def test_the_detections_are_actually_wired(kind):
-    """A vocabulary nothing raises is a vocabulary. These three are already
-    detected in app.py and used to stop at a print."""
-    assert f'"{kind}"' in APP.read_text(encoding="utf-8"), \
-        f"{kind} is defined and never raised"
+def _raised_kinds() -> set:
+    """Kinds that actually reach `_platform_event`, following variables.
+
+    Reading the call sites rather than searching the file. The first version
+    of this test asserted the name appeared *somewhere* in app.py, which a
+    mention in a comment satisfies - and three of six kinds sat unwired while
+    it passed. Two of the three that were wired pass their kind through a
+    variable, so looking only for a literal argument misses those too; the
+    assignments are followed.
+    """
+    tree = ast.parse(APP.read_text(encoding="utf-8"))
+    raised = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call)
+                and getattr(node.func, "id", "") == "_platform_event"
+                and node.args):
+            continue
+        first = node.args[0]
+        if isinstance(first, ast.Constant):
+            raised.add(first.value)
+            continue
+        name = getattr(first, "id", "")
+        for other in ast.walk(tree):
+            if isinstance(other, ast.Assign) and any(
+                    getattr(t, "id", "") == name for t in other.targets):
+                raised.update(c.value for c in ast.walk(other.value)
+                              if isinstance(c, ast.Constant)
+                              and isinstance(c.value, str))
+    return raised
+
+
+@pytest.mark.parametrize("kind", sorted(self_defence.KINDS))
+def test_every_kind_is_actually_raised(kind):
+    """A vocabulary nothing raises is a vocabulary.
+
+    Parametrised over the whole map rather than a hand-written list, so a kind
+    added and never wired fails here instead of sitting quietly. That is how
+    three of them sat: defined, explained, given a severity, and unreachable.
+    """
+    assert kind in _raised_kinds(), (
+        f"{kind} is defined in self_defence.KINDS and nothing calls "
+        f"_platform_event with it"
+    )
+
+
+def test_nothing_raises_a_kind_that_does_not_exist():
+    """The other direction. `describe()` files an unknown kind under MEDIUM
+    rather than dropping it, which is the right runtime behaviour and would
+    hide a typo for ever."""
+    invented = sorted(k for k in _raised_kinds()
+                      if k.isupper() and "_" in k and k not in self_defence.KINDS)
+    assert not invented, f"raised but never defined: {invented}"
 
 
 def test_there_is_somewhere_to_read_them():
