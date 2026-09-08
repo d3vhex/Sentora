@@ -54,8 +54,23 @@ def _set_literal(name: str) -> set:
 
 
 def _schema_tables(path: pathlib.Path) -> set:
-    return set(re.findall(
-        r"CREATE TABLE IF NOT EXISTS [`\"]?(\w+)", path.read_text(encoding="utf-8")))
+    """Table names, from SQL only.
+
+    Comments go first. The agent schema documents one of its own migrations
+    with the line
+
+        -- Existing agents: CREATE TABLE IF NOT EXISTS leaves the old CHECK …
+
+    and this used to read a table called `leaves` out of it. Harmless where
+    the result is filtered against `ALLOWED_TABLES`, and not harmless in
+    `test_the_agent_ships_every_table_it_collects` below, which asks a
+    question about every name it finds.
+    """
+    from tests.test_agent_schema_migration import _load_func
+
+    strip = _load_func(ROOT / "Sentora" / "modules" / "db.py", "_strip_comments")
+    return set(re.findall(r"CREATE TABLE IF NOT EXISTS [`\"]?(\w+)",
+                          strip(path.read_text(encoding="utf-8"))))
 
 
 ALLOWED = _set_literal("ALLOWED_TABLES")
@@ -100,6 +115,79 @@ def test_the_agent_collects_nothing_the_server_will_not_take():
         f"the agent collects and ships {missing}, ingest accepts them, and "
         f"there is nowhere to put them"
     )
+
+
+# Tables in the agent's own schema that it deliberately does not ship, and
+# why. Anything not named here has to be on `TABLES` in main.py.
+#
+# The list is short on purpose. A table the agent creates is a table something
+# was expected to write to, so "we do not send this" is a decision, and a
+# decision that is not written down is indistinguishable from the bug this
+# test exists to catch.
+AGENT_LOCAL_ONLY = {
+    "automations":
+        "A work queue the server pushes down and the agent updates in place. "
+        "It travels the other way, through /automations/report.",
+    "security_audit":
+        "No collector was ever written for it. The table is kept so one can "
+        "be added without a schema change; the claim that this agent reports "
+        "it is not - see the note on TABLES in main.py.",
+}
+
+
+def test_the_agent_ships_every_table_it_collects():
+    """The direction nothing checked, and it had been wrong for months.
+
+    `modules/inventory.py` wrote `software_inventory` and `network_inventory`
+    every cycle. Neither was on `TABLES`, so the send loop never offered them.
+    `prune_sent` never touched them either, because it will not delete an
+    unsent row - so they grew: 368,902 rows and 78,224 rows in the agent's own
+    database, none of them ever leaving the host.
+
+    Every layer was consistent with itself. The collector logged "Scanned 326
+    apps and 68 open ports". The server had both names in `ALLOWED_TABLES` and
+    `DEDUP_TABLES`, ready to receive them. The console showed two empty
+    tables, which is what a machine with no software installed looks like.
+
+    So the question this asks is not "does the server accept it" - that test
+    is above and it passed throughout. It is "does the agent send it at all".
+    """
+    main = (ROOT / "Sentora" / "main.py").read_text(encoding="utf-8")
+    block = re.search(r"^TABLES = \[(.*?)^\]", main, re.S | re.M)
+    assert block, "TABLES is no longer a list literal in the agent's main.py"
+    shipped = set(re.findall(r"['\"]([a-z_]+)['\"]", block.group(1)))
+
+    unshipped = sorted(_schema_tables(AGENT_SCHEMA) - shipped - AGENT_LOCAL_ONLY.keys())
+    assert not unshipped, (
+        f"the agent's schema has {unshipped} and TABLES does not, so anything "
+        f"written to them stays on the host for ever. Add them to TABLES, or "
+        f"to AGENT_LOCAL_ONLY with the reason."
+    )
+
+
+def test_nothing_is_excused_from_shipping_that_no_longer_exists():
+    """The excuse list rots the same way any list does."""
+    stale = sorted(AGENT_LOCAL_ONLY.keys() - _schema_tables(AGENT_SCHEMA))
+    assert not stale, f"AGENT_LOCAL_ONLY names tables the schema dropped: {stale}"
+
+
+def test_an_unshipped_table_cannot_grow_for_ever():
+    """The second half of the same failure.
+
+    `prune_sent` refuses to delete an unsent row - correctly, for a table that
+    is being delivered. For one that is not, it means the local database grows
+    until the disk does, on a machine this product is supposed to be watching
+    rather than filling. `prune_unsent` is the bound.
+    """
+    db = (ROOT / "Sentora" / "modules" / "db.py").read_text(encoding="utf-8")
+    assert "sent = FALSE AND id <" in db, (
+        "prune_unsent no longer bounds the unsent backlog"
+    )
+    main = (ROOT / "Sentora" / "main.py").read_text(encoding="utf-8")
+    tree = ast.parse(main)
+    called = {n.func.id for n in ast.walk(tree)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert "prune_unsent" in called, "the retention loop never calls it"
 
 
 def test_a_rejected_row_does_not_keep_its_fingerprint():

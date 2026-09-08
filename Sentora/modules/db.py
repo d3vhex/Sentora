@@ -19,6 +19,46 @@ def get_conn():
     )
 
 
+def scrub_nuls(value):
+    r"""Remove NUL bytes from anything about to be bound as a parameter.
+
+    PostgreSQL text cannot hold `\x00`. Not "should not" - the wire protocol
+    terminates strings with it, so psycopg2 refuses the statement outright:
+
+        A string literal cannot contain NUL (0x00) characters.
+
+    Which is fine until you remember what this agent collects. Every hour the
+    port scanner opens a socket to each listening port and reads whatever comes
+    back, and a binary protocol answers with binary. `decode(errors='ignore')`
+    does not help: it drops bytes that are not *valid*, and `\x00` is a
+    perfectly valid code point. So the banner keeps it, the service and product
+    strings are cut from the banner, and the insert dies.
+
+    It had been dying every hour on this host - ten times in the current log -
+    and it took the whole scan with it, because the exception left the loop
+    that was still writing the other ports. 108 rows, none newer than the day
+    before, and the console showed a Ports tab that looked merely quiet.
+
+    Stripping loses a byte that could not have been stored anyway; the row it
+    saves is one that is currently lost entirely. Applied to every bound
+    parameter rather than to inserts alone, because the scanner's duplicate
+    check passes the same product string to a SELECT and that raises first.
+
+    Text only. `bytea` stores NUL without complaint, and a binary column is
+    where a raw capture belongs, so stripping bytes here would corrupt the one
+    case that is already correct.
+    """
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, list):
+        return [scrub_nuls(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(scrub_nuls(v) for v in value)
+    if isinstance(value, dict):
+        return {k: scrub_nuls(v) for k, v in value.items()}
+    return value
+
+
 def _schema_path():
     """db/init.sql, whether running from source or from the PyInstaller bundle."""
     import sys
@@ -175,7 +215,7 @@ def delete_all(table: str):
 def insert_record(table: str, data: dict):
     columns = ','.join(data.keys())
     placeholders = ','.join(['%s'] * len(data))
-    values = list(data.values())
+    values = scrub_nuls(list(data.values()))
     query = f"INSERT INTO {table} ({columns}) VALUES ({placeholders})"
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -301,6 +341,44 @@ def prune_sent(table: str, keep: int) -> int:
     return removed if removed and removed > 0 else 0
 
 
+def prune_unsent(table: str, keep: int) -> int:
+    """Abandon unsent rows beyond the newest `keep`, and say how many.
+
+    `prune_sent` deliberately refuses to touch an unsent row, on the grounds
+    that it has not reached the server and deleting it is data loss. That is
+    right for a table that is being delivered and wrong for one that is not,
+    and the agent had two of the latter: `software_inventory` and
+    `network_inventory` were collected every cycle and were not on the
+    shipping list, so they accumulated 368,902 and 78,224 unsent rows here
+    while both tables read as empty on the server.
+
+    Nothing reported it. `prune_sent` skipped them because they were unsent,
+    the send loop skipped them because they were not listed, and the only
+    visible symptom was a host that appeared to have no software installed.
+
+    So there is a second bound, far above the first. A table being delivered
+    never reaches it - the send loop drains fifty rows every few seconds, and
+    an outage long enough to build this backlog is one where the newest rows
+    are the ones worth keeping anyway. A table that is not being delivered
+    reaches it within a day and then stops growing.
+
+    `keep` is the newest rows, not the oldest, and that is a real choice:
+    `fetch_unsent` has no ORDER BY, so a backlog drains roughly oldest-first
+    and a month-old software list would ship ahead of today's.
+    """
+    query = (
+        f"DELETE FROM {table} WHERE sent = FALSE AND id < "
+        f"(SELECT id FROM {table} WHERE sent = FALSE "
+        f" ORDER BY id DESC LIMIT 1 OFFSET %s)"
+    )
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, (keep,))
+            removed = cur.rowcount
+        conn.commit()
+    return removed if removed and removed > 0 else 0
+
+
 def fetch_one(table: str, where: str = "1=1", params: tuple = (), order_by: str = None):
     query = f"SELECT * FROM {table} WHERE {where}"
     if order_by:
@@ -308,7 +386,7 @@ def fetch_one(table: str, where: str = "1=1", params: tuple = (), order_by: str 
     query += " LIMIT 1"
     with get_conn() as conn:
         with conn.cursor(cursor_factory=DictCursor) as cur:
-            cur.execute(query, params)
+            cur.execute(query, scrub_nuls(params))
             row = cur.fetchone()
     return row
 
@@ -332,14 +410,14 @@ def fetch_where(table: str, where: str = "1=1", params: tuple = (), order_by: st
         params = params + (limit,)
     with get_conn() as conn:
         with conn.cursor(cursor_factory=DictCursor) as cur:
-            cur.execute(query, params)
+            cur.execute(query, scrub_nuls(params))
             rows = cur.fetchall()
     return rows
 
 
 def update_record(table: str, data: dict, where: str, params: tuple = ()):
     sets = ','.join([f"{k}=%s" for k in data])
-    values = list(data.values()) + list(params)
+    values = scrub_nuls(list(data.values()) + list(params))
     query = f"UPDATE {table} SET {sets} WHERE {where}"
     with get_conn() as conn:
         with conn.cursor() as cur:

@@ -105,3 +105,90 @@ def test_the_portscanner_uses_them():
     body = ast.unparse(fn)
     assert "%s" in body, "the duplicate check builds its own literals again"
     assert "params" in body
+
+
+# --------------------------------------------------------------------------
+# Parameterising it was necessary and not sufficient
+# --------------------------------------------------------------------------
+
+def _db_func(name: str):
+    """Lift one function out of the agent's db module without importing it."""
+    source = (AGENT / "modules" / "db.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    fn = next(n for n in tree.body
+              if isinstance(n, ast.FunctionDef) and n.name == name)
+    ns: dict = {}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "db.py", "exec"), ns)
+    return ns[name]
+
+
+def test_a_nul_byte_does_not_reach_postgres():
+    r"""The next thing that broke after the quoting was fixed.
+
+    PostgreSQL text cannot contain `\x00` - the protocol terminates strings
+    with it - so psycopg2 refuses the whole statement:
+
+        A string literal cannot contain NUL (0x00) characters.
+
+    The port scanner reads a raw banner off every listening port, and a binary
+    protocol answers in binary. `decode(errors='ignore')` keeps the NUL,
+    because it drops bytes that are not *valid* and `\x00` is valid. So the
+    scan ran every hour, found its ports, and died on the write. Ten times in
+    the current log, against a table whose newest row was the previous day.
+    """
+    scrub = _db_func("scrub_nuls")
+    assert scrub("SSH-2.0-OpenSSH\x008.9") == "SSH-2.0-OpenSSH8.9"
+    assert scrub(("a\x00b", 5, None)) == ("ab", 5, None)
+    assert scrub(["x\x00"]) == ["x"]
+    assert scrub({"banner": "\x00\x00"}) == {"banner": ""}
+
+
+def test_binary_is_left_alone():
+    """`bytea` stores NUL without complaining, and a raw capture is what a
+    binary column is for. Stripping there would corrupt the one case that was
+    already right."""
+    scrub = _db_func("scrub_nuls")
+    assert scrub(b"\x00\x01\x00") == b"\x00\x01\x00"
+
+
+@pytest.mark.parametrize("func", ["insert_record", "update_record",
+                                  "fetch_where", "fetch_one"])
+def test_every_bound_parameter_is_scrubbed(func):
+    """Inserts are not enough. The scanner's duplicate check passes the same
+    product string to a SELECT, and that raises first - so the row never
+    reached the insert that was supposedly the problem."""
+    source = (AGENT / "modules" / "db.py").read_text(encoding="utf-8")
+    fn = next(n for n in ast.parse(source).body
+              if isinstance(n, ast.FunctionDef) and n.name == func)
+    assert "scrub_nuls" in ast.unparse(fn), f"{func} binds unscrubbed values"
+
+
+def test_the_scan_survives_a_row_it_cannot_store():
+    """The insert loop used to sit inside the try that reports the scan as
+    failed, so the first unstorable row ended the scan and took every port
+    after it with it. One banner cost the whole hour."""
+    source = (AGENT / "modules" / "portscanner" / "portscanner.py").read_text(
+        encoding="utf-8")
+    fn = next(n for n in ast.parse(source).body
+              if isinstance(n, ast.AsyncFunctionDef) and n.name == "main_async")
+    loop = next(n for n in ast.walk(fn) if isinstance(n, ast.For))
+    assert any(isinstance(n, ast.Try) for n in loop.body), (
+        "a failed row ends the scan again"
+    )
+
+
+@pytest.mark.parametrize("column", ["target_ip", "state", "banner"])
+def test_the_scanner_fills_the_columns_the_server_has(column):
+    """All three existed on the server and were NULL on all 108 rows, because
+    the agent's own table did not have them and the insert did not mention
+    them. A port list that does not say which host, or whether the port
+    answered, is a list of numbers."""
+    source = (AGENT / "modules" / "portscanner" / "portscanner.py").read_text(
+        encoding="utf-8")
+    fn = next(n for n in ast.parse(source).body
+              if isinstance(n, ast.AsyncFunctionDef) and n.name == "main_async")
+    assert f"'{column}'" in ast.unparse(fn), f"{column} is not written"
+
+    schema = (AGENT / "db" / "init.sql").read_text(encoding="utf-8")
+    block = schema.split("portscan_result", 1)[1].split(";", 1)[0]
+    assert column in block, f"{column} is not in the agent's own table"
