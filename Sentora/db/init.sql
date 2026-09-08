@@ -26,23 +26,34 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_cf_dup_not_null
   ON critical_files (dup_fp) WHERE dup_fp IS NOT NULL;
 
 -- ========== portscan_result ==========
+-- target_ip, state and banner are new here and are not new on the server: its
+-- table has held all three since the beginning, so three columns were NULL on
+-- every row that ever arrived, because the agent had nowhere to put them. A
+-- port list that does not say which host, or whether the port answered, is a
+-- list of numbers.
 CREATE TABLE IF NOT EXISTS portscan_result (
     id         SERIAL PRIMARY KEY,
+    target_ip  TEXT,
     port       INTEGER,
     protocol   TEXT,
+    state      TEXT,
     service    TEXT,
     product    TEXT,
     version    TEXT,
+    banner     TEXT,
     scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     sent       BOOLEAN DEFAULT FALSE,
     dup_fp     CHAR(64)
 );
 ALTER TABLE portscan_result
+    ADD COLUMN IF NOT EXISTS target_ip  TEXT,
     ADD COLUMN IF NOT EXISTS port       INTEGER,
     ADD COLUMN IF NOT EXISTS protocol   TEXT,
+    ADD COLUMN IF NOT EXISTS state      TEXT,
     ADD COLUMN IF NOT EXISTS service    TEXT,
     ADD COLUMN IF NOT EXISTS product    TEXT,
     ADD COLUMN IF NOT EXISTS version    TEXT,
+    ADD COLUMN IF NOT EXISTS banner     TEXT,
     ADD COLUMN IF NOT EXISTS scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     ADD COLUMN IF NOT EXISTS sent       BOOLEAN DEFAULT FALSE,
     ADD COLUMN IF NOT EXISTS dup_fp     CHAR(64);

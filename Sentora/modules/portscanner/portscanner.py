@@ -598,8 +598,8 @@ async def scan_ports(target, timeout):
     while not result_queue.empty():
         res = await result_queue.get()
         port, protocol, service, product, version, banner = res
-        results.append((port, protocol, service, product, version))
-        
+        results.append((port, protocol, service, product, version, banner))
+
         banner_preview = banner[:80] + '...' if banner and len(banner) > 80 else banner
         print(f"[+] {port:5d}/tcp - {service:20s} | {product:20s} | v{version}")
         if banner_preview:
@@ -622,24 +622,52 @@ async def main_async():
     try:
         total_found = 0
         total_saved = 0
+        total_failed = 0
         results = await scan_ports(target, timeout)
-        
-        for port, protocol, service, product, version in results:
+
+        for port, protocol, service, product, version, banner in results:
             total_found += 1
-            if not is_duplicate(port, protocol, service, product, version):
-                insert_record(
-                    TABLE,
-                    {
-                        'port': port,
-                        'protocol': protocol,
-                        'service': service,
-                        'product': product,
-                        'version': version,
-                        'scanned_at': datetime.now(timezone.utc).replace(tzinfo=None),
-                    },
-                )
-                total_saved += 1
-                
+            # Per row, not per scan.
+            #
+            # This loop used to sit inside the try below, so the first row
+            # that would not insert ended the scan and took every port after
+            # it. One binary banner with a NUL in it cost the whole hour's
+            # work, every hour. `db.scrub_nuls` is the fix for that particular
+            # input; this is the fix for the shape of the failure, which will
+            # come back with some other byte.
+            try:
+                if not is_duplicate(port, protocol, service, product, version):
+                    insert_record(
+                        TABLE,
+                        {
+                            'target_ip': target,
+                            'port': port,
+                            'protocol': protocol,
+                            # Only a port that accepted a connection is
+                            # enqueued, so every row here is open. The column
+                            # existed and was NULL on all 108 rows, which
+                            # makes a port list say nothing about whether the
+                            # port answered.
+                            'state': 'open',
+                            'service': service,
+                            'product': product,
+                            'version': version,
+                            # Kept, and bounded. The banner is the evidence
+                            # for the identification - without it `Unknown-*`
+                            # is a dead end - but it is remote input, so a
+                            # service that answers with a megabyte does not
+                            # get to write a megabyte per port per hour.
+                            'banner': (banner or '')[:2048] or None,
+                            'scanned_at': datetime.now(timezone.utc).replace(tzinfo=None),
+                        },
+                    )
+                    total_saved += 1
+            except Exception as e:
+                total_failed += 1
+                if total_failed == 1:
+                    print(f"[!] {port}/{protocol} not stored: "
+                          f"{type(e).__name__}: {e}")
+
         end_time = datetime.now(timezone.utc).replace(tzinfo=None)
         duration = (end_time - start_time).total_seconds()
         
@@ -649,7 +677,9 @@ async def main_async():
         print(f"  Duration: {duration:.2f} seconds ({duration/60:.2f} minutes)")
         print(f"  Ports Found: {total_found}")
         print(f"  New Records Saved: {total_saved}")
-        print(f"  Duplicates Skipped: {total_found - total_saved}")
+        print(f"  Duplicates Skipped: {total_found - total_saved - total_failed}")
+        if total_failed:
+            print(f"  Not Stored: {total_failed}")
         print(f"{'='*70}\n")
     except KeyboardInterrupt:
         print("\n[!] Scan interrupted by user.")

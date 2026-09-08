@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 import ipaddress
 
 from modules.db import (insert_record, fetch_unsent, mark_sent, fetch_one,
-                        reoffer_recent, prune_sent)
+                        reoffer_recent, prune_sent, prune_unsent)
 import modules.enc_db as enc_db
 import modules.screen_capture as screen_capture
 import modules.agent_paths as agent_paths
@@ -479,6 +479,22 @@ TABLES = [
     'process_events',
     'hardware_inventory',
     'docker_containers',
+    # `software_inventory` and `network_inventory` are the opposite of the
+    # `security_audit` case below, and they were missing for longer.
+    #
+    # `modules/inventory.py` has been writing both every cycle since it was
+    # written - "Inventory: Scanned 326 apps and 68 open ports" is in the log
+    # every twenty minutes - and neither table was on this list, so not one row
+    # was ever offered to the server. On this host that is 368,902 rows of
+    # software inventory and 78,224 of network inventory sitting unsent in the
+    # agent's own database, while the console showed both tables empty: a
+    # machine with no software installed and nothing listening.
+    #
+    # The server was ready the whole time. Both names are in its
+    # `ALLOWED_TABLES` and its `DEDUP_TABLES`, so it has been prepared to
+    # receive and deduplicate two tables nothing ever sent it.
+    'software_inventory',
+    'network_inventory',
     # `security_audit` was here and is not any more. Nothing in this agent
     # ever wrote a row to it - no collector, not a broken one - so it was
     # shipped empty every cycle and the console showed it permanently as
@@ -828,6 +844,14 @@ def db_sender_loop():
 #: quietly capped by whatever the cleaner happened to leave behind.
 _RETENTION_ROWS = 5000
 
+#: The second bound, on rows the server has *not* got.
+#:
+#: Four times the sent limit, because this one must never bite a table that
+#: is simply behind. The send loop moves fifty rows every few seconds, so a
+#: healthy table stays far below this even through a long outage; only a table
+#: nothing is shipping climbs here, and two of them did - see `prune_unsent`.
+_UNSENT_BACKLOG_ROWS = 20000
+
 
 def retention_loop():
     """Keep the agent's local database from growing for ever.
@@ -849,9 +873,11 @@ def retention_loop():
         # doing is shipping the backlog, not deleting it.
         time.sleep(3600)
         total = 0
+        abandoned = 0
         for table in TABLES:
             try:
                 total += prune_sent(table, _RETENTION_ROWS)
+                abandoned += prune_unsent(table, _UNSENT_BACKLOG_ROWS)
             except Exception as e:
                 # One table failing must not stop the rest - the same rule the
                 # collectors follow, and for the same reason.
@@ -859,6 +885,13 @@ def retention_loop():
         if total:
             print(f"[*] Retention: removed {total} already-shipped row(s); "
                   f"keeping the newest {_RETENTION_ROWS} per table", flush=True)
+        if abandoned:
+            # Louder than the line above, and phrased as a loss, because it
+            # is one: these rows were collected and never delivered.
+            print(f"[!] Retention: abandoned {abandoned} row(s) that were "
+                  f"never sent, keeping the newest {_UNSENT_BACKLOG_ROWS} per "
+                  f"table. A table reaching this is not being shipped.",
+                  flush=True)
 
 
 #: How many consecutive failures between repeat reports, once a collector has
