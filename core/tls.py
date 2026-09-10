@@ -152,10 +152,11 @@ def _generate(env, log) -> tuple[str, str]:
         ) from e
 
     cn = (env.get("TLS_CN") or "").strip() or "localhost"
+    extra = [n.strip() for n in (env.get("TLS_SAN") or "").split(",") if n.strip()]
     outdir = material_dir(env)
     try:
         os.makedirs(outdir, exist_ok=True)
-        paths = ensure_certs(outdir=outdir, cn=cn, log=log)
+        paths = ensure_certs(outdir=outdir, cn=cn, log=log, extra_names=extra)
     except OSError as e:
         # Named, because the bare errno gives no clue which of the two
         # plausible causes it is - and they need opposite fixes.
@@ -173,7 +174,57 @@ def _generate(env, log) -> tuple[str, str]:
         "beyond your own network.")
     log(f"[tls] Agents need {paths['root_crt']} to verify this server; the "
         f"installer fetches it from /api/agent/ca, or set server_ca by hand.")
+    _warn_if_names_are_stale(paths["crt"], cn, extra, log)
     return paths["crt"], paths["key"]
+
+
+def _warn_if_names_are_stale(cert_path: str, cn: str, extra: list[str], log) -> None:
+    """Say so when the certificate on disk predates the configured names.
+
+    `ensure_certs` is idempotent, which is right - regenerating on every boot
+    would hand every restart a new identity and break every agent that had
+    pinned the CA. The cost is that changing `TLS_CN` or `TLS_SAN` on a
+    deployment that already has a certificate does *nothing*, and nothing said
+    so. The operator sets the hostname they intend to use, restarts, and gets
+    the same certificate for `localhost` with no error anywhere - then spends
+    the afternoon on the browser warning instead of on the two files that
+    would have fixed it.
+
+    This is a warning rather than a failure. The server still works on the
+    names the certificate does carry, and refusing to start because a name was
+    added would be worse than saying it out loud.
+    """
+    try:
+        from cryptography import x509
+
+        from certs.generate_certs import certificate_names
+
+        with open(cert_path, "rb") as fh:
+            covered = certificate_names(x509.load_pem_x509_certificate(fh.read()))
+    except Exception as e:
+        # Not fatal - a certificate that cannot be read back is still being
+        # served, and refusing to start over a diagnostic would be worse than
+        # the diagnostic. But say it: a check that silently does nothing is
+        # indistinguishable from a check that passed, which is the exact
+        # failure this function exists to report.
+        log(f"[tls] Could not read {cert_path} back to confirm which names it "
+            f"covers ({type(e).__name__}: {e}). If the browser reports a name "
+            f"mismatch, that is why nothing warned about it.")
+        return
+
+    wanted = {n for n in [cn, *extra] if n}
+    missing = sorted(wanted - covered)
+    if not missing:
+        return
+
+    log(f"[tls] The certificate at {cert_path} does not cover "
+        f"{', '.join(missing)} - it was generated before those names were "
+        f"configured, and TLS material is never regenerated on top of itself. "
+        f"Browsers will report a name mismatch, and WebAuthn cannot be "
+        f"registered against a name the certificate does not carry. Delete "
+        f"the files in that directory and restart, or run "
+        f"`python certs/generate_certs.py --force --cn {cn}"
+        + (f" --san {','.join(extra)}" if extra else "") + "`.")
 
 
 def existing(env=None) -> dict | None:

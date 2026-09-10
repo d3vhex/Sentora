@@ -223,7 +223,14 @@ $sha    = (Get-FileHash -Algorithm SHA256 $artifact).Hash.ToLower()
 
 Write-Ok ("Built main.exe  ({0:N1} MB)" -f $sizeMb)
 Write-Host "    sha256: $sha"
-Write-Host "    Ship it via /api/agent/download/windows (restart the server container to pick it up)."
+# `docker compose restart app` and not `up -d --build app` was what this line
+# used to say, and a restart does nothing: Sentora/ is copied into the image
+# by the Dockerfile, not bind-mounted, so the container keeps serving the
+# binary it was built with. A rebuild-and-reinstall cycle was spent on that -
+# the agent came back with the previous build's hash and every fix looked like
+# it had failed.
+Write-Host "    Serve it: docker compose up -d --build app   (a plain restart keeps the old binary)"
+Write-Host "    Then reinstall the agent; /api/agent/download/windows reads it from the image."
 
 # ─────────────────────── post-build cleanup ───────────────────────
 # Drop the intermediate PyInstaller artifacts so the working tree

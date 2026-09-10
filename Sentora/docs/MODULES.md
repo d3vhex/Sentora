@@ -2,7 +2,16 @@
 
 Every module is launched from `main.py` via `periodic_wrapped(...)` (or
 a dedicated thread for continuous watchers). Findings are written to
-the agent's local DB and shipped to the server by a background flusher.
+the agent's local DB, and shipped to the server by a background flusher
+**only if the table is named in `TABLES` in `main.py`**.
+
+That last part is not a formality. `software_inventory` and
+`network_inventory` were written every cycle by `inventory` and were not
+on that list, so nothing was ever offered to the server: 368,902 rows and
+78,224 rows sat unsent in the agent's own database while both tables read
+as empty in the console. Adding a module means adding its table there, and
+`tests/test_ingest_schema_coverage.py` now fails if a table in the agent
+schema is neither shipped nor listed as deliberately local.
 
 Convention: tables marked (enc) have sensitive fields encrypted at rest
 by `modules/enc_db.py` using the per-tenant Fernet key. See the
@@ -49,13 +58,25 @@ map.
 
 ### `edr_enforcer` (periodic baseline)
 - Path: `modules/edr_enforcer.py`
-- Behavior: Scheduled hash-baseline scan of a small high-value file set
-  (`/etc/passwd`, `/etc/shadow`, SAM hive path, `hosts`, `sshd_config`).
-  First run establishes the baseline; subsequent runs flag any mismatch
-  as a `security_audit` finding. Complements the realtime `fim` watcher,
-  since the baseline scan catches changes that occurred while the agent
-  was offline.
-- Output table: `security_audit` (enc)
+- Behavior: The agent's periodic endpoint sweep. Five passes per cycle:
+  - `check_fim()` — hash-baseline scan of a small high-value file set
+    (`/etc/passwd`, `/etc/shadow`, SAM hive path, `hosts`, `sshd_config`).
+    Complements the realtime `fim` watcher, which cannot see changes made
+    while the agent was offline.
+  - `track_network()` — current sockets and the process behind each.
+  - `monitor_processes()` — new and exiting processes.
+  - `get_hardware_inventory()` — CPU, memory and disk facts.
+  - `monitor_registry()` — Windows autorun and policy keys.
+- Output tables: `fim_data` (enc), `network_connections` (enc),
+  `process_events` (enc), `hardware_inventory` (enc), `registry_logs` (enc)
+- This entry described a module writing `security_audit` and nothing else.
+  It has never written that table — nothing in the agent has — and the four
+  tables it does write beside `fim_data` were undocumented. `security_audit`
+  is the clearest case in the codebase of a claim outliving its
+  implementation: the document promised it, the schema created it, `TABLES`
+  shipped it empty every cycle, and the console showed it as NOT COLLECTED
+  for the life of every install. It is off the shipping list now; the table
+  stays so a collector can be added without a schema change.
 
 ---
 
@@ -63,22 +84,28 @@ map.
 
 ### `inventory`
 - Path: `modules/inventory.py`
-- Behavior: Hardware snapshot (CPU model, RAM, disk topology) plus
+- Behavior: Hardware snapshot (CPU model, RAM, disk topology),
   installed-software enumeration (`dpkg-query`, then `rpm -qa`, then a
-  Windows registry walk under `Uninstall`). Writes one
-  `hardware_inventory` row and N `installed_software` rows per sweep.
+  Windows registry walk under `Uninstall`), and the set of listening
+  sockets with the process owning each. Writes one `hardware_inventory`
+  row, N `software_inventory` rows and N `network_inventory` rows per
+  sweep.
 - Output tables: `hardware_inventory` (enc) for `name` and
-  `serial_number`; `installed_software`
+  `serial_number`; `software_inventory`; `network_inventory`
+- The doc said `installed_software`, which is not a table and never was.
+  The two inventory tables were also the pair that reached the server for
+  the first time only after `TABLES` was corrected — see the note at the
+  top.
 
 ### `find_vulns`
 - Path: `modules/find_vulns/` (`info_collector.py` and `find_vuln.py`)
 - Behavior:
   - `info_collector` produces the package list (same logic as
-    `inventory` but emits to the OSV-input format).
+    `inventory` but emitting the OSV input format) into `packages`.
   - `find_vuln` queries `https://api.osv.dev` (or the server-proxied
     air-gap mirror) for known vulnerabilities and writes
     `vulnerabilities_report` rows.
-- Output table: `vulnerabilities_report`
+- Output tables: `packages`, `vulnerabilities_report`
 
 ---
 
@@ -92,7 +119,12 @@ map.
   2. Walks `psutil.process_iter()` for known dual-use tooling: `psexec`,
      `winrs`, `wsmprovhost`, `nmap`, `masscan`, `nc` / `ncat` / `netcat`,
      `socat`, `chisel`, `mimikatz`, `rdesktop`.
-- Output table: `security_audit` (enc) with `type=LATERAL_MOVEMENT`
+- Output table: `events_alert` (enc), source `LateralMovement`
+- Findings go through `send_alert()` in `main.py`, which deduplicates on a
+  content fingerprint before writing. These detectors report *state*, not
+  events — an established loopback SMB connection is re-found every 300s —
+  and without the fingerprint one normal connection produced the same alert
+  roughly 288 times a day.
 
 ### `persistence_hunter`
 - Path: `modules/persistence_hunter.py`
@@ -102,7 +134,17 @@ map.
     running `.vbs` / `.ps1`. Inspects the per-user Startup folder.
   - Linux: `/etc/crontab`, `/etc/cron.d/`, user crontabs and suspicious
     systemd unit files.
-- Output table: `security_audit` (enc) with `type=PERSISTENCE`
+- Output table: `events_alert` (enc), source `PersistenceHunter`
+- Same `send_alert()` path and the same deduplication as
+  `lateral_movement` above.
+
+> All three modules in this section, plus `edr_enforcer` above, were
+> documented as writing `security_audit`. None of them ever did — nothing in
+> this agent has written a row to that table. The schema created it, `TABLES`
+> shipped it empty every cycle, and the console showed it as NOT COLLECTED for
+> the life of every install, which reads as a sensor that broke rather than one
+> that was never built. It is off the shipping list; the table stays so a
+> collector can be added later without a schema change.
 
 ### `check_permissions`
 - Path: `modules/check_permissions/check_permissions.py`
@@ -119,17 +161,28 @@ map.
 
 ### `portscanner`
 - Path: `modules/portscanner/portscanner.py`
-- Behavior: Scans local TCP ports, grabs service banners, classifies
-  the service when a fingerprint matches. Used both for surface mapping
-  and to detect new listeners that appear between sweeps.
-- Output table: `portscan_result`
+- Behavior: Scans `127.0.0.1` hourly, grabs a banner from each open
+  port, and classifies the service when a fingerprint matches. Used for
+  surface mapping and to spot listeners that appear between sweeps.
+- Output table: `portscan_result` — `target_ip`, `port`, `protocol`,
+  `state`, `service`, `product`, `version`, `banner`
+- `target_ip`, `state` and `banner` were columns on the *server's* table
+  that the agent's own table did not have and the insert never mentioned,
+  so all 108 rows on the server carried NULL for each. A port list that
+  does not say which host, or whether the port answered, is a list of
+  numbers.
+- The banner is remote input and is truncated to 2 KB. It is also where
+  the NUL bytes come from that used to kill the whole scan — see
+  `db.py` below.
 
 ### `resource_checker`
 - Path: `modules/resource_checker/resource_checker.py` (plus `disks.py`)
-- Behavior: Per-tick CPU and memory snapshot into `resource_log`. The
-  `disks.py` companion writes per-partition usage to `disk_info` and
+- Behavior: Per-tick CPU and memory snapshot into `resource_usage`. The
+  `disks.py` companion writes per-partition usage to `disk_usage` and
   flags any partition over the soft or hard threshold.
-- Output tables: `resource_log`, `disk_info`
+- Output tables: `resource_usage`, `disk_usage`
+- Documented as `resource_log` and `disk_info` until now. Neither name
+  exists in the schema.
 
 ### `docker_monitor`
 - Path: `modules/docker_monitor/docker_monitor.py`
@@ -179,6 +232,21 @@ Thin DB wrapper used by every module: `insert_record`, `fetch_where`,
 an equivalent SQLite schema is shipped at
 [`db/init_sqlite.sql`](../db/init_sqlite.sql) for offline or minimal
 deployments.
+
+Two behaviours a module author needs to know about:
+
+- **`scrub_nuls` strips `\x00` from every bound parameter.** PostgreSQL
+  text cannot hold a NUL and psycopg2 refuses the whole statement with
+  `ValueError: A string literal cannot contain NUL (0x00) characters` —
+  note the type, an `except psycopg2.Error` walks straight past it. Any
+  module that stores bytes off a socket or a file will hit this; the port
+  scanner did, every hour, and lost the entire scan each time because the
+  exception left the loop that was writing the other ports.
+- **`prune_unsent` bounds the backlog of rows that never shipped.**
+  `prune_sent` deliberately refuses to delete an unsent row, which is
+  right for a table being delivered and wrong for one that is not. A table
+  missing from `TABLES` would otherwise grow until the disk did, on a
+  machine this product is meant to be watching rather than filling.
 
 ### `enc_db.py`
 Fernet-backed transparent encryption layer over `db.py`. Pulls the

@@ -112,6 +112,7 @@ from ai.utils import load_ai_config, is_critical_log, save_ai_results
 from security import session as session_store
 from security import ssrf
 from security import totp as totp_store
+from security import webauthn as webauthn_store
 from core import agent_link
 from core import attack
 from core import config_validation
@@ -7526,14 +7527,45 @@ async def _totp_secret_for(cur, user_id: int) -> tuple[str | None, bool]:
 
 
 async def _totp_required(cur, user_id: int) -> bool:
-    """Whether this user has a *confirmed* second factor.
+    """Whether this user has a *confirmed* second factor of any kind.
 
     Confirmed, not merely enrolled. A secret written when the QR code was
     displayed and never proved would lock out everybody who scanned it into an
     app they then deleted.
+
+    A registered security key counts. Reading only the TOTP table would let an
+    operator who enrolled a key and never set up an authenticator sign in with
+    a password alone - the console would show a second factor on the account
+    and not ask for one, which is the worst of both: the appearance of the
+    control without the control.
     """
     _, confirmed = await _totp_secret_for(cur, user_id)
-    return confirmed
+    if confirmed:
+        return True
+    return await _has_security_key(cur, user_id)
+
+
+async def _has_security_key(cur, user_id: int) -> bool:
+    """Any key, for any origin.
+
+    Deliberately not scoped to the current relying party, unlike the list the
+    console shows. Whether a login needs a second factor is a property of the
+    account; whether *this* browser can offer a key is a property of the
+    origin. Conflating them would mean an operator with a key registered at a
+    hostname could skip the second factor entirely by opening the console at
+    an address - which turns the origin binding, the whole point of WebAuthn,
+    into a bypass.
+    """
+    try:
+        await _webauthn_tables(cur)
+        await cur.execute(
+            "SELECT 1 FROM user_webauthn WHERE user_id = %s LIMIT 1", (user_id,))
+        return (await cur.fetchone()) is not None
+    except Exception:
+        # A missing table on an older database is "no keys", not a failed
+        # login. This runs on the password path, and raising here would lock
+        # everybody out of a console whose 2FA they had never enabled.
+        return False
 
 
 async def _begin_second_factor(request, *, user_id: int, username: str,
@@ -7682,6 +7714,24 @@ async def complete_second_factor(request):
         finally:
             await cur.close()
 
+    return await _finish_second_factor_login(
+        request, user_id=user_id, username=username, auth_type=auth_type,
+        role_row=role_row, ip=ip,
+        factor="recovery code" if used_recovery else "second factor",
+        used_recovery=used_recovery)
+
+
+async def _finish_second_factor_login(request, *, user_id: int, username: str,
+                                      auth_type: str, role_row, ip: str,
+                                      factor: str, used_recovery: bool = False):
+    """Issue the session, once both factors are in.
+
+    Shared with the security-key route rather than copied into it. Session
+    issuance is the step where a mistake is a bypass, and two of them drift:
+    the code that files a login and the code that scores one had already come
+    apart once in this codebase, and nobody could see it because each side had
+    its own idea of what counted.
+    """
     role = role_row[0] if role_row else None
     must_change = bool(role_row[1]) if role_row else False
 
@@ -7700,9 +7750,7 @@ async def complete_second_factor(request):
                        "credential one.",
         }, status=503)
 
-    await log_login_attempt(
-        username, auth_type, "success",
-        "recovery code" if used_recovery else "second factor", ip)
+    await log_login_attempt(username, auth_type, "success", factor, ip)
     if used_recovery:
         # Worth its own line and its own event: a recovery code means the
         # normal factor was unavailable, which is either an honest lost phone
@@ -7913,6 +7961,501 @@ async def second_factor_disable(request):
                     "second factor removed by the account holder")
     return sanic_json({"status": "success",
                        "message": "Two-factor is off for this account."})
+
+
+# ---------------------------------------------------------------------------
+# Security keys
+#
+# The second factor TOTP cannot be: a code typed into a convincing copy of this
+# login page works on the real one, and the operator has no way to tell. A
+# security key signs over the origin it is actually talking to, so it produces
+# nothing usable on a copy.
+#
+# There is no configuration. The relying-party ID is derived from the request,
+# which is why this works on a laptop at `localhost` and on an estate with a
+# real hostname without either being told anything - and why some origins
+# cannot host a key at all. `security.webauthn.usability` answers that, and the
+# console shows the reason instead of a button that fails.
+# ---------------------------------------------------------------------------
+
+def _webauthn_lib():
+    """The library, or None.
+
+    Imported here rather than at module scope on purpose. This is an optional
+    factor, and a deployment that pulls new code without reinstalling its
+    dependencies should lose the security-key option, not the whole console.
+    """
+    try:
+        import webauthn as _lib
+        from webauthn.helpers import base64url_to_bytes, bytes_to_base64url
+        from webauthn.helpers.structs import (
+            AuthenticatorSelectionCriteria, PublicKeyCredentialDescriptor,
+            ResidentKeyRequirement, UserVerificationRequirement,
+        )
+    except ImportError:
+        return None
+    return {
+        "lib": _lib, "to_bytes": base64url_to_bytes, "to_b64": bytes_to_base64url,
+        "Selection": AuthenticatorSelectionCriteria,
+        "Descriptor": PublicKeyCredentialDescriptor,
+        "ResidentKey": ResidentKeyRequirement,
+        "UserVerification": UserVerificationRequirement,
+    }
+
+
+async def _webauthn_tables(cur) -> None:
+    for statement in (webauthn_store.DDL_CREDENTIALS, webauthn_store.DDL_CHALLENGES):
+        await cur.execute(statement)
+
+
+def _webauthn_origin(request):
+    """(rp_id, origin, reason) for the request in hand."""
+    scheme = (request.scheme or "http").lower()
+    try:
+        rp_id, origin = webauthn_store.relying_party(request.host, scheme)
+    except webauthn_store.Unusable as e:
+        return None, None, str(e)
+    return rp_id, origin, None
+
+
+async def _webauthn_credentials(cur, user_id: int, rp_id: str) -> list:
+    """This user's keys *for this origin*.
+
+    Scoped to the relying party deliberately. A key registered while the
+    console was at `localhost` is one the browser will not offer at a hostname,
+    so listing it there shows an operator a factor they cannot use and then
+    times out at the prompt with no explanation.
+    """
+    await cur.execute(
+        "SELECT id, credential_id, public_key, sign_count, transports, "
+        "       nickname, created_at, last_used_at "
+        "  FROM user_webauthn WHERE user_id = %s AND rp_id = %s "
+        " ORDER BY created_at",
+        (user_id, rp_id))
+    rows = await cur.fetchall()
+    return [{"id": r[0], "credential_id": r[1], "public_key": r[2],
+             "sign_count": int(r[3] or 0), "transports": r[4],
+             "nickname": r[5], "created_at": r[6], "last_used_at": r[7]}
+            for r in rows]
+
+
+@app.get("/api/2fa/webauthn/capability")
+async def webauthn_capability(request):
+    """Whether a key can be used from where this browser is standing.
+
+    The console asks before it offers anything, because the alternative is a
+    button that produces a browser error naming neither the cause nor the fix.
+    """
+    user_id = current_user_id(request)
+    if not user_id:
+        return sanic_json({"status": "error", "message": "Unauthorized"}, status=401)
+
+    if _webauthn_lib() is None:
+        return sanic_json({
+            "status": "success", "available": False,
+            "reason": "This server was installed without the `webauthn` "
+                      "package, so security keys are unavailable. One-time "
+                      "codes are unaffected.",
+            "credentials": [],
+        })
+
+    rp_id, _origin, reason = _webauthn_origin(request)
+    if reason:
+        return sanic_json({"status": "success", "available": False,
+                           "reason": reason, "credentials": []})
+
+    async with userdb_conn() as cnx:
+        cur = await cnx.cursor()
+        try:
+            await _webauthn_tables(cur)
+            creds = await _webauthn_credentials(cur, user_id, rp_id)
+        finally:
+            await cur.close()
+
+    return sanic_json({
+        "status": "success", "available": True, "reason": "", "rp_id": rp_id,
+        "credentials": [{
+            "id": c["id"],
+            "label": webauthn_store.describe(c),
+            "created_at": str(c["created_at"] or ""),
+            "last_used_at": str(c["last_used_at"] or "") or None,
+        } for c in creds],
+    })
+
+
+@app.post("/api/2fa/webauthn/register/begin")
+async def webauthn_register_begin(request):
+    """Options for creating a credential. Nothing becomes a factor yet."""
+    user_id = current_user_id(request)
+    if not user_id:
+        return sanic_json({"status": "error", "message": "Unauthorized"}, status=401)
+
+    lib = _webauthn_lib()
+    if lib is None:
+        return sanic_json({"status": "error",
+                           "message": "This server has no WebAuthn support "
+                                      "installed."}, status=501)
+
+    rp_id, origin, reason = _webauthn_origin(request)
+    if reason:
+        return sanic_json({"status": "error", "message": reason}, status=409)
+
+    challenge = webauthn_store.new_challenge()
+    async with userdb_conn() as cnx:
+        cur = await cnx.cursor()
+        try:
+            await _webauthn_tables(cur)
+            await cur.execute("SELECT username FROM users WHERE id = %s", (user_id,))
+            row = await cur.fetchone()
+            username = row[0] if row else str(user_id)
+            existing = await _webauthn_credentials(cur, user_id, rp_id)
+            await cur.execute(
+                "INSERT INTO webauthn_challenges (challenge, user_id, purpose, "
+                "rp_id, origin, expires_at) VALUES (%s, %s, 'register', %s, %s, "
+                "DATE_ADD(NOW(), INTERVAL %s SECOND))",
+                (challenge, user_id, rp_id, origin,
+                 webauthn_store.CHALLENGE_TTL_SECONDS))
+            # Cheap, and this table only grows otherwise: an abandoned ceremony
+            # is exactly the row nobody comes back for.
+            await cur.execute("DELETE FROM webauthn_challenges WHERE expires_at < NOW()")
+            await cnx.commit()
+        finally:
+            await cur.close()
+
+    options = lib["lib"].generate_registration_options(
+        rp_id=rp_id,
+        rp_name=webauthn_store.RP_NAME,
+        user_id=str(user_id).encode(),
+        user_name=username,
+        challenge=lib["to_bytes"](challenge),
+        # Already-registered keys are excluded so the authenticator says "you
+        # have one of these already" rather than quietly making a second
+        # credential the operator cannot tell apart from the first.
+        exclude_credentials=[
+            lib["Descriptor"](id=lib["to_bytes"](c["credential_id"]))
+            for c in existing
+        ],
+        authenticator_selection=lib["Selection"](
+            resident_key=lib["ResidentKey"].PREFERRED,
+            user_verification=lib["UserVerification"].PREFERRED,
+        ),
+    )
+    return sanic_json({"status": "success",
+                       "options": json.loads(lib["lib"].options_to_json(options))})
+
+
+@app.post("/api/2fa/webauthn/register/finish")
+async def webauthn_register_finish(request):
+    """Verify the attestation and store the credential."""
+    user_id = current_user_id(request)
+    if not user_id:
+        return sanic_json({"status": "error", "message": "Unauthorized"}, status=401)
+
+    lib = _webauthn_lib()
+    if lib is None:
+        return sanic_json({"status": "error",
+                           "message": "This server has no WebAuthn support "
+                                      "installed."}, status=501)
+
+    data = request.json or {}
+    credential = data.get("credential")
+    nickname = (data.get("nickname") or "").strip()[:64] or None
+    if not credential:
+        return sanic_json({"status": "error",
+                           "message": "No credential was sent."}, status=400)
+
+    async with userdb_conn() as cnx:
+        cur = await cnx.cursor()
+        try:
+            await _webauthn_tables(cur)
+            # The challenge, the RP ID and the origin all come from the row we
+            # wrote, never from the response. Verifying a response against the
+            # origin the response itself claims is not a check.
+            await cur.execute(
+                "SELECT challenge, rp_id, origin FROM webauthn_challenges "
+                " WHERE user_id = %s AND purpose = 'register' "
+                "   AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1",
+                (user_id,))
+            row = await cur.fetchone()
+            if not row:
+                return sanic_json({
+                    "status": "error",
+                    "message": "That registration expired. Start again.",
+                }, status=400)
+            challenge, rp_id, origin = row
+
+            try:
+                verified = lib["lib"].verify_registration_response(
+                    credential=credential,
+                    expected_challenge=lib["to_bytes"](challenge),
+                    expected_rp_id=rp_id,
+                    expected_origin=origin,
+                )
+            except Exception as e:
+                await cur.execute(
+                    "DELETE FROM webauthn_challenges WHERE challenge = %s",
+                    (challenge,))
+                await cnx.commit()
+                return sanic_json({
+                    "status": "error",
+                    "message": f"That key could not be verified: {e}",
+                }, status=400)
+
+            # Single use, verified or not.
+            await cur.execute("DELETE FROM webauthn_challenges WHERE challenge = %s",
+                              (challenge,))
+            transports = ""
+            if isinstance(credential, dict):
+                transports = ",".join(
+                    str(t) for t in (credential.get("transports") or [])
+                )[:128]
+            await cur.execute(
+                "INSERT INTO user_webauthn (user_id, credential_id, public_key, "
+                "rp_id, sign_count, transports, nickname) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE sign_count = VALUES(sign_count)",
+                (user_id, lib["to_b64"](verified.credential_id),
+                 lib["to_b64"](verified.credential_public_key), rp_id,
+                 int(verified.sign_count or 0), transports, nickname))
+            await cnx.commit()
+        finally:
+            await cur.close()
+
+    await audit_log(request, "WEBAUTHN_KEY_ADDED", str(user_id),
+                    f"security key registered for {rp_id}")
+    return sanic_json({"status": "success",
+                       "message": "Security key registered."})
+
+
+@app.delete("/api/2fa/webauthn/<credential_row_id:int>")
+async def webauthn_remove(request, credential_row_id: int):
+    """Remove one key. Scoped to the caller, so an id from elsewhere does
+    nothing rather than removing somebody else's factor."""
+    user_id = current_user_id(request)
+    if not user_id:
+        return sanic_json({"status": "error", "message": "Unauthorized"}, status=401)
+
+    async with userdb_conn() as cnx:
+        cur = await cnx.cursor()
+        try:
+            await _webauthn_tables(cur)
+            await cur.execute(
+                "DELETE FROM user_webauthn WHERE id = %s AND user_id = %s",
+                (credential_row_id, user_id))
+            removed = cur.rowcount
+            await cnx.commit()
+        finally:
+            await cur.close()
+
+    if not removed:
+        return sanic_json({"status": "error",
+                           "message": "No such key on this account."}, status=404)
+    await audit_log(request, "WEBAUTHN_KEY_REMOVED", str(user_id),
+                    "security key removed by the account holder")
+    return sanic_json({"status": "success", "message": "Security key removed."})
+
+
+@app.post("/login/2fa/webauthn/begin")
+async def webauthn_login_begin(request):
+    """Options for asserting a key against a pending login.
+
+    The pending token is the same one the code path uses: passing the password
+    gets a short-lived credential that can do exactly one thing, and which
+    factor finishes it is the operator's choice.
+    """
+    lib = _webauthn_lib()
+    if lib is None:
+        return sanic_json({"status": "error",
+                           "message": "This server has no WebAuthn support "
+                                      "installed."}, status=501)
+
+    raw_token = ((request.json or {}).get("token") or "").strip()
+    if not raw_token:
+        return sanic_json({"status": "error",
+                           "message": "The login token is required."}, status=400)
+
+    rp_id, origin, reason = _webauthn_origin(request)
+    if reason:
+        return sanic_json({"status": "error", "message": reason}, status=409)
+
+    challenge = webauthn_store.new_challenge()
+    async with userdb_conn() as cnx:
+        cur = await cnx.cursor()
+        try:
+            await _totp_tables(cur)
+            await _webauthn_tables(cur)
+            await cur.execute(
+                "SELECT user_id FROM totp_pending WHERE token_hash = %s "
+                "  AND expires_at > NOW()",
+                (totp_store.hash_pending(raw_token),))
+            row = await cur.fetchone()
+            if not row:
+                return sanic_json({
+                    "status": "error",
+                    "message": "This login has expired. Sign in again.",
+                }, status=401)
+            user_id = row[0]
+
+            creds = await _webauthn_credentials(cur, user_id, rp_id)
+            if not creds:
+                # Said plainly rather than offered as an empty prompt. A key
+                # registered at another origin is invisible to the browser
+                # here, and "nothing happened" is the least useful answer.
+                return sanic_json({
+                    "status": "error",
+                    "message": "No security key is registered for this account "
+                               "at this address. Use a one-time code.",
+                }, status=404)
+
+            await cur.execute(
+                "INSERT INTO webauthn_challenges (challenge, user_id, purpose, "
+                "rp_id, origin, expires_at) VALUES (%s, %s, 'login', %s, %s, "
+                "DATE_ADD(NOW(), INTERVAL %s SECOND))",
+                (challenge, user_id, rp_id, origin,
+                 webauthn_store.CHALLENGE_TTL_SECONDS))
+            await cur.execute("DELETE FROM webauthn_challenges WHERE expires_at < NOW()")
+            await cnx.commit()
+        finally:
+            await cur.close()
+
+    options = lib["lib"].generate_authentication_options(
+        rp_id=rp_id,
+        challenge=lib["to_bytes"](challenge),
+        allow_credentials=[
+            lib["Descriptor"](id=lib["to_bytes"](c["credential_id"]))
+            for c in creds
+        ],
+        user_verification=lib["UserVerification"].PREFERRED,
+    )
+    return sanic_json({"status": "success",
+                       "options": json.loads(lib["lib"].options_to_json(options))})
+
+
+@app.post("/login/2fa/webauthn/finish")
+async def webauthn_login_finish(request):
+    """Verify the assertion and issue the session."""
+    lib = _webauthn_lib()
+    if lib is None:
+        return sanic_json({"status": "error",
+                           "message": "This server has no WebAuthn support "
+                                      "installed."}, status=501)
+
+    data = request.json or {}
+    raw_token = (data.get("token") or "").strip()
+    credential = data.get("credential")
+    ip = _client_ip(request)
+    if not raw_token or not credential:
+        return sanic_json({"status": "error",
+                           "message": "Both the login token and a credential "
+                                      "are required."}, status=400)
+
+    async with userdb_conn() as cnx:
+        cur = await cnx.cursor()
+        try:
+            await _totp_tables(cur)
+            await _webauthn_tables(cur)
+            await cur.execute(
+                "SELECT user_id, username, auth_type FROM totp_pending "
+                " WHERE token_hash = %s AND expires_at > NOW()",
+                (totp_store.hash_pending(raw_token),))
+            pending = await cur.fetchone()
+            if not pending:
+                return sanic_json({
+                    "status": "error",
+                    "message": "This login has expired. Sign in again.",
+                }, status=401)
+            user_id, username, auth_type = pending
+
+            await cur.execute(
+                "SELECT challenge, rp_id, origin FROM webauthn_challenges "
+                " WHERE user_id = %s AND purpose = 'login' "
+                "   AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1",
+                (user_id,))
+            row = await cur.fetchone()
+            if not row:
+                return sanic_json({
+                    "status": "error",
+                    "message": "That challenge expired. Try again.",
+                }, status=400)
+            challenge, rp_id, origin = row
+
+            raw_id = credential.get("id") if isinstance(credential, dict) else None
+            await cur.execute(
+                "SELECT id, public_key, sign_count FROM user_webauthn "
+                " WHERE user_id = %s AND rp_id = %s AND credential_id = %s",
+                (user_id, rp_id, raw_id))
+            stored = await cur.fetchone()
+            if not stored:
+                return sanic_json({
+                    "status": "error",
+                    "message": "That key is not registered for this account "
+                               "at this address.",
+                }, status=401)
+            row_id, public_key, stored_count = stored
+
+            try:
+                verified = lib["lib"].verify_authentication_response(
+                    credential=credential,
+                    expected_challenge=lib["to_bytes"](challenge),
+                    expected_rp_id=rp_id,
+                    expected_origin=origin,
+                    credential_public_key=lib["to_bytes"](public_key),
+                    credential_current_sign_count=int(stored_count or 0),
+                )
+            except Exception as e:
+                await cur.execute(
+                    "DELETE FROM webauthn_challenges WHERE challenge = %s",
+                    (challenge,))
+                await cnx.commit()
+                await log_login_attempt(username, auth_type, "failure",
+                                        "security key rejected", ip)
+                return sanic_json({
+                    "status": "error",
+                    "message": f"That key could not be verified: {e}",
+                }, status=401)
+
+            # Single use.
+            await cur.execute("DELETE FROM webauthn_challenges WHERE challenge = %s",
+                              (challenge,))
+
+            presented = int(verified.new_sign_count or 0)
+            if webauthn_store.counter_regressed(int(stored_count or 0), presented):
+                # The one thing the counter is for. A key that has gone
+                # backwards is a copy of one that has been used more times than
+                # the copy knows about.
+                await cur.execute("DELETE FROM totp_pending WHERE token_hash = %s",
+                                  (totp_store.hash_pending(raw_token),))
+                await cnx.commit()
+                await log_login_attempt(username, auth_type, "failure",
+                                        "security key counter went backwards", ip)
+                await _platform_event(
+                    "WEBAUTHN_COUNTER_REGRESSED", subject=username, source_ip=ip,
+                    detail=f"a security key presented signature counter "
+                           f"{presented} after {stored_count}; the key has "
+                           f"either been cloned or the response replayed")
+                return sanic_json({
+                    "status": "error",
+                    "message": "That key reported a signature counter lower "
+                               "than the last one seen, which means it has "
+                               "been copied. It has not been accepted.",
+                }, status=401)
+
+            await cur.execute(
+                "UPDATE user_webauthn SET sign_count = %s, last_used_at = NOW() "
+                " WHERE id = %s", (presented, row_id))
+            await cur.execute("DELETE FROM totp_pending WHERE token_hash = %s",
+                              (totp_store.hash_pending(raw_token),))
+            await cur.execute(
+                "SELECT role, must_change_password, created_at FROM users "
+                " WHERE id = %s", (user_id,))
+            role_row = await cur.fetchone()
+            await cnx.commit()
+        finally:
+            await cur.close()
+
+    return await _finish_second_factor_login(
+        request, user_id=user_id, username=username, auth_type=auth_type,
+        role_row=role_row, ip=ip, factor="security key")
 
 
 @app.route("/api/platform/events")

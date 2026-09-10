@@ -32,6 +32,8 @@ annotated-types==0.8.0
     # via pydantic
 bcrypt==5.0.0
     # via passlib
+cbor2==6.1.4
+    # via webauthn
 certifi==2026.7.22
     # via
     #   opensearch-py
@@ -43,7 +45,10 @@ charset-normalizer==3.5.1
     #   reportlab
     #   requests
 cryptography==50.0.0
-    # via -r requirements.txt
+    # via
+    #   -r requirements.txt
+    #   pyopenssl
+    #   webauthn
 dnspython==2.8.0
     # via email-validator
 docker==7.2.0
@@ -100,7 +105,12 @@ psutil==7.2.2
 psycopg2-binary==2.9.12
     # via -r requirements.txt
 pyasn1==0.6.4
-    # via ldap3
+    # via
+    #   ldap3
+    #   pyasn1-modules
+    #   webauthn
+pyasn1-modules==0.4.2
+    # via webauthn
 pycparser==3.0
     # via cffi
 pydantic==2.13.4
@@ -109,6 +119,8 @@ pydantic-core==2.46.4
     # via pydantic
 pymysql==1.2.0
     # via aiomysql
+pyopenssl==26.4.0
+    # via webauthn
 python-dateutil==2.9.0.post0
     # via
     #   opensearch-py
@@ -146,6 +158,7 @@ typing-extensions==4.16.0
     #   multidict
     #   pydantic
     #   pydantic-core
+    #   pyopenssl
     #   sanic
     #   typing-inspection
 typing-inspection==0.4.4
@@ -162,6 +175,8 @@ urllib3==2.7.0
 uvloop==0.22.1
     # via sanic
 watchdog==6.0.0
+    # via -r requirements.txt
+webauthn==3.0.0
     # via -r requirements.txt
 websockets==16.1.1
     # via

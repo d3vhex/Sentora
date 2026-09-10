@@ -84,6 +84,12 @@ KINDS: dict[str, tuple[str, str]] = {
         "A wrong password was given when turning off two-factor. A hijacked "
         "session trying to remove the control that would have stopped it "
         "looks exactly like this."),
+    "WEBAUTHN_COUNTER_REGRESSED": (
+        "CRITICAL",
+        "A security key presented a signature counter lower than the last one "
+        "this server saw. That is what a copy of the key looks like: the copy "
+        "does not know how many times the original has been used. The only "
+        "other reading is a replayed response, and neither is benign."),
 }
 
 # `TLS_DOWNGRADE_REFUSED` was defined here and is deliberately gone.

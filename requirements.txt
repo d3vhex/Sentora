@@ -19,3 +19,14 @@ watchdog
 opensearch-py
 websockets
 reportlab
+
+# Security keys as a second factor (security/webauthn.py). Optional at
+# runtime: app.py imports it lazily and degrades to one-time codes when it is
+# absent, so an existing deployment that pulls new code without reinstalling
+# loses the key option rather than the console.
+#
+# It pulls `cryptography` forward - a fresh install of this line moved it from
+# 43 to 50 here. Nothing broke, and the whole suite was run against the newer
+# one before this was added, but it is the library Fernet and the TLS material
+# both rest on, so a version jump is worth knowing about rather than meeting.
+webauthn==3.0.0

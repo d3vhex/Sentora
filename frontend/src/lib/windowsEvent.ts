@@ -70,26 +70,50 @@ export function parseEventMessage(raw: string): ParsedEvent {
   let seenField = false;
 
   for (const line of lines) {
-    const match = line.match(FIELD_LINE);
-    if (match) {
-      seenField = true;
-      const key = match[1];
-      const value = match[2].trim();
-      // Windows emits a run of empty keys on most events - PipelineId,
-      // CommandName, CommandType, CommandPath. They are noise in every one.
-      if (value) fields.push({ key, value });
-      continue;
+    // Split on tabs before matching. `FIELD_LINE` is anchored at the start of
+    // a line, and the agent builds its message as `summary | inserts` on one
+    // line - so the first field arrives *after* the headline on the same line,
+    // separated by the tab Windows puts in front of it:
+    //
+    //   [PowerShell] EID=403, Cat=4 | Stopped | Available | \tNewEngineState=Stopped
+    //
+    // Matching per line dropped that field on every event of this shape, and
+    // it is the field that says what actually happened. The rest of the
+    // inserts are one per line and are unaffected.
+    for (const segment of line.split('\t')) {
+      const match = segment.match(FIELD_LINE);
+      if (match) {
+        seenField = true;
+        const key = match[1];
+        const value = match[2].trim();
+        // Windows emits a run of empty keys on most events - PipelineId,
+        // CommandName, CommandType, CommandPath. They are noise in every one.
+        if (value) fields.push({ key, value });
+        continue;
+      }
+      if (!seenField) headlineParts.push(segment);
     }
-    if (!seenField) headlineParts.push(line);
   }
 
   // The first line often ends with the same values repeated as ` | a | b | `
   // before the fields begin. Trim the trailing separators, keep the text.
-  const headline = headlineParts
-    .join(' ')
-    .replace(/\s+/g, ' ')
-    .replace(/(\s*\|\s*)+$/, '')
-    .trim();
+  //
+  // Trimmed with a loop rather than a regex, and deliberately.
+  //
+  // This was `(\s*\|\s*)+$`: a quantifier inside a quantifier with the
+  // whitespace ambiguous between adjacent repetitions, which backtracks
+  // exponentially on a line ending in a long run of spaces. `[\s|]+$` fixes
+  // that and is still super-linear, because an anchored trailing match makes
+  // the engine retry from every position when it fails. JavaScript has no
+  // possessive quantifiers to say "do not backtrack", so the honest answer is
+  // not to ask a regex for something a scan does in one pass - over text an
+  // attacker writes into a log, running in the operator's browser.
+  const collapsed = headlineParts.join(' ').replace(/\s+/g, ' ');
+  let end = collapsed.length;
+  while (end > 0 && (collapsed[end - 1] === '|' || collapsed[end - 1] === ' ')) {
+    end -= 1;
+  }
+  const headline = collapsed.slice(0, end).trim();
 
   return { headline, fields, structured: seenField };
 }

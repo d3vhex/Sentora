@@ -1,80 +1,137 @@
-import React, { useEffect, useState } from 'react';
-import { 
-  Zap,
-  CheckCircle2,
-  AlertCircle,
-  Clock,
-  Terminal,
-  Activity,
-  Plus,
-  Edit2,
-  Trash2,
-  X,
-  Save,
-  RefreshCw
+/**
+ * Response actions: what was run on a host, and what happened.
+ *
+ * Both loaders here had no failure branch - `getAgents()` and
+ * `getAutomations()` were `.then(setState)` with nothing after them. A request
+ * that failed left the agent dropdown empty, which disables the New button,
+ * which is indistinguishable from an estate with no agents in it.
+ *
+ * `StatusBadge` was a fourth private copy of the severity-to-colour mapping,
+ * with its own greens and reds. It is the shared `Badge` now, so `failed` here
+ * is the same red as `critical` everywhere else.
+ */
+import React, { useCallback, useEffect, useState } from 'react';
+import {
+  Zap, Clock, Terminal, Plus, Edit2, Trash2, Save, RefreshCw,
 } from 'lucide-react';
 import { agentService } from '../services/api';
+import {
+  PageHeader, Card, Badge, DataTable, Row, Cell, Tone,
+  EmptyState, ErrorState, LoadingState, Modal, Field, DialogButton,
+} from '../components/ui';
+
+const ACTIONS = [
+  ['block_ip', 'Block IP address'],
+  ['unblock_ip', 'Unblock IP address'],
+  ['disable_user', 'Disable user account'],
+  ['enable_user', 'Enable user account'],
+  ['quarantine_file', 'Quarantine file'],
+  ['delete_file', 'Delete file'],
+  ['kill_process', 'Kill process'],
+  ['suspend_process', 'Suspend process'],
+  ['delete_registry_key', 'Delete registry key'],
+  ['protect_shadows', 'Protect volume shadows'],
+  ['restart_service', 'Restart service'],
+  ['isolate_host', 'Isolate host'],
+  ['lock_machine', 'Lock machine'],
+  ['tail_log', 'Tail log file'],
+  ['run_cmd', 'Run custom command'],
+] as const;
+
+/** One mapping, shared with every other page through `Badge`. */
+const STATUS_TONE: Record<string, Tone> = {
+  completed: 'ok', success: 'ok',
+  failed: 'critical',
+  active: 'medium', pending: 'medium',
+  cancelled: 'neutral', paused: 'neutral',
+};
+
+const FILTERS = [
+  ['all', 'All'],
+  ['active', 'Running'],
+  ['completed', 'Done'],
+  ['failed', 'Failed'],
+] as const;
+
+/** The target arrives as a JSON array for some actions and a bare string for
+ *  others, and rendering the raw `["1.2.3.4"]` was leaking that detail. */
+function targetText(raw: unknown): string {
+  if (Array.isArray(raw)) return raw.join(' ');
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+      try {
+        const arr = JSON.parse(trimmed);
+        if (Array.isArray(arr)) return arr.join(' ');
+      } catch {
+        /* not JSON after all; show it as written */
+      }
+    }
+    return raw;
+  }
+  return String(raw ?? '');
+}
 
 const Automations: React.FC = () => {
   const [agents, setAgents] = useState<string[]>([]);
   const [selectedAgent, setSelectedAgent] = useState('');
   const [automations, setAutomations] = useState<any[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [filter, setFilter] = useState('all');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [filter, setFilter] = useState<string>('all');
 
-  // Modal states
   const [showModal, setShowModal] = useState(false);
-  const [isEditing, setIsEditing] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<number | null>(null);
   const [formData, setFormData] = useState({
-    action: 'block_ip',
-    target: '',
-    comment: '',
-    event_id: ''
+    action: 'block_ip', target: '', comment: '', event_id: '',
   });
 
-  useEffect(() => {
-    agentService.getAgents().then(list => {
-      const agentNames = list.map((a: any) => typeof a === 'string' ? a : a.name);
-      setAgents(agentNames);
-      if (agentNames.length > 0) setSelectedAgent(agentNames[0]);
-    });
-  }, []);
+  const say = (err: any, fallback: string) =>
+    err?.response?.data?.error || err?.response?.data?.message || err?.message || fallback;
 
   useEffect(() => {
-    if (selectedAgent) {
-      fetchData();
+    agentService.getAgents()
+      .then((list: any[]) => {
+        const names = list.map((a) => (typeof a === 'string' ? a : a.name));
+        setAgents(names);
+        setSelectedAgent((current) => current || names[0] || '');
+        if (names.length === 0) setLoading(false);
+      })
+      .catch((err) => {
+        setError(say(err, 'Could not list agents'));
+        setLoading(false);
+      });
+  }, []);
+
+  const fetchData = useCallback(async () => {
+    if (!selectedAgent) return;
+    setLoading(true);
+    try {
+      setAutomations(await agentService.getAutomations(selectedAgent));
+      setError(null);
+    } catch (err) {
+      setError(say(err, `Could not read automations for ${selectedAgent}`));
+    } finally {
+      setLoading(false);
     }
   }, [selectedAgent]);
 
-  const fetchData = () => {
-    if (!selectedAgent) return;
-    setLoading(true);
-    agentService.getAutomations(selectedAgent)
-      .then(setAutomations)
-      .finally(() => setLoading(false));
-  };
+  useEffect(() => { fetchData(); }, [fetchData]);
 
-  const handleOpenCreate = () => {
-    setIsEditing(false);
+  const openCreate = () => {
     setEditingId(null);
-    setFormData({
-      action: 'block_ip',
-      target: '',
-      comment: 'Manual SOAR trigger',
-      event_id: ''
-    });
+    setFormData({ action: 'block_ip', target: '', comment: 'Manual SOAR trigger', event_id: '' });
     setShowModal(true);
   };
 
-  const handleOpenEdit = (auto: any) => {
-    setIsEditing(true);
+  const openEdit = (auto: any) => {
     setEditingId(auto.id);
     setFormData({
       action: auto.action,
-      target: auto.target,
+      target: targetText(auto.target),
       comment: auto.comment || '',
-      event_id: auto.event_id?.toString() || ''
+      event_id: auto.event_id?.toString() || '',
     });
     setShowModal(true);
   };
@@ -82,323 +139,261 @@ const Automations: React.FC = () => {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedAgent) return;
+    const payload = {
+      ...formData,
+      event_id: formData.event_id ? parseInt(formData.event_id, 10) : null,
+    };
     try {
-      const payload = {
-        ...formData,
-        event_id: formData.event_id ? parseInt(formData.event_id) : null
-      };
-
-      if (isEditing && editingId) {
+      if (editingId) {
         await agentService.updateAutomation(selectedAgent, editingId, payload);
       } else {
         await agentService.createAutomation(selectedAgent, payload);
       }
       setShowModal(false);
       fetchData();
-    } catch (err: any) {
-      alert("Error saving automation: " + (err.response?.data?.error || err.message));
+    } catch (err) {
+      alert(say(err, 'Failed to save automation'));
     }
   };
 
   const handleDelete = async (id: number) => {
+    setConfirmDelete(null);
     if (!selectedAgent) return;
-    if (window.confirm("Delete this automation rule?")) {
-      try {
-        await agentService.deleteAutomation(selectedAgent, id);
-        fetchData();
-      } catch (err) {
-        alert("Failed to delete automation");
-      }
+    try {
+      await agentService.deleteAutomation(selectedAgent, id);
+      fetchData();
+    } catch (err) {
+      alert(say(err, 'Failed to delete automation'));
     }
   };
 
-  const filteredAutomations = automations.filter(a => {
-    if (filter === 'active') return a.status === 'active' || a.status === 'pending';
-    if (filter === 'completed') return a.status === 'completed' || a.status === 'success';
-    if (filter === 'failed') return a.status === 'failed';
+  const visible = automations.filter((a) => {
+    const status = (a.status || '').toLowerCase();
+    if (filter === 'active') return status === 'active' || status === 'pending';
+    if (filter === 'completed') return status === 'completed' || status === 'success';
+    if (filter === 'failed') return status === 'failed';
     return true;
   });
 
+  const body = () => {
+    if (loading) return <LoadingState label="Reading response history…" />;
+    if (agents.length === 0) {
+      return (
+        <EmptyState
+          title="No agents"
+          detail="Response actions run on a host. Enrol one first."
+        />
+      );
+    }
+    if (visible.length === 0) {
+      return (
+        <EmptyState
+          title={filter === 'all' ? 'Nothing has been run on this host' : `No ${filter} actions`}
+          detail={filter === 'all'
+            ? 'Response actions appear here whether a playbook or a person started them.'
+            : 'Try the All filter.'}
+          icon={<Zap size={18} style={{ color: 'var(--text-muted)' }} />}
+        />
+      );
+    }
+    return (
+      <DataTable columns={['When', 'Action', 'Target', 'Status', 'Reason', '']}>
+        {visible.map((auto) => {
+          const status = (auto.status || 'pending').toLowerCase();
+          const failed = status === 'failed';
+          const reason = (auto.last_error || auto.error || auto.comment || '').toString().trim();
+          return (
+            <Row key={auto.id}>
+              <Cell>
+                <div>#{auto.id}</div>
+                <div
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 'var(--space-1)',
+                    marginTop: 'var(--space-1)', color: 'var(--text-muted)',
+                    fontSize: 'var(--text-xs)',
+                  }}
+                >
+                  <Clock size={11} /> {auto.timestamp}
+                </div>
+              </Cell>
+              <Cell>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+                  <Terminal size={14} style={{ color: 'var(--text-muted)' }} />
+                  {auto.action}
+                </span>
+              </Cell>
+              <Cell mono>
+                <span style={{ wordBreak: 'break-word', overflowWrap: 'anywhere' }}>
+                  {targetText(auto.target)}
+                </span>
+              </Cell>
+              <Cell>
+                <Badge tone={STATUS_TONE[status] ?? 'neutral'}>{status}</Badge>
+              </Cell>
+              <Cell>
+                <span
+                  style={{
+                    color: failed ? 'var(--accent-color)' : 'var(--text-secondary)',
+                    wordBreak: 'break-word', overflowWrap: 'anywhere',
+                  }}
+                >
+                  {reason || '—'}
+                </span>
+              </Cell>
+              <Cell align="right">
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-2)' }}>
+                  <button className="icon-btn" title="Edit" onClick={() => openEdit(auto)}>
+                    <Edit2 size={15} />
+                  </button>
+                  <button
+                    className="icon-btn"
+                    title="Delete"
+                    onClick={() => setConfirmDelete(auto.id)}
+                    style={{ color: 'var(--accent-color)' }}
+                  >
+                    <Trash2 size={15} />
+                  </button>
+                </div>
+              </Cell>
+            </Row>
+          );
+        })}
+      </DataTable>
+    );
+  };
+
   return (
     <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '32px' }}>
-        <div>
-          <h2 style={{ fontSize: '1.875rem', marginBottom: '8px' }}>Global SOAR Automations</h2>
-          <p style={{ color: 'var(--text-secondary)' }}>Manage automated response rules and view execution history.</p>
-        </div>
-        <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
-          <select 
-            value={selectedAgent}
-            onChange={(e) => setSelectedAgent(e.target.value)}
-            style={{
-              backgroundColor: 'var(--card-bg)',
-              border: '1px solid var(--border-color)',
-              borderRadius: '8px',
-              padding: '10px 16px',
-              color: 'var(--text-primary)',
-              fontSize: '0.875rem',
-              outline: 'none'
-            }}
-          >
-            {agents.map(a => <option key={a} value={a}>{a}</option>)}
-          </select>
-          <button 
-            onClick={handleOpenCreate}
-            disabled={!selectedAgent}
-            style={{ 
-              backgroundColor: !selectedAgent ? 'var(--border-color)' : 'var(--accent-secondary)', 
-              color: 'white', 
-              padding: '10px 20px', 
-              borderRadius: '8px', 
-              fontWeight: 600,
-              display: 'flex',
-              alignItems: 'center',
-              gap: '8px',
-              cursor: !selectedAgent ? 'not-allowed' : 'pointer'
-            }}
-          >
-            <Plus size={18} /> New Automation
-          </button>
-        </div>
-      </div>
+      <PageHeader
+        title="Response Actions"
+        subtitle="What has been run on a host to contain something, and whether it worked."
+        icon={<Zap size={22} />}
+        actions={
+          <>
+            <select
+              value={selectedAgent}
+              onChange={(e) => setSelectedAgent(e.target.value)}
+              disabled={agents.length === 0}
+            >
+              {agents.length === 0 && <option>No agents</option>}
+              {agents.map((a) => <option key={a} value={a}>{a}</option>)}
+            </select>
+            <button className="btn-primary" onClick={openCreate} disabled={!selectedAgent}>
+              <Plus size={15} /> New action
+            </button>
+          </>
+        }
+      />
 
-      <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
-        <div style={{ padding: '20px', borderBottom: '1px solid var(--border-color)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <div style={{ display: 'flex', gap: '16px' }}>
-            <FilterButton label="All" active={filter === 'all'} onClick={() => setFilter('all')} />
-            <FilterButton label="Active" active={filter === 'active'} onClick={() => setFilter('active')} />
-            <FilterButton label="Completed" active={filter === 'completed'} onClick={() => setFilter('completed')} />
-            <FilterButton label="Failed" active={filter === 'failed'} onClick={() => setFilter('failed')} />
-          </div>
-          <button onClick={fetchData} style={{ color: 'var(--text-secondary)' }}><RefreshCw size={18} className={loading ? 'animate-spin' : ''} /></button>
-        </div>
-
-        <div style={{ overflowX: 'auto' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.875rem' }}>
-            <thead>
-              <tr style={{ backgroundColor: 'rgba(255,255,255,0.02)', borderBottom: '1px solid var(--border-color)' }}>
-                <th style={{ padding: '12px 20px', fontWeight: 600, color: 'var(--text-secondary)' }}>ID / Time</th>
-                <th style={{ padding: '12px 20px', fontWeight: 600, color: 'var(--text-secondary)' }}>Action</th>
-                <th style={{ padding: '12px 20px', fontWeight: 600, color: 'var(--text-secondary)' }}>Target</th>
-                <th style={{ padding: '12px 20px', fontWeight: 600, color: 'var(--text-secondary)' }}>Status</th>
-                <th style={{ padding: '12px 20px', fontWeight: 600, color: 'var(--text-secondary)' }}>Reason / Detail</th>
-                <th style={{ padding: '12px 20px', fontWeight: 600, color: 'var(--text-secondary)', textAlign: 'right' }}>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {filteredAutomations.map((auto) => (
-                <tr key={auto.id} style={{ borderBottom: '1px solid var(--border-color)', transition: 'background-color 0.2s ease' }} onMouseOver={(e) => e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.01)'} onMouseOut={(e) => e.currentTarget.style.backgroundColor = 'transparent'}>
-                  <td style={{ padding: '16px 20px' }}>
-                    <div style={{ fontWeight: 600 }}>#{auto.id}</div>
-                    <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: '4px', marginTop: '4px' }}>
-                      <Clock size={12} /> {auto.timestamp}
-                    </div>
-                  </td>
-                  <td style={{ padding: '16px 20px' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontWeight: 500 }}>
-                      <Terminal size={16} color="var(--accent-secondary)" />
-                      {auto.action?.toUpperCase()}
-                    </div>
-                  </td>
-                  <td style={{ padding: '16px 20px', color: 'var(--text-secondary)', verticalAlign: 'top', minWidth: '180px', maxWidth: '260px' }}>
-                    <TargetCell auto={auto} />
-                  </td>
-                  <td style={{ padding: '16px 20px', verticalAlign: 'top', whiteSpace: 'nowrap' }}>
-                    <StatusBadge status={auto.status} />
-                  </td>
-                  <td style={{ padding: '16px 20px', verticalAlign: 'top', minWidth: '260px' }}>
-                    <ReasonCell auto={auto} />
-                  </td>
-                  <td style={{ padding: '16px 20px', textAlign: 'right' }}>
-                    <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
-                      <button onClick={() => handleOpenEdit(auto)} style={{ color: 'var(--text-secondary)' }}><Edit2 size={16} /></button>
-                      <button onClick={() => handleDelete(auto.id)} style={{ color: 'var(--accent-color)' }}><Trash2 size={16} /></button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
-              {filteredAutomations.length === 0 && !loading && (
-                <tr>
-                  <td colSpan={6} style={{ padding: '60px', textAlign: 'center', color: 'var(--text-secondary)' }}>
-                    <Zap size={48} style={{ opacity: 0.1, marginBottom: '16px', margin: '0 auto' }} />
-                    <p>No automations found matching the criteria.</p>
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* Automation Modal */}
-      {showModal && (
-        <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: '20px' }}>
-          <div style={{ backgroundColor: 'var(--card-bg)', backdropFilter: 'blur(20px)', width: '100%', maxWidth: '500px', borderRadius: 'var(--radius-lg)', border: '1px solid var(--border-neon)', padding: '32px', boxShadow: '0 20px 50px rgba(0,0,0,0.5)' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' }}>
-              <h3 style={{ fontSize: '1.25rem' }}>{isEditing ? 'Edit Automation' : 'New SOAR Automation'}</h3>
-              <button onClick={() => setShowModal(false)} style={{ color: 'var(--text-secondary)' }}><X size={24} /></button>
-            </div>
-            
-            <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                <label style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>Action Type</label>
-                <select 
-                  value={formData.action} 
-                  onChange={e => setFormData({...formData, action: e.target.value})}
-                  style={{ backgroundColor: 'var(--bg-color)', border: '1px solid var(--border-color)', padding: '12px', borderRadius: '8px', color: 'white' }}
-                >
-                  <option value="block_ip">Block IP Address</option>
-                  <option value="unblock_ip">Unblock IP Address</option>
-                  <option value="disable_user">Disable User Account</option>
-                  <option value="enable_user">Enable User Account</option>
-                  <option value="quarantine_file">Quarantine File</option>
-                  <option value="delete_file">Delete File</option>
-                  <option value="kill_process">Kill Process</option>
-                  <option value="suspend_process">Suspend Process (Dondur)</option>
-                  <option value="delete_registry_key">Delete Registry Key</option>
-                  <option value="protect_shadows">Protect Volume Shadows</option>
-                  <option value="restart_service">Restart Service</option>
-                  <option value="isolate_host">Isolate Host</option>
-                  <option value="lock_machine">Lock Machine</option>
-                  <option value="tail_log">Tail Log File</option>
-                  <option value="run_cmd">Run Custom Command</option>
-                </select>
-              </div>
-
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                <label style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>Target (IP, Path, PID, etc.)</label>
-                <input 
-                  type="text" 
-                  value={formData.target} 
-                  onChange={e => setFormData({...formData, target: e.target.value})} 
-                  required 
-                  placeholder="e.g. 192.168.1.100"
-                  style={{ backgroundColor: 'var(--bg-color)', border: '1px solid var(--border-color)', padding: '12px', borderRadius: '8px', color: 'white' }} 
-                />
-              </div>
-
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                <label style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>Comment / Reason</label>
-                <input 
-                  type="text" 
-                  value={formData.comment} 
-                  onChange={e => setFormData({...formData, comment: e.target.value})} 
-                  style={{ backgroundColor: 'var(--bg-color)', border: '1px solid var(--border-color)', padding: '12px', borderRadius: '8px', color: 'white' }} 
-                />
-              </div>
-
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                <label style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>SIEM Event ID (Optional)</label>
-                <input 
-                  type="number" 
-                  value={formData.event_id} 
-                  onChange={e => setFormData({...formData, event_id: e.target.value})} 
-                  placeholder="Link to a specific alert"
-                  style={{ backgroundColor: 'var(--bg-color)', border: '1px solid var(--border-color)', padding: '12px', borderRadius: '8px', color: 'white' }} 
-                />
-              </div>
-
-              <div style={{ display: 'flex', gap: '12px', marginTop: '12px' }}>
-                <button type="button" onClick={() => setShowModal(false)} style={{ flex: 1, padding: '14px', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'white', fontWeight: 600 }}>Cancel</button>
-                <button type="submit" style={{ flex: 1, padding: '14px', borderRadius: '8px', backgroundColor: 'var(--accent-secondary)', color: 'white', fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}>
-                  <Save size={18} /> {isEditing ? 'Update Rule' : 'Execute Now'}
-                </button>
-              </div>
-            </form>
-          </div>
+      {error && (
+        <div style={{ marginBottom: 'var(--space-5)' }}>
+          <ErrorState title="Request failed" detail={error} />
         </div>
       )}
-    </div>
-  );
-};
 
-const FilterButton: React.FC<{ label: string, active: boolean, onClick: () => void }> = ({ label, active, onClick }) => (
-  <button 
-    onClick={onClick}
-    style={{
-      padding: '6px 12px',
-      borderRadius: '6px',
-      fontSize: '0.875rem',
-      fontWeight: 500,
-      backgroundColor: active ? 'var(--accent-secondary)' : 'transparent',
-      color: active ? 'white' : 'var(--text-secondary)',
-      transition: 'all 0.2s ease'
-    }}
-  >
-    {label}
-  </button>
-);
-
-const ReasonCell: React.FC<{ auto: any }> = ({ auto }) => {
-  const status = (auto.status || '').toLowerCase();
-  const isFailure = status === 'failed';
-  const text = (auto.last_error || auto.error || auto.comment || '').toString().trim();
-  if (!text) {
-    return <span style={{ opacity: 0.5 }}>—</span>;
-  }
-  return (
-    <div
-      style={{
-        color: isFailure ? 'var(--accent-color)' : 'var(--text-secondary)',
-        whiteSpace: 'normal',
-        wordBreak: 'break-word',
-        overflowWrap: 'anywhere',
-        lineHeight: 1.4,
-        fontSize: '0.8125rem',
-      }}
-    >
-      {text}
-    </div>
-  );
-};
-
-const TargetCell: React.FC<{ auto: any }> = ({ auto }) => {
-  let display = auto.target;
-  if (typeof display === 'string') {
-    const trimmed = display.trim();
-    if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
-      try {
-        const arr = JSON.parse(trimmed);
-        if (Array.isArray(arr)) {
-          display = arr.join(' ');
+      <Card
+        actions={
+          <div style={{ display: 'flex', gap: 'var(--space-2)', alignItems: 'center' }}>
+            {FILTERS.map(([key, label]) => (
+              <button
+                key={key}
+                className={filter === key ? 'btn-primary' : 'btn-secondary'}
+                onClick={() => setFilter(key)}
+              >
+                {label}
+              </button>
+            ))}
+            <button className="icon-btn" title="Refresh" onClick={fetchData}>
+              <RefreshCw size={15} className={loading ? 'animate-spin' : undefined} />
+            </button>
+          </div>
         }
-      } catch {
-        // leave as-is
-      }
-    }
-  } else if (Array.isArray(display)) {
-    display = display.join(' ');
-  }
-  return (
-    <span style={{ fontFamily: 'monospace', wordBreak: 'break-word', overflowWrap: 'anywhere' }}>
-      {display}
-    </span>
-  );
-};
+      >
+        {body()}
+      </Card>
 
-const StatusBadge: React.FC<{ status: string }> = ({ status }) => {
-  const normalized = (status || '').toLowerCase();
-  let color = 'var(--text-secondary)';
-  let bg = 'rgba(255,255,255,0.05)';
-  let icon = <Clock size={14} />;
+      {showModal && (
+        <Modal
+          title={editingId ? 'Edit action' : 'New response action'}
+          subtitle={editingId
+            ? undefined
+            : `This runs on ${selectedAgent} as soon as you submit it.`}
+          onClose={() => setShowModal(false)}
+          width={500}
+        >
+          <form
+            onSubmit={handleSubmit}
+            style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}
+          >
+            <Field label="Action">
+              <select
+                value={formData.action}
+                onChange={(e) => setFormData({ ...formData, action: e.target.value })}
+              >
+                {ACTIONS.map(([value, label]) => (
+                  <option key={value} value={value}>{label}</option>
+                ))}
+              </select>
+            </Field>
+            <Field label="Target" hint="An address, a path, a PID or a service name, depending on the action.">
+              <input
+                value={formData.target}
+                onChange={(e) => setFormData({ ...formData, target: e.target.value })}
+                required
+                placeholder="192.168.1.100"
+                autoFocus
+              />
+            </Field>
+            <Field label="Reason" hint="Why this was run. It is the only record once the action has finished.">
+              <input
+                value={formData.comment}
+                onChange={(e) => setFormData({ ...formData, comment: e.target.value })}
+              />
+            </Field>
+            <Field label="Linked event" hint="Optional. The SIEM event this responds to.">
+              <input
+                type="number"
+                value={formData.event_id}
+                onChange={(e) => setFormData({ ...formData, event_id: e.target.value })}
+                placeholder="Event id"
+              />
+            </Field>
+            <div style={{ display: 'flex', gap: 'var(--space-2)' }}>
+              <DialogButton onClick={() => setShowModal(false)}>Cancel</DialogButton>
+              <DialogButton type="submit" variant="solid">
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+                  <Save size={15} /> {editingId ? 'Update' : 'Run now'}
+                </span>
+              </DialogButton>
+            </div>
+          </form>
+        </Modal>
+      )}
 
-  if (normalized === 'completed' || normalized === 'success') {
-    color = 'var(--accent-success)';
-    bg = 'rgba(16, 185, 129, 0.1)';
-    icon = <CheckCircle2 size={14} />;
-  } else if (normalized === 'failed') {
-    color = 'var(--accent-color)';
-    bg = 'rgba(239, 68, 68, 0.1)';
-    icon = <AlertCircle size={14} />;
-  } else if (normalized === 'active' || normalized === 'pending') {
-    color = 'var(--accent-warning)';
-    bg = 'rgba(245, 158, 11, 0.1)';
-    icon = <Activity size={14} className="animate-spin" />;
-  }
-
-  return (
-    <div style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', padding: '4px 10px', borderRadius: '20px', backgroundColor: bg, color: color, fontSize: '0.75rem', fontWeight: 600, textTransform: 'uppercase' }}>
-      {icon} {status || 'PENDING'}
+      {confirmDelete !== null && (
+        <Modal
+          title="Delete this record?"
+          subtitle="It removes the history, not the effect. An action that already ran stays run."
+          onClose={() => setConfirmDelete(null)}
+          footer={
+            <>
+              <DialogButton onClick={() => setConfirmDelete(null)}>Cancel</DialogButton>
+              <DialogButton
+                variant="solid"
+                tone="critical"
+                onClick={() => handleDelete(confirmDelete)}
+              >
+                Delete
+              </DialogButton>
+            </>
+          }
+        >
+          <p style={{ margin: 0, fontSize: 'var(--text-sm)', color: 'var(--text-secondary)' }}>
+            If you meant to reverse it, run the opposite action instead — unblock, enable,
+            or restart.
+          </p>
+        </Modal>
+      )}
     </div>
   );
 };

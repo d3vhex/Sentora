@@ -275,6 +275,35 @@ button:active {
   border-color: var(--border-neon);
 }
 
+/* An icon on its own, as a row action.
+ *
+ * Written inline on every table that has one, and each got a different pad and
+ * a different colour. The disabled state is the part that kept being left out:
+ * the delete button on the `admin` account is disabled and looked exactly like
+ * the enabled ones, so it read as broken rather than as protected. */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  line-height: 0;
+}
+
+.icon-btn:hover:not(:disabled) {
+  border-color: var(--border-color);
+  color: var(--text-primary);
+}
+
+.icon-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
 /* A surface, not an object.
  *
  * This used to lift two pixels and glow on hover, over a 12px backdrop blur.
