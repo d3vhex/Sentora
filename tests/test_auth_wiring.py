@@ -179,6 +179,20 @@ SESSION_ONLY_HANDLERS = {
     "second_factor_enrol",
     "second_factor_confirm",
     "second_factor_disable",
+    # Security keys, same argument. `webauthn_remove` takes a row id and
+    # scopes the DELETE to `user_id = %s` as well, so an id belonging to
+    # somebody else matches nothing rather than removing their factor.
+    "webauthn_capability",
+    "webauthn_register_begin",
+    "webauthn_register_finish",
+    "webauthn_remove",
+    # These two are the second half of a login, not an authenticated action.
+    # There is no session yet - the caller holds a pending token minted
+    # moments ago by a correct password, and that token is the authorisation.
+    # Requiring a session here would mean requiring a session to finish
+    # getting one.
+    "webauthn_login_begin",
+    "webauthn_login_finish",
 }
 
 # Named individually so a bulk edit to the list above cannot quietly reopen

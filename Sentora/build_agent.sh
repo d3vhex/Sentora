@@ -265,7 +265,12 @@ fi
 
 ok "Built main ($SIZE)"
 printf "    sha256: %s\n" "$SHA"
-printf "    Ship it via /api/agent/download/linux (restart the server container to pick it up).\n"
+# A restart does nothing here: Sentora/ is copied into the image by the
+# Dockerfile rather than bind-mounted, so the container keeps serving the
+# binary it was built with. See the note in build_agent.ps1 - a whole
+# rebuild-and-reinstall cycle was spent discovering it.
+printf "    Serve it: docker compose up -d --build app   (a plain restart keeps the old binary)\n"
+printf "    Then reinstall the agent; /api/agent/download/linux reads it from the image.\n"
 
 # ─────────────────────── post-build cleanup ───────────────────────
 # Drop the intermediate PyInstaller artifacts so the working tree

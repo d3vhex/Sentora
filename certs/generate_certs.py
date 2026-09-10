@@ -1,5 +1,6 @@
 
 import argparse
+import ipaddress
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -7,6 +8,73 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+
+
+def subject_alt_names(cn: str, extra=None) -> x509.SubjectAlternativeName:
+    """Every name this certificate is allowed to answer to.
+
+    The list used to be `[DNSName(cn), DNSName("localhost")]` and nothing else,
+    which has two consequences.
+
+    With the default CN the certificate came out carrying `DNS:localhost`
+    twice - harmless, and a sign that nothing was deduplicating.
+
+    The real one is that there was no way to add a name at all. A console
+    reached at `https://192.168.1.26:8000` fails hostname verification in every
+    client, because an IP address in the CN is not an IP SAN and clients have
+    not honoured the CN for this since 2000. And WebAuthn cannot be added at
+    all without a DNS name: its RP ID must be a domain, and browsers reject an
+    IP address outright, so `https://<address>` is not a place a security key
+    can ever be registered.
+
+    Entries that parse as an IP address become `IPAddress` SANs and the rest
+    become `DNSName`; putting an address in the DNS list produces a
+    certificate that silently matches nothing.
+    """
+    dns: list[str] = []
+    ips: list = []
+
+    def add(value: str) -> None:
+        value = (value or "").strip()
+        if not value:
+            return
+        try:
+            parsed = ipaddress.ip_address(value)
+        except ValueError:
+            if value not in dns:
+                dns.append(value)
+        else:
+            if parsed not in ips:
+                ips.append(parsed)
+
+    add(cn)
+    for name in (extra or []):
+        add(name)
+    # Always reachable from the machine itself, which is where the first
+    # login and every health check happen.
+    add("localhost")
+    add("127.0.0.1")
+    add("::1")
+
+    return x509.SubjectAlternativeName(
+        [x509.DNSName(d) for d in dns] + [x509.IPAddress(i) for i in ips]
+    )
+
+
+def certificate_names(cert) -> set[str]:
+    """The names a certificate actually covers, as strings.
+
+    Used to tell an operator that the certificate on disk predates the names
+    they have configured — see `core.tls`. Without it, changing `TLS_CN` does
+    nothing at all and nothing says why.
+    """
+    try:
+        san = cert.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName).value
+    except x509.ExtensionNotFound:
+        return set()
+    return (set(san.get_values_for_type(x509.DNSName))
+            | {str(i) for i in san.get_values_for_type(x509.IPAddress)})
 
 
 def write_pem(path: str, data: bytes):
@@ -55,7 +123,7 @@ def generate_root_ca(common_name: str, days: int):
     return key, cert
 
 
-def generate_server_cert(cn: str, days: int, ca_key, ca_cert):
+def generate_server_cert(cn: str, days: int, ca_key, ca_cert, extra_names=None):
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
     subject = x509.Name([
@@ -69,10 +137,7 @@ def generate_server_cert(cn: str, days: int, ca_key, ca_cert):
     # utcnow() produced — just without the call Python deprecated in 3.12.
     now = datetime.now(timezone.utc).replace(tzinfo=None)
 
-    san = x509.SubjectAlternativeName([
-        x509.DNSName(cn),
-        x509.DNSName("localhost"),
-    ])
+    san = subject_alt_names(cn, extra_names)
 
     cert = (
         x509.CertificateBuilder()
@@ -105,7 +170,7 @@ def generate_server_cert(cn: str, days: int, ca_key, ca_cert):
 
 
 def ensure_certs(outdir: str = None, cn: str = "localhost", days: int = 365,
-                 force: bool = False, log=print) -> dict:
+                 force: bool = False, log=print, extra_names=None) -> dict:
     """Create the CA and server certificate if they are not already there.
 
     Returns the paths. Idempotent unless `force`.
@@ -148,7 +213,7 @@ def ensure_certs(outdir: str = None, cn: str = "localhost", days: int = 365,
     ))
     write_pem(paths["root_crt"], ca_cert.public_bytes(serialization.Encoding.PEM))
 
-    srv_key, srv_cert = generate_server_cert(cn, days, ca_key, ca_cert)
+    srv_key, srv_cert = generate_server_cert(cn, days, ca_key, ca_cert, extra_names)
     write_pem(paths["key"], srv_key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.TraditionalOpenSSL,
@@ -162,7 +227,8 @@ def ensure_certs(outdir: str = None, cn: str = "localhost", days: int = 365,
     _restrict(paths["root_key"])
     _restrict(paths["key"])
 
-    log(f"[+] Generated {paths['crt']} (CN={cn}, {days} days)")
+    covered = ", ".join(sorted(certificate_names(srv_cert)))
+    log(f"[+] Generated {paths['crt']} ({days} days), valid for: {covered}")
     return paths
 
 
@@ -181,6 +247,11 @@ def _restrict(path: str) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Generate a Root CA and a server certificate (beginner style)")
     parser.add_argument("--cn", default="localhost", help="Server certificate Common Name (default: localhost)")
+    parser.add_argument("--san", default="",
+                        help="Extra names the certificate answers to, comma "
+                             "separated. Hostnames and IP addresses both; a "
+                             "browser needs a hostname here before a security "
+                             "key can be registered against this server.")
     parser.add_argument("--days", type=int, default=365, help="Validity in days (default: 365)")
     parser.add_argument("--out", default=os.path.dirname(__file__) or ".", help="Output directory (default: certs folder)")
     parser.add_argument("--force", action="store_true", help="Overwrite existing files if present")
@@ -214,7 +285,8 @@ def main():
     write_pem(root_crt_path, ca_cert.public_bytes(serialization.Encoding.PEM))
 
     print("[i] Generating server certificate …")
-    srv_key, srv_cert = generate_server_cert(args.cn, args.days, ca_key, ca_cert)
+    extra = [n for n in args.san.split(',') if n.strip()]
+    srv_key, srv_cert = generate_server_cert(args.cn, args.days, ca_key, ca_cert, extra)
     write_pem(
         srv_key_path,
         srv_key.private_bytes(
@@ -231,6 +303,7 @@ def main():
     )
 
     print("[+] Done.")
+    print(f"    Valid for: {', '.join(sorted(certificate_names(srv_cert)))}")
     print(f"    Root CA:   {root_crt_path} (key: {root_key_path})")
     print(f"    Server:    {srv_crt_path} (key: {srv_key_path})")
     print(f"    Fullchain: {fullchain_path}")

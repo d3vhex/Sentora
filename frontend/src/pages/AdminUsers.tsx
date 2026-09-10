@@ -1,43 +1,66 @@
-import React, { useState, useEffect } from 'react';
+/**
+ * Who can sign in, and what each of them is allowed to do.
+ *
+ * The page had no loading, empty or failed state. `fetchData` caught its own
+ * error and wrote it to the browser console, so a request that failed rendered
+ * an empty user list - and on this page in particular that is the worst thing
+ * it could render. "Nobody has access" and "we could not find out who has
+ * access" look identical, and an operator who reads the first when the second
+ * is true concludes the platform is locked down.
+ *
+ * The three dialogs here were three copies of the same forty lines. They are
+ * `Modal` now, which also means Escape closes them.
+ */
+import React, { useCallback, useEffect, useState } from 'react';
 import { UserPlus, Shield, Trash2, Key } from 'lucide-react';
 import { adminService } from '../services/api';
+import {
+  PageHeader, Card, Badge, DataTable, Row, Cell,
+  EmptyState, ErrorState, LoadingState, Modal, Field, DialogButton,
+} from '../components/ui';
+
+type User = { id: number; username: string; role: string; created_at?: string };
+type Permission = { id: number; name: string; description?: string };
+type Role = { id: number; role_name: string; permissions: Permission[] };
 
 const AdminUsers: React.FC = () => {
-  const [users, setUsers] = useState<any[]>([]);
-  const [roles, setRoles] = useState<any[]>([]);
-  const [permissions, setPermissions] = useState<any[]>([]);
+  const [users, setUsers] = useState<User[]>([]);
+  const [roles, setRoles] = useState<Role[]>([]);
+  const [permissions, setPermissions] = useState<Permission[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
   const [showUserModal, setShowUserModal] = useState(false);
   const [showRoleModal, setShowRoleModal] = useState(false);
-  const [showResetModal, setShowResetModal] = useState(false);
-  const [editingRole, setEditingRole] = useState<any>(null);
-  const [resetUser, setResetUser] = useState<any>(null);
-  
-  // Form states
+  const [resetUser, setResetUser] = useState<User | null>(null);
+  const [editingRole, setEditingRole] = useState<Role | null>(null);
+
   const [newUser, setNewUser] = useState({ username: '', password: '', role: '' });
   const [newRole, setNewRole] = useState({ role_name: '' });
   const [newPassword, setNewPassword] = useState('');
 
-  useEffect(() => {
-    fetchData();
-  }, []);
-
-  const fetchData = async () => {
+  const fetchData = useCallback(async () => {
     try {
       const [userData, roleData, permData] = await Promise.all([
         adminService.getUsers(),
         adminService.getRoles(),
-        adminService.getPermissions()
+        adminService.getPermissions(),
       ]);
       setUsers(userData);
       setRoles(roleData);
       setPermissions(permData);
-      if (roleData.length > 0 && !newUser.role) {
-        setNewUser(prev => ({ ...prev, role: roleData[0].role_name }));
-      }
-    } catch (err) {
-      console.error("Failed to fetch data", err);
+      setError(null);
+      setNewUser((prev) => (prev.role ? prev : { ...prev, role: roleData[0]?.role_name || '' }));
+    } catch (err: any) {
+      // Said on the page, not to the browser console. An empty table on the
+      // access-control page reads as "no accounts exist".
+      setError(err?.response?.data?.message || err?.message || 'Request failed');
+    } finally {
+      setLoading(false);
     }
-  };
+  }, []);
+
+  useEffect(() => { fetchData(); }, [fetchData]);
 
   const handleCreateUser = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -47,18 +70,17 @@ const AdminUsers: React.FC = () => {
       setNewUser({ username: '', password: '', role: roles[0]?.role_name || '' });
       fetchData();
     } catch (err: any) {
-      alert(err.response?.data?.message || "Failed to create user");
+      alert(err.response?.data?.message || 'Failed to create user');
     }
   };
 
   const handleDeleteUser = async (id: number) => {
-    if (window.confirm("Delete this user?")) {
-      try {
-        await adminService.deleteUser(id);
-        fetchData();
-      } catch (err) {
-        alert("Failed to delete user");
-      }
+    if (!window.confirm('Delete this user?')) return;
+    try {
+      await adminService.deleteUser(id);
+      fetchData();
+    } catch {
+      alert('Failed to delete user');
     }
   };
 
@@ -67,12 +89,11 @@ const AdminUsers: React.FC = () => {
     if (!resetUser) return;
     try {
       await adminService.resetUserPassword(resetUser.id, newPassword);
-      setShowResetModal(false);
-      setNewPassword('');
       setResetUser(null);
-      alert("Password reset successfully!");
+      setNewPassword('');
+      alert('Password reset successfully.');
     } catch (err: any) {
-      alert(err.response?.data?.message || "Failed to reset password");
+      alert(err.response?.data?.message || 'Failed to reset password');
     }
   };
 
@@ -84,210 +105,299 @@ const AdminUsers: React.FC = () => {
       setNewRole({ role_name: '' });
       fetchData();
     } catch (err: any) {
-      alert(err.response?.data?.message || "Failed to create role");
+      alert(err.response?.data?.message || 'Failed to create role');
+    }
+  };
+
+  const togglePermission = async (role: Role, permName: string) => {
+    const current = Array.isArray(role.permissions) ? role.permissions.map((p) => p.name) : [];
+    const updated = current.includes(permName)
+      ? current.filter((p) => p !== permName)
+      : [...current, permName];
+    try {
+      await adminService.updateRolePermissions(role.id, role.role_name, updated);
+      fetchData();
+    } catch {
+      alert('Failed to update permissions');
     }
   };
 
   const handleDeleteRole = async (id: number) => {
-    if (window.confirm("Delete this role?")) {
-      try {
-        await adminService.deleteRole(id);
-        fetchData();
-      } catch (err: any) {
-        alert(err.response?.data?.message || "Failed to delete role");
-      }
-    }
-  };
-
-  const togglePermission = async (role: any, permName: string) => {
-    const currentPerms = Array.isArray(role.permissions) ? role.permissions.map((p: any) => p.name) : [];
-    const updatedPerms = currentPerms.includes(permName)
-      ? currentPerms.filter((p: string) => p !== permName)
-      : [...currentPerms, permName];
-    
-
+    if (!window.confirm('Delete this role?')) return;
     try {
-      await adminService.updateRolePermissions(role.id, role.role_name, updatedPerms);
+      await adminService.deleteRole(id);
       fetchData();
-    } catch (err) {
-      alert("Failed to update permissions");
+    } catch (err: any) {
+      alert(err.response?.data?.message || 'Failed to delete role');
     }
   };
 
   return (
-    <div style={{ position: 'relative' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '32px' }}>
-        <div>
-          <h2 style={{ fontSize: '1.875rem', marginBottom: '8px' }}>Identity & Access</h2>
-          <p style={{ color: 'var(--text-secondary)' }}>Manage platform users, assign roles, and configure granular permissions.</p>
-        </div>
-        <div style={{ display: 'flex', gap: '12px' }}>
-          <button 
-            onClick={() => setShowRoleModal(true)}
-            style={{ padding: '10px 20px', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'var(--text-primary)', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}
-          >
-            <Shield size={18} /> New Role
-          </button>
-          <button 
-            onClick={() => setShowUserModal(true)}
-            style={{ backgroundColor: 'var(--accent-secondary)', color: 'white', padding: '10px 20px', borderRadius: '8px', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}
-          >
-            <UserPlus size={18} /> Add User
-          </button>
-        </div>
-      </div>
+    <div>
+      <PageHeader
+        title="Identity & Access"
+        subtitle="Who can sign in, which role they hold, and what that role is permitted to do."
+        icon={<Shield size={22} />}
+        actions={
+          <>
+            <button className="btn-secondary" onClick={() => setShowRoleModal(true)}>
+              <Shield size={16} /> New role
+            </button>
+            <button className="btn-primary" onClick={() => setShowUserModal(true)}>
+              <UserPlus size={16} /> Add user
+            </button>
+          </>
+        }
+      />
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1.5fr 1fr', gap: '24px' }}>
-        {/* Users Table */}
-        <div style={{ backgroundColor: 'var(--card-bg)', border: '1px solid var(--border-color)', borderRadius: '12px', overflow: 'hidden' }}>
-          <div style={{ padding: '20px', borderBottom: '1px solid var(--border-color)' }}>
-            <h3 style={{ fontSize: '1.125rem' }}>Active Users</h3>
-          </div>
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.875rem' }}>
-              <thead>
-                <tr style={{ backgroundColor: 'rgba(255,255,255,0.02)', borderBottom: '1px solid var(--border-color)' }}>
-                  <th style={{ padding: '12px 20px', fontWeight: 600, color: 'var(--text-secondary)' }}>User</th>
-                  <th style={{ padding: '12px 20px', fontWeight: 600, color: 'var(--text-secondary)' }}>Assigned Role</th>
-                  <th style={{ padding: '12px 20px', fontWeight: 600, color: 'var(--text-secondary)' }}>Created</th>
-                  <th style={{ padding: '12px 20px', fontWeight: 600, color: 'var(--text-secondary)', textAlign: 'right' }}>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
+      {error && (
+        <ErrorState
+          title="Could not load users and roles"
+          detail={`${error}. This is not an empty platform - the list below is unknown, not zero.`}
+        />
+      )}
+
+      {!error && (
+        <div className="responsive-grid">
+          <Card title="Accounts">
+            {loading ? (
+              <LoadingState label="Loading accounts…" />
+            ) : users.length === 0 ? (
+              <EmptyState
+                title="No accounts"
+                detail="Every platform needs at least one. Add a user to begin."
+              />
+            ) : (
+              <DataTable columns={['User', 'Role', 'Created', '']}>
                 {users.map((user) => (
-                  <tr key={user.id} style={{ borderBottom: '1px solid var(--border-color)' }}>
-                    <td style={{ padding: '16px 20px', fontWeight: 500 }}>{user.username}</td>
-                    <td style={{ padding: '16px 20px' }}>
-                      <span style={{ padding: '4px 8px', borderRadius: '6px', backgroundColor: user.role === 'admin' ? 'rgba(239, 68, 68, 0.1)' : 'rgba(59, 130, 246, 0.1)', color: user.role === 'admin' ? 'var(--accent-color)' : 'var(--accent-secondary)', fontSize: '0.75rem', fontWeight: 600, textTransform: 'uppercase' }}>
+                  <Row key={user.id}>
+                    <Cell>{user.username}</Cell>
+                    <Cell>
+                      <Badge tone={user.role === 'admin' ? 'critical' : 'info'}>
                         {user.role}
-                      </span>
-                    </td>
-                    <td style={{ padding: '16px 20px', color: 'var(--text-secondary)' }}>{user.created_at || 'N/A'}</td>
-                    <td style={{ padding: '16px 20px', textAlign: 'right' }}>
-                      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
-                        <button onClick={() => { setResetUser(user); setShowResetModal(true); }} title="Reset Password" style={{ color: 'var(--text-secondary)', padding: '6px' }}><Key size={16} /></button>
-                        <button onClick={() => handleDeleteUser(user.id)} title="Delete" style={{ color: 'var(--accent-color)', padding: '6px' }} disabled={user.username === 'admin'}><Trash2 size={16} /></button>
+                      </Badge>
+                    </Cell>
+                    <Cell mono>{user.created_at || '—'}</Cell>
+                    <Cell align="right">
+                      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-2)' }}>
+                        <button
+                          className="icon-btn"
+                          title="Reset password"
+                          onClick={() => { setResetUser(user); setNewPassword(''); }}
+                        >
+                          <Key size={15} />
+                        </button>
+                        <button
+                          className="icon-btn"
+                          title={user.username === 'admin' ? 'The admin account cannot be deleted' : 'Delete'}
+                          onClick={() => handleDeleteUser(user.id)}
+                          disabled={user.username === 'admin'}
+                          style={{ color: 'var(--accent-color)' }}
+                        >
+                          <Trash2 size={15} />
+                        </button>
                       </div>
-                    </td>
-                  </tr>
+                    </Cell>
+                  </Row>
                 ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
+              </DataTable>
+            )}
+          </Card>
 
-        {/* Roles List */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
-          <div style={{ backgroundColor: 'var(--card-bg)', border: '1px solid var(--border-color)', borderRadius: '12px', padding: '24px' }}>
-            <h3 style={{ fontSize: '1.125rem', marginBottom: '20px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <Shield size={20} color="var(--accent-success)" /> Platform Roles
-            </h3>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-              {roles.map((role) => (
-                <div key={role.id} style={{ padding: '16px', backgroundColor: 'rgba(255,255,255,0.02)', border: '1px solid var(--border-color)', borderRadius: '10px' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: editingRole?.id === role.id ? '12px' : '0' }}>
-                    <span style={{ fontWeight: 700, fontSize: '0.9rem', color: 'var(--text-primary)' }}>{role.role_name.toUpperCase()}</span>
-                    <div style={{ display: 'flex', gap: '8px' }}>
-                      <button onClick={() => setEditingRole(editingRole?.id === role.id ? null : role)} style={{ fontSize: '0.75rem', color: 'var(--accent-secondary)', fontWeight: 600 }}>
-                        {editingRole?.id === role.id ? 'Close' : 'Permissions'}
-                      </button>
-                      {role.role_name !== 'admin' && (
-                        <button onClick={() => handleDeleteRole(role.id)} style={{ color: 'var(--accent-color)' }}><Trash2 size={14} /></button>
+          <Card title="Roles">
+            {loading ? (
+              <LoadingState label="Loading roles…" />
+            ) : roles.length === 0 ? (
+              <EmptyState title="No roles defined" detail="A user needs a role to be created." />
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-3)' }}>
+                {roles.map((role) => {
+                  const open = editingRole?.id === role.id;
+                  return (
+                    <div
+                      key={role.id}
+                      style={{
+                        border: '1px solid var(--border-color)',
+                        borderRadius: 'var(--radius-md)',
+                        padding: 'var(--space-3)',
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: 'flex', alignItems: 'center',
+                          justifyContent: 'space-between', gap: 'var(--space-2)',
+                        }}
+                      >
+                        <Badge tone={role.role_name === 'admin' ? 'critical' : 'neutral'}>
+                          {role.role_name}
+                        </Badge>
+                        <div style={{ display: 'flex', gap: 'var(--space-2)' }}>
+                          <button
+                            className="btn-secondary"
+                            onClick={() => setEditingRole(open ? null : role)}
+                          >
+                            {open ? 'Close' : 'Permissions'}
+                          </button>
+                          {role.role_name !== 'admin' && (
+                            <button
+                              className="icon-btn"
+                              title="Delete role"
+                              onClick={() => handleDeleteRole(role.id)}
+                              style={{ color: 'var(--accent-color)' }}
+                            >
+                              <Trash2 size={14} />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      {open && (
+                        <div
+                          style={{
+                            display: 'flex', flexDirection: 'column',
+                            gap: 'var(--space-2)', marginTop: 'var(--space-3)',
+                            paddingTop: 'var(--space-3)',
+                            borderTop: '1px solid var(--border-color)',
+                          }}
+                        >
+                          {role.role_name === 'admin' && (
+                            <p
+                              style={{
+                                margin: 0, color: 'var(--text-muted)',
+                                fontSize: 'var(--text-xs)',
+                              }}
+                            >
+                              admin holds every permission and cannot be edited. A platform
+                              with no full-access role is a platform nobody can recover.
+                            </p>
+                          )}
+                          {permissions.map((perm) => {
+                            const assigned = role.permissions?.some((p) => p.name === perm.name);
+                            return (
+                              <label
+                                key={perm.id}
+                                style={{
+                                  display: 'flex', alignItems: 'center',
+                                  gap: 'var(--space-2)', cursor: 'pointer',
+                                  fontSize: 'var(--text-sm)',
+                                  color: assigned ? 'var(--text-primary)' : 'var(--text-secondary)',
+                                }}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={!!assigned}
+                                  onChange={() => togglePermission(role, perm.name)}
+                                  disabled={role.role_name === 'admin'}
+                                  style={{ width: 'auto', padding: 0 }}
+                                />
+                                {perm.description || perm.name}
+                              </label>
+                            );
+                          })}
+                        </div>
                       )}
                     </div>
-                  </div>
-                  
-                  {editingRole?.id === role.id && (
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '8px', marginTop: '16px', padding: '12px', backgroundColor: 'var(--bg-color)', borderRadius: '8px' }}>
-                      {permissions.map(perm => {
-                        const isAssigned = role.permissions.some((p: any) => p.name === perm.name);
-                        return (
-                          <label key={perm.id} style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer', fontSize: '0.8rem' }}>
-                            <input 
-                              type="checkbox" 
-                              checked={isAssigned} 
-                              onChange={() => togglePermission(role, perm.name)}
-                              disabled={role.role_name === 'admin'} 
-                            />
-                            <span style={{ color: isAssigned ? 'var(--text-primary)' : 'var(--text-secondary)' }}>{perm.description || perm.name}</span>
-                          </label>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          </div>
+                  );
+                })}
+              </div>
+            )}
+          </Card>
         </div>
-      </div>
+      )}
 
-      {/* User Modal */}
       {showUserModal && (
-        <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.8)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100, padding: '20px' }}>
-          <div style={{ backgroundColor: 'var(--card-bg)', width: '100%', maxWidth: '400px', borderRadius: '16px', border: '1px solid var(--border-color)', padding: '32px' }}>
-            <h3 style={{ fontSize: '1.25rem', marginBottom: '24px' }}>Create New User</h3>
-            <form onSubmit={handleCreateUser} style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                <label style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>Username</label>
-                <input type="text" value={newUser.username} onChange={e => setNewUser({...newUser, username: e.target.value})} required style={{ backgroundColor: 'var(--bg-color)', border: '1px solid var(--border-color)', padding: '12px', borderRadius: '8px', color: 'white' }} />
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                <label style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>Password</label>
-                <input type="password" value={newUser.password} onChange={e => setNewUser({...newUser, password: e.target.value})} required style={{ backgroundColor: 'var(--bg-color)', border: '1px solid var(--border-color)', padding: '12px', borderRadius: '8px', color: 'white' }} />
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                <label style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>Role</label>
-                <select value={newUser.role} onChange={e => setNewUser({...newUser, role: e.target.value})} style={{ backgroundColor: 'var(--bg-color)', border: '1px solid var(--border-color)', padding: '12px', borderRadius: '8px', color: 'white' }}>
-                  {roles.map(r => <option key={r.id} value={r.role_name}>{r.role_name}</option>)}
-                </select>
-              </div>
-              <div style={{ display: 'flex', gap: '12px', marginTop: '12px' }}>
-                <button type="button" onClick={() => setShowUserModal(false)} style={{ flex: 1, padding: '12px', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'white' }}>Cancel</button>
-                <button type="submit" style={{ flex: 1, padding: '12px', borderRadius: '8px', backgroundColor: 'var(--accent-secondary)', color: 'white', fontWeight: 600 }}>Create User</button>
-              </div>
-            </form>
-          </div>
-        </div>
+        <Modal title="Create user" onClose={() => setShowUserModal(false)}>
+          <form
+            onSubmit={handleCreateUser}
+            style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}
+          >
+            <Field label="Username">
+              <input
+                type="text"
+                value={newUser.username}
+                onChange={(e) => setNewUser({ ...newUser, username: e.target.value })}
+                required
+                autoFocus
+              />
+            </Field>
+            <Field label="Password">
+              <input
+                type="password"
+                value={newUser.password}
+                onChange={(e) => setNewUser({ ...newUser, password: e.target.value })}
+                required
+              />
+            </Field>
+            <Field label="Role" hint="What this account is permitted to do.">
+              <select
+                value={newUser.role}
+                onChange={(e) => setNewUser({ ...newUser, role: e.target.value })}
+              >
+                {roles.map((r) => (
+                  <option key={r.id} value={r.role_name}>{r.role_name}</option>
+                ))}
+              </select>
+            </Field>
+            <div style={{ display: 'flex', gap: 'var(--space-2)' }}>
+              <DialogButton onClick={() => setShowUserModal(false)}>Cancel</DialogButton>
+              <DialogButton type="submit" variant="solid">Create user</DialogButton>
+            </div>
+          </form>
+        </Modal>
       )}
 
-      {/* Reset Password Modal */}
-      {showResetModal && (
-        <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.8)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100, padding: '20px' }}>
-          <div style={{ backgroundColor: 'var(--card-bg)', width: '100%', maxWidth: '400px', borderRadius: '16px', border: '1px solid var(--border-color)', padding: '32px' }}>
-            <h3 style={{ fontSize: '1.25rem', marginBottom: '8px' }}>Reset Password</h3>
-            <p style={{ color: 'var(--text-secondary)', fontSize: '0.875rem', marginBottom: '24px' }}>Set a new password for <strong>{resetUser?.username}</strong></p>
-            <form onSubmit={handleResetPassword} style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                <label style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>New Password</label>
-                <input type="password" value={newPassword} onChange={e => setNewPassword(e.target.value)} required minLength={6} style={{ backgroundColor: 'var(--bg-color)', border: '1px solid var(--border-color)', padding: '12px', borderRadius: '8px', color: 'white' }} />
-              </div>
-              <div style={{ display: 'flex', gap: '12px', marginTop: '12px' }}>
-                <button type="button" onClick={() => setShowResetModal(false)} style={{ flex: 1, padding: '12px', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'white' }}>Cancel</button>
-                <button type="submit" style={{ flex: 1, padding: '12px', borderRadius: '8px', backgroundColor: 'var(--accent-color)', color: 'white', fontWeight: 600 }}>Reset Password</button>
-              </div>
-            </form>
-          </div>
-        </div>
+      {resetUser && (
+        <Modal
+          title="Reset password"
+          subtitle={<>Set a new password for <strong>{resetUser.username}</strong>.</>}
+          onClose={() => setResetUser(null)}
+        >
+          <form
+            onSubmit={handleResetPassword}
+            style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}
+          >
+            <Field label="New password" hint="At least six characters.">
+              <input
+                type="password"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                required
+                minLength={6}
+                autoFocus
+              />
+            </Field>
+            <div style={{ display: 'flex', gap: 'var(--space-2)' }}>
+              <DialogButton onClick={() => setResetUser(null)}>Cancel</DialogButton>
+              <DialogButton type="submit" variant="solid" tone="critical">
+                Reset password
+              </DialogButton>
+            </div>
+          </form>
+        </Modal>
       )}
 
-      {/* Role Modal */}
       {showRoleModal && (
-        <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.8)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100, padding: '20px' }}>
-          <div style={{ backgroundColor: 'var(--card-bg)', width: '100%', maxWidth: '400px', borderRadius: '16px', border: '1px solid var(--border-color)', padding: '32px' }}>
-            <h3 style={{ fontSize: '1.25rem', marginBottom: '24px' }}>Create New Role</h3>
-            <form onSubmit={handleCreateRole} style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                <label style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>Role Name</label>
-                <input type="text" value={newRole.role_name} onChange={e => setNewRole({role_name: e.target.value})} required placeholder="e.g. analyst" style={{ backgroundColor: 'var(--bg-color)', border: '1px solid var(--border-color)', padding: '12px', borderRadius: '8px', color: 'white' }} />
-              </div>
-              <div style={{ display: 'flex', gap: '12px', marginTop: '12px' }}>
-                <button type="button" onClick={() => setShowRoleModal(false)} style={{ flex: 1, padding: '12px', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'white' }}>Cancel</button>
-                <button type="submit" style={{ flex: 1, padding: '12px', borderRadius: '8px', backgroundColor: 'var(--accent-secondary)', color: 'white', fontWeight: 600 }}>Create Role</button>
-              </div>
-            </form>
-          </div>
-        </div>
+        <Modal title="Create role" onClose={() => setShowRoleModal(false)}>
+          <form
+            onSubmit={handleCreateRole}
+            style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}
+          >
+            <Field label="Role name" hint="Permissions are assigned after it exists.">
+              <input
+                type="text"
+                value={newRole.role_name}
+                onChange={(e) => setNewRole({ role_name: e.target.value })}
+                required
+                placeholder="analyst"
+                autoFocus
+              />
+            </Field>
+            <div style={{ display: 'flex', gap: 'var(--space-2)' }}>
+              <DialogButton onClick={() => setShowRoleModal(false)}>Cancel</DialogButton>
+              <DialogButton type="submit" variant="solid">Create role</DialogButton>
+            </div>
+          </form>
+        </Modal>
       )}
     </div>
   );

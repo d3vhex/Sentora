@@ -96,6 +96,60 @@ export const authService = {
       return res.data;
     }),
 
+  /** Finish a login with a security key instead of a code.
+   *
+   * Two calls, because the challenge has to come from the server: one that
+   * cannot be replayed and one the browser did not choose. The same session
+   * bookkeeping as the other two paths — see the note on
+   * `completeSecondFactor`.
+   */
+  webauthnLoginBegin: (token: string) =>
+    api.post('/login/2fa/webauthn/begin', { token }).then(r => {
+      if (r.data.status !== 'success') {
+        throw new Error(r.data.message || 'No security key is available here.');
+      }
+      return r.data.options;
+    }),
+
+  webauthnLoginFinish: (token: string, credential: any) =>
+    api.post('/login/2fa/webauthn/finish', { token, credential }).then(r => {
+      if (r.data.status !== 'success') {
+        throw new Error(r.data.message || 'That key was not accepted.');
+      }
+      localStorage.setItem('userId', r.data.user.id.toString());
+      localStorage.setItem('user', JSON.stringify(r.data.user));
+      if (r.data.user.must_change_password) {
+        localStorage.setItem('mustChangePassword', '1');
+      } else {
+        localStorage.removeItem('mustChangePassword');
+      }
+      return r.data;
+    }),
+
+  /** Whether a key can be registered from this origin, and which are. */
+  webauthnCapability: () =>
+    api.get('/api/2fa/webauthn/capability').then(r => r.data),
+
+  webauthnRegisterBegin: () =>
+    api.post('/api/2fa/webauthn/register/begin').then(r => {
+      if (r.data.status !== 'success') {
+        throw new Error(r.data.message || 'Registration could not be started.');
+      }
+      return r.data.options;
+    }),
+
+  webauthnRegisterFinish: (credential: any, nickname: string) =>
+    api.post('/api/2fa/webauthn/register/finish', { credential, nickname })
+      .then(r => {
+        if (r.data.status !== 'success') {
+          throw new Error(r.data.message || 'That key was not accepted.');
+        }
+        return r.data;
+      }),
+
+  webauthnRemove: (id: number) =>
+    api.delete(`/api/2fa/webauthn/${id}`).then(r => r.data),
+
   twoFactorStatus: () => api.get('/api/2fa/status').then(r => r.data),
   twoFactorEnrol: () => api.post('/api/2fa/enrol').then(r => r.data),
   twoFactorConfirm: (code: string) =>

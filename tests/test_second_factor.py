@@ -187,7 +187,13 @@ def test_they_are_shown_once_and_only_once():
 
 
 def test_a_recovery_code_is_burnt_on_use():
-    body = ast.unparse(_function("complete_second_factor"))
+    # The route hands the tail of the login to `_finish_second_factor_login`,
+    # which the security-key route shares. Both halves together are what the
+    # invariant is about, so both are read: asserting only against the route
+    # would have started failing the moment the session issuance was extracted,
+    # while nothing about the behaviour had changed.
+    body = (ast.unparse(_function("complete_second_factor"))
+            + ast.unparse(_function("_finish_second_factor_login")))
     assert "used_at = NOW()" in body
     assert "used_at IS NULL" in body, "a spent recovery code can be replayed"
     assert "RECOVERY_CODE_USED" in body, \

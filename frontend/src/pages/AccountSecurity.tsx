@@ -1,8 +1,12 @@
-import React, { useEffect, useState } from 'react';
-import { ShieldCheck, ShieldOff, KeyRound, Copy, Check, AlertTriangle } from 'lucide-react';
+import React, { useCallback, useEffect, useState } from 'react';
+import {
+  ShieldCheck, ShieldOff, KeyRound, Copy, Check, AlertTriangle,
+  Usb, Trash2, Info,
+} from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import { authService } from '../services/api';
-import { Card, PageHeader } from '../components/ui';
+import { Card, PageHeader, Badge, EmptyState, LoadingState } from '../components/ui';
+import * as webauthn from '../lib/webauthn';
 
 /** Every operator can reach this, whatever their role.
  *
@@ -38,8 +42,58 @@ const AccountSecurity: React.FC = () => {
 
   const [password, setPassword] = useState('');
 
+  // Security keys. `capability` is the server's answer to "can a key be used
+  // from where this browser is standing", which is not a question the page can
+  // answer for itself — see security/webauthn.py.
+  const [capability, setCapability] = useState<any | null>(null);
+  const [keyName, setKeyName] = useState('');
+  const [keyBusy, setKeyBusy] = useState(false);
+  const [keyNotice, setKeyNotice] = useState('');
+
   const refresh = () => authService.twoFactorStatus().then(setStatus).catch(() => setStatus(null));
-  useEffect(() => { refresh(); }, []);
+
+  const refreshKeys = useCallback(() => {
+    authService.webauthnCapability()
+      .then(setCapability)
+      .catch(() => setCapability({
+        available: false,
+        reason: 'The server did not answer when asked about security keys.',
+        credentials: [],
+      }));
+  }, []);
+
+  useEffect(() => { refresh(); refreshKeys(); }, [refreshKeys]);
+
+  const addKey = async () => {
+    setError(''); setKeyNotice(''); setKeyBusy(true);
+    try {
+      const options = await authService.webauthnRegisterBegin();
+      const credential = await webauthn.createCredential(options);
+      await authService.webauthnRegisterFinish(credential, keyName);
+      setKeyName('');
+      setKeyNotice('Security key registered.');
+      refreshKeys();
+      refresh();
+    } catch (e: any) {
+      // `explain` covers the browser's side: its own message is usually empty,
+      // because saying exactly why a ceremony failed is a fingerprinting
+      // surface, so the useful signal is the error name.
+      setError(e?.response?.data?.message || webauthn.explain(e));
+    } finally { setKeyBusy(false); }
+  };
+
+  const removeKey = async (id: number, label: string) => {
+    if (!window.confirm(`Remove ${label}? You will not be able to sign in with it.`)) return;
+    setError(''); setKeyNotice(''); setKeyBusy(true);
+    try {
+      await authService.webauthnRemove(id);
+      setKeyNotice('Security key removed.');
+      refreshKeys();
+      refresh();
+    } catch (e: any) {
+      setError(e?.response?.data?.message || 'Could not remove that key.');
+    } finally { setKeyBusy(false); }
+  };
 
   const begin = async () => {
     setError(''); setBusy(true);
@@ -279,6 +333,113 @@ const AccountSecurity: React.FC = () => {
                 Turn off
               </button>
             </form>
+          </>
+        )}
+      </Card>
+
+      <Card title="Security keys">
+        <p style={note}>
+          A one-time code typed into a convincing copy of this login page works
+          on the real one. A security key does not: the browser signs over the
+          address it is actually talking to, so a key registered here produces
+          nothing usable anywhere else.
+        </p>
+
+        {capability === null && <LoadingState label="Checking this browser…" />}
+
+        {capability && !capability.available && (
+          <div style={{
+            display: 'flex', gap: 'var(--space-3)', alignItems: 'flex-start',
+            padding: 'var(--space-3)',
+            border: '1px solid var(--border-color)',
+            borderRadius: 'var(--radius-md)',
+            fontSize: 'var(--text-sm)', color: 'var(--text-secondary)',
+            lineHeight: 1.5,
+          }}>
+            <Info size={16} style={{ flexShrink: 0, marginTop: 2 }} />
+            <div>
+              {/* The reason, not a disabled button. Every one of these is a
+                  dead end the operator would otherwise meet as a browser error
+                  naming neither the cause nor the fix. */}
+              <div>{capability.reason}</div>
+              <div style={{ marginTop: 'var(--space-2)', color: 'var(--text-muted)' }}>
+                One-time codes above are unaffected.
+              </div>
+            </div>
+          </div>
+        )}
+
+        {capability?.available && (
+          <>
+            {!!keyNotice && (
+              <p style={{ ...note, color: 'var(--accent-success)' }}>{keyNotice}</p>
+            )}
+
+            {capability.credentials.length === 0 ? (
+              <EmptyState
+                title="No keys registered"
+                detail={`Keys registered here work at ${capability.rp_id} and nowhere else.`}
+                icon={<Usb size={18} style={{ color: 'var(--text-muted)' }} />}
+              />
+            ) : (
+              <div style={{
+                display: 'flex', flexDirection: 'column',
+                gap: 'var(--space-2)', marginBottom: 'var(--space-4)',
+              }}>
+                {capability.credentials.map((c: any) => (
+                  <div key={c.id} style={{
+                    display: 'flex', alignItems: 'center',
+                    justifyContent: 'space-between', gap: 'var(--space-3)',
+                    padding: 'var(--space-3)',
+                    border: '1px solid var(--border-color)',
+                    borderRadius: 'var(--radius-md)',
+                  }}>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontSize: 'var(--text-sm)' }}>{c.label}</div>
+                      <div style={{
+                        marginTop: 'var(--space-1)', fontSize: 'var(--text-xs)',
+                        color: 'var(--text-muted)',
+                      }}>
+                        Added {c.created_at || 'recently'}
+                        {c.last_used_at ? ` · last used ${c.last_used_at}` : ' · never used'}
+                      </div>
+                    </div>
+                    <button
+                      className="icon-btn"
+                      title="Remove this key"
+                      onClick={() => removeKey(c.id, c.label)}
+                      disabled={keyBusy}
+                      style={{ color: 'var(--accent-color)' }}
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div style={{
+              display: 'flex', gap: 'var(--space-2)', alignItems: 'center',
+              flexWrap: 'wrap',
+            }}>
+              <input
+                value={keyName}
+                onChange={(e) => setKeyName(e.target.value)}
+                placeholder="Name this key (optional)"
+                maxLength={64}
+                style={{ width: 240 }}
+              />
+              <button className="btn-primary" onClick={addKey} disabled={keyBusy}>
+                <Usb size={15} /> {keyBusy ? 'Waiting for the key…' : 'Add a security key'}
+              </button>
+              <Badge tone="info">{capability.rp_id}</Badge>
+            </div>
+
+            <p style={{ ...note, marginTop: 'var(--space-4)', marginBottom: 0 }}>
+              A key is an addition, not a replacement. Keep your recovery codes:
+              they are what gets you back in if the key is lost, and turning
+              two-factor off still needs your password.
+            </p>
           </>
         )}
       </Card>

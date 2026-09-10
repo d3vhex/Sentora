@@ -227,7 +227,32 @@ shows it reporting, and nothing reaches it.
 ```ini
 # .env
 TLS_ENABLED=1
-TLS_CN=soc.example.com          # the name agents and browsers will use
+TLS_CN=soc.example.com                    # the name agents and browsers use
+TLS_SAN=soc.example.com,10.0.0.5          # every other name it answers to
+```
+
+`TLS_SAN` is comma separated and takes hostnames and addresses alike; anything
+that parses as an address becomes an IP SAN rather than a DNS name, because a
+bare address in the DNS list matches nothing. `localhost`, `127.0.0.1` and
+`::1` are always included.
+
+Put in it every name anyone will actually type. The old certificate carried
+`DNS:localhost` and nothing else, so a console opened at `https://10.0.0.5`
+failed hostname verification in every browser on top of the untrusted-CA
+warning - two errors that look like one.
+
+It also decides whether a security key can ever be used here. WebAuthn's RP ID
+must be a domain, and browsers reject an IP address outright, so `https://` at
+an address is not somewhere a passkey can be registered. That needs a name in
+this list, resolvable from the operator's machine.
+
+Generation is idempotent - a new identity on every restart would break every
+agent that pinned the CA - so **changing these values on a deployment that
+already has a certificate does nothing by itself**. The startup log says so and
+prints the command to regenerate:
+
+```
+python certs/generate_certs.py --force --cn soc.example.com --san 10.0.0.5
 ```
 
 That is enough. On first boot `app` generates a CA and a server certificate
@@ -869,6 +894,53 @@ stay valid for their whole step, and without single use anyone who sees one
 entered has the rest of that step to use it themselves. A second attempt
 raises `TOTP_CODE_REPLAYED`.
 
+#### Security keys
+
+A code typed into a convincing copy of this login page works on the real one,
+and the operator has no way to tell. That is the case a one-time code cannot
+cover and a security key can: the browser signs over the origin it is actually
+talking to, so a key registered against `soc.example.com` produces nothing
+usable on a lookalike.
+
+**There is nothing to configure.** The relying-party ID is derived from the
+request, so a single-machine install at `https://localhost:8000` and an estate
+at `https://soc.example.com` both work without being told anything, and no
+setting can disagree with the URL people type.
+
+The cost of that is that some origins cannot host a key at all, and the console
+says which. Open **My Security** and it reports one of:
+
+| Where the console is open | Security keys |
+| :--- | :--- |
+| `https://soc.example.com` | available |
+| `http://localhost:8000` or `https://localhost:8000` | available — localhost is a secure context by definition |
+| `https://10.0.0.5:8000` | **unavailable.** A relying-party ID must be a domain and browsers reject an address outright. Reach the console by a name — see `TLS_SAN` in §3.2. |
+| `http://soc.example.com` | **unavailable.** WebAuthn needs a secure context; set `TLS_ENABLED=1`. |
+| any, with the `webauthn` package absent | **unavailable.** The import is lazy, so a deployment that pulls new code without reinstalling loses this option rather than the console. |
+
+One-time codes are unaffected in every one of those rows. A key is an addition,
+not a replacement, and recovery codes remain the way back into an account whose
+authenticator is gone.
+
+Two consequences worth knowing before you roll it out:
+
+- **A credential is bound to the origin it was made at.** A key registered
+  while the console was at `localhost` is one the browser will not offer at a
+  hostname. `user_webauthn.rp_id` records it, and the login step offers only
+  the keys that can work where you are, rather than showing a prompt that times
+  out. Register keys at the address operators actually use.
+- **Whether a login needs a second factor is a property of the account, not of
+  the origin.** An operator with a key and no authenticator is still challenged
+  when they open the console at an address — otherwise the origin binding, the
+  entire point of WebAuthn, would become a way around it.
+
+A key that presents a signature counter lower than the last one seen is
+refused and raises `WEBAUTHN_COUNTER_REGRESSED` (CRITICAL): that is what a
+cloned key looks like, since the copy does not know how many times the original
+has been used. A counter of zero means the authenticator does not implement one
+— true of most platform passkeys and everything that syncs between devices —
+and is accepted.
+
 #### What is stored
 
 | | |
@@ -876,6 +948,8 @@ raises `TOTP_CODE_REPLAYED`.
 | `user_totp.secret` | The seed, **Fernet-encrypted** with the server key. A dump of `userdb` alone does not hand over everybody's second factor. |
 | `user_recovery_codes.code_hash` | SHA-256. Never the code. |
 | `totp_pending.token_hash` | SHA-256 of the half-authenticated token, like a session. |
+| `user_webauthn.public_key` | The credential's public key, base64url. Public by construction — it verifies signatures and cannot make them. |
+| `webauthn_challenges` | Server-side and single use, expiring in two minutes. A challenge the browser chooses is not a challenge. |
 
 The seed column is `VARCHAR(512)` for ciphertext, not for the ~32 characters a
 base32 seed reads as - see §4.1 for what sizing a column to the human-readable
@@ -931,6 +1005,7 @@ every host in the fleet and was the one machine nobody watched.
 | `ENROLMENT_TOKEN_REUSED` | HIGH | A one-time token presented twice. Usually an installer re-run; the other reading is that it leaked. |
 | `TOTP_CODE_REPLAYED` | HIGH | A second-factor code already used was presented again. |
 | `TOTP_DISABLE_REFUSED` | HIGH | A wrong password when turning off two-factor. A hijacked session trying to remove the control that would have stopped it looks exactly like this. |
+| `WEBAUTHN_COUNTER_REGRESSED` | CRITICAL | A security key presented a signature counter lower than the last one seen. That is what a copy of the key looks like — the copy does not know how many times the original has been used. The only other reading is a replayed response, and neither is benign. |
 | `PERMISSION_DENIED` | MEDIUM | An operator reached past their role. One is a mis-click; a run of them is somebody mapping what they can touch. |
 | `RECOVERY_CODE_USED` | MEDIUM | Signed in with a recovery code rather than an authenticator. |
 

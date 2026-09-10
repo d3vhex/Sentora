@@ -1,15 +1,28 @@
-import React, { useEffect, useState } from 'react';
+/**
+ * Enrolling an endpoint: a one-time token, and the command that consumes it.
+ *
+ * Two things here were quietly wrong.
+ *
+ * `loadEnrollments` checked `if (r.ok && data.status === 'success')` and had
+ * no else. A 401, a 500 and an empty estate all rendered "No enrollment tokens
+ * yet." - so a token you had just issued could appear not to exist, and the
+ * natural response is to issue another.
+ *
+ * And the copy button called `navigator.clipboard.writeText` without checking
+ * whether it worked. That API only exists in a secure context, so on a
+ * deployment reached over plain http it is `undefined` - the copy did nothing
+ * and the button still said "Copied". On this page in particular that loses
+ * the token: the panel says, correctly, that the raw value is shown once and
+ * never again. It now reports the failure and leaves the text selectable.
+ */
+import React, { useCallback, useEffect, useState } from 'react';
 import {
-  ShieldCheck,
-  Info,
-  CheckCircle2,
-  AlertCircle,
-  Copy,
-  Check,
-  KeyRound,
-  Trash2,
-  RefreshCw
+  ShieldCheck, Info, CheckCircle2, Copy, Check, KeyRound, Trash2, RefreshCw,
 } from 'lucide-react';
+import {
+  PageHeader, Card, Badge, DataTable, Row, Cell, Field,
+  EmptyState, ErrorState, LoadingState, Modal, DialogButton,
+} from '../components/ui';
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ||
@@ -38,6 +51,7 @@ type EnrollResponse = {
 
 const Deployment: React.FC = () => {
   const [copied, setCopied] = useState<string | null>(null);
+  const [copyFailed, setCopyFailed] = useState<string | null>(null);
 
   const [hostnameHint, setHostnameHint] = useState('');
   const [note, setNote] = useState('');
@@ -46,12 +60,14 @@ const Deployment: React.FC = () => {
   const [lastToken, setLastToken] = useState<EnrollResponse | null>(null);
 
   const [enrollments, setEnrollments] = useState<Enrollment[]>([]);
-  const [loadingList, setLoadingList] = useState(false);
+  const [loadingList, setLoadingList] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [confirmRevoke, setConfirmRevoke] = useState<Enrollment | null>(null);
 
-  const authHeaders = (): Record<string, string> => {
-    const userId = localStorage.getItem('userId') || '0';
-    return { 'X-User-ID': userId, 'Content-Type': 'application/json' };
-  };
+  const authHeaders = (): Record<string, string> => ({
+    'X-User-ID': localStorage.getItem('userId') || '0',
+    'Content-Type': 'application/json',
+  });
 
   // These calls use raw fetch rather than the shared axios client, so they
   // need the session cookie opted in explicitly. Without it the requests are
@@ -59,24 +75,27 @@ const Deployment: React.FC = () => {
   const authFetch = (url: string, init: RequestInit = {}) =>
     fetch(url, { ...init, credentials: 'include', headers: authHeaders() });
 
-  const loadEnrollments = async () => {
+  const loadEnrollments = useCallback(async () => {
     setLoadingList(true);
     try {
       const r = await authFetch(`${API_BASE_URL}/api/agents/enrollments`);
-      const data = await r.json();
-      if (r.ok && data.status === 'success') {
-        setEnrollments(data.enrollments || []);
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok || data.status !== 'success') {
+        // Previously this branch did not exist, so a rejected request left the
+        // list empty and the page said there were no tokens.
+        setError(data.message || `The server answered ${r.status} — the list below is unknown, not empty.`);
+        return;
       }
-    } catch (e) {
-      console.error('Failed to load enrollments', e);
+      setEnrollments(data.enrollments || []);
+      setError(null);
+    } catch (e: any) {
+      setError(e?.message || 'Could not reach the server');
     } finally {
       setLoadingList(false);
     }
-  };
-
-  useEffect(() => {
-    loadEnrollments();
   }, []);
+
+  useEffect(() => { loadEnrollments(); }, [loadEnrollments]);
 
   const generateToken = async () => {
     setGenerating(true);
@@ -90,432 +109,265 @@ const Deployment: React.FC = () => {
           ttl_hours: ttlHours,
         }),
       });
-      const data = await r.json();
+      const data = await r.json().catch(() => ({}));
       if (!r.ok || data.status !== 'success') {
-        alert(data.message || 'Failed to create enrollment token');
+        setError(data.message || `Could not create a token (${r.status})`);
         return;
       }
       setLastToken(data);
       setHostnameHint('');
       setNote('');
+      setError(null);
       loadEnrollments();
     } catch (e: any) {
-      alert(`Error: ${e.message || e}`);
+      setError(e?.message || 'Could not create a token');
     } finally {
       setGenerating(false);
     }
   };
 
-  const revokeToken = async (id: number) => {
-    if (!confirm('Revoke this enrollment token?')) return;
+  const revokeToken = async (row: Enrollment) => {
+    setConfirmRevoke(null);
     try {
-      const r = await authFetch(`${API_BASE_URL}/api/agents/enrollments/${id}`, {
+      const r = await authFetch(`${API_BASE_URL}/api/agents/enrollments/${row.id}`, {
         method: 'DELETE',
       });
-      if (r.ok) loadEnrollments();
-      else {
-        const data = await r.json().catch(() => ({}));
-        alert(data.message || 'Failed to revoke');
-      }
+      if (r.ok) { loadEnrollments(); return; }
+      const data = await r.json().catch(() => ({}));
+      setError(data.message || `Could not revoke token ${row.token_preview}`);
     } catch (e: any) {
-      alert(`Error: ${e.message || e}`);
+      setError(e?.message || 'Could not revoke the token');
     }
   };
 
-  const copyToClipboard = (text: string, id: string) => {
-    navigator.clipboard.writeText(text);
-    setCopied(id);
-    setTimeout(() => setCopied(null), 2000);
+  /** Reports failure instead of claiming success.
+   *
+   * `navigator.clipboard` is only defined in a secure context. Over plain http
+   * — which is how a first deployment is usually reached — the old code threw
+   * inside an unawaited promise and the button still said "Copied". */
+  const copyToClipboard = async (text: string, id: string) => {
+    setCopyFailed(null);
+    try {
+      if (!navigator.clipboard) throw new Error('no clipboard in this context');
+      await navigator.clipboard.writeText(text);
+      setCopied(id);
+      setTimeout(() => setCopied(null), 2000);
+    } catch {
+      setCopyFailed(id);
+    }
+  };
+
+  const statusOf = (e: Enrollment) => {
+    if (e.used_at) return { tone: 'ok' as const, label: `used → ${e.used_by_agent}` };
+    if (e.expires_at && new Date(e.expires_at) < new Date()) {
+      return { tone: 'medium' as const, label: 'expired' };
+    }
+    return { tone: 'info' as const, label: 'pending' };
+  };
+
+  const list = () => {
+    if (loadingList && enrollments.length === 0) return <LoadingState label="Reading tokens…" />;
+    if (enrollments.length === 0) {
+      return (
+        <EmptyState
+          title="No enrolment tokens"
+          detail="Generate one above, then run the command it produces on the endpoint."
+        />
+      );
+    }
+    return (
+      <DataTable columns={['Token', 'Hint', 'Created', 'Expires', 'Status', '']}>
+        {enrollments.map((e) => {
+          const status = statusOf(e);
+          return (
+            <Row key={e.id}>
+              <Cell mono>{e.token_preview}</Cell>
+              <Cell>{e.hostname_hint || '—'}</Cell>
+              <Cell mono>{e.created_at}</Cell>
+              <Cell mono>{e.expires_at}</Cell>
+              <Cell><Badge tone={status.tone}>{status.label}</Badge></Cell>
+              <Cell align="right">
+                {!e.used_at && (
+                  <button
+                    className="icon-btn"
+                    title="Revoke"
+                    onClick={() => setConfirmRevoke(e)}
+                    style={{ color: 'var(--accent-color)' }}
+                  >
+                    <Trash2 size={15} />
+                  </button>
+                )}
+              </Cell>
+            </Row>
+          );
+        })}
+      </DataTable>
+    );
   };
 
   return (
-    <div style={{ maxWidth: '1100px', margin: '0 auto', padding: '20px' }}>
-      {/* Header */}
-      <div
-        style={{
-          backgroundColor: 'var(--card-bg)',
-          borderRadius: '16px',
-          padding: '32px',
-          border: '1px solid var(--border-color)',
-          marginBottom: '24px',
-        }}
-      >
-        <div style={{ display: 'flex', alignItems: 'center', gap: '16px', marginBottom: '24px' }}>
+    <div>
+      <PageHeader
+        title="Enrol an Endpoint"
+        subtitle="A single-use token that the installer exchanges for this host's own key. Revoking one agent leaves the rest alone."
+        icon={<KeyRound size={22} />}
+        actions={
+          <button className="btn-secondary" onClick={loadEnrollments} disabled={loadingList}>
+            <RefreshCw size={15} className={loadingList ? 'animate-spin' : undefined} /> Refresh
+          </button>
+        }
+      />
+
+      {error && (
+        <div style={{ marginBottom: 'var(--space-5)' }}>
+          <ErrorState title="Enrolment request failed" detail={error} />
+        </div>
+      )}
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-5)' }}>
+        <Card title="New token">
           <div
             style={{
-              width: '48px',
-              height: '48px',
-              borderRadius: '12px',
-              backgroundColor: 'rgba(59, 130, 246, 0.1)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              color: 'var(--accent-secondary)',
+              display: 'flex', gap: 'var(--space-3)', alignItems: 'flex-start',
+              marginBottom: 'var(--space-4)',
             }}
           >
-            <KeyRound size={24} />
-          </div>
-          <div>
-            <h2 style={{ fontSize: '1.5rem', marginBottom: '4px' }}>Enroll New Agent</h2>
-            <p style={{ color: 'var(--text-secondary)' }}>
-              Generate a one-time enrollment token; each endpoint gets its own per-agent key.
+            <Info size={16} style={{ color: 'var(--text-muted)', flexShrink: 0, marginTop: 2 }} />
+            <p
+              style={{
+                margin: 0, fontSize: 'var(--text-sm)', color: 'var(--text-secondary)',
+                lineHeight: 1.6, maxWidth: '78ch',
+              }}
+            >
+              The token burns on first use and expires on its own. On first boot the installer
+              trades it for a unique <code>agent_key</code>, writes an identity config and
+              registers the service. Every issuance and registration is written to{' '}
+              <code>audit_logs</code>.
             </p>
           </div>
-        </div>
 
-        <div
-          style={{
-            backgroundColor: 'rgba(59, 130, 246, 0.05)',
-            border: '1px solid rgba(59, 130, 246, 0.2)',
-            borderRadius: '12px',
-            padding: '16px',
-            display: 'flex',
-            gap: '12px',
-            marginBottom: '24px',
-          }}
-        >
-          <Info size={20} color="#3b82f6" style={{ flexShrink: 0, marginTop: '2px' }} />
-          <p style={{ fontSize: '0.875rem', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-            Tokens are <strong>single-use</strong> and expire. On first boot the installer exchanges the
-            token for a unique <code>agent_key</code>, writes an identity config, and registers the
-            service. Revoke an agent by deleting its key from the list below.
-          </p>
-        </div>
+          <div className="responsive-grid" style={{ alignItems: 'end' }}>
+            <Field label="Hostname hint" hint="Optional. Which machine you mean this for.">
+              <input value={hostnameHint} onChange={(e) => setHostnameHint(e.target.value)} />
+            </Field>
+            <Field label="Note" hint="Optional. Why it was issued.">
+              <input value={note} onChange={(e) => setNote(e.target.value)} />
+            </Field>
+            <Field label="Valid for (hours)">
+              <input
+                type="number"
+                min={1}
+                max={720}
+                value={ttlHours}
+                onChange={(e) => setTtlHours(parseInt(e.target.value || '24', 10))}
+              />
+            </Field>
+            <button className="btn-primary" onClick={generateToken} disabled={generating}>
+              <KeyRound size={15} /> {generating ? 'Generating…' : 'Generate token'}
+            </button>
+          </div>
 
-        {/* Token generation form */}
-        <div
-          style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
-            gap: '12px',
-            marginBottom: '16px',
-          }}
-        >
-          <input
-            type="text"
-            placeholder="Hostname hint (optional)"
-            value={hostnameHint}
-            onChange={(e) => setHostnameHint(e.target.value)}
-            style={inputStyle}
-          />
-          <input
-            type="text"
-            placeholder="Note (optional)"
-            value={note}
-            onChange={(e) => setNote(e.target.value)}
-            style={inputStyle}
-          />
-          <input
-            type="number"
-            min={1}
-            max={720}
-            value={ttlHours}
-            onChange={(e) => setTtlHours(parseInt(e.target.value || '24', 10))}
-            placeholder="TTL (hours)"
-            style={inputStyle}
-          />
-          <button
-            onClick={generateToken}
-            disabled={generating}
-            style={{
-              backgroundColor: 'var(--accent-secondary)',
-              color: 'white',
-              padding: '10px 16px',
-              borderRadius: '8px',
-              fontWeight: 600,
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              gap: '8px',
-              opacity: generating ? 0.6 : 1,
-              cursor: generating ? 'not-allowed' : 'pointer',
-            }}
-          >
-            <KeyRound size={16} /> {generating ? 'Generating…' : 'Generate Enrollment Token'}
-          </button>
-        </div>
+          {lastToken && (
+            <div
+              style={{
+                marginTop: 'var(--space-5)', paddingTop: 'var(--space-4)',
+                borderTop: '1px solid var(--border-color)',
+              }}
+            >
+              <div
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 'var(--space-2)',
+                  marginBottom: 'var(--space-3)', fontSize: 'var(--text-sm)',
+                }}
+              >
+                <CheckCircle2 size={16} style={{ color: 'var(--accent-success)' }} />
+                Token ready — expires {lastToken.expires_at}
+              </div>
 
-        {/* Last generated token panel */}
-        {lastToken && (
-          <div
-            style={{
-              backgroundColor: 'var(--bg-color)',
-              borderRadius: '12px',
-              border: '1px solid rgba(16, 185, 129, 0.35)',
-              padding: '20px',
-              marginTop: '8px',
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
-              <CheckCircle2 size={18} color="#10b981" />
-              <strong>Token ready · expires {lastToken.expires_at}</strong>
+              {(['linux', 'windows'] as const).map((os) => (
+                <div key={os} style={{ marginBottom: 'var(--space-4)' }}>
+                  <div
+                    style={{
+                      display: 'flex', justifyContent: 'space-between',
+                      alignItems: 'center', marginBottom: 'var(--space-2)',
+                    }}
+                  >
+                    <span
+                      style={{
+                        fontSize: 'var(--text-xs)', color: 'var(--text-muted)',
+                        textTransform: 'uppercase', letterSpacing: '0.04em',
+                      }}
+                    >
+                      {os === 'linux' ? 'Linux (bash)' : 'Windows (PowerShell)'}
+                    </span>
+                    <button
+                      className="btn-secondary"
+                      onClick={() => copyToClipboard(lastToken.install[os], os)}
+                    >
+                      {copied === os ? <Check size={14} /> : <Copy size={14} />}
+                      {copied === os ? 'Copied' : 'Copy'}
+                    </button>
+                  </div>
+                  <code
+                    className="mono"
+                    style={{
+                      display: 'block', padding: 'var(--space-3)',
+                      background: 'var(--bg-color)',
+                      border: '1px solid var(--border-color)',
+                      borderRadius: 'var(--radius-md)',
+                      fontSize: 'var(--text-xs)',
+                      overflowX: 'auto', whiteSpace: 'pre',
+                      userSelect: 'all',
+                    }}
+                  >
+                    {lastToken.install[os]}
+                  </code>
+                  {copyFailed === os && (
+                    <p style={{ margin: 'var(--space-2) 0 0', fontSize: 'var(--text-xs)', color: 'var(--accent-color)' }}>
+                      The browser refused clipboard access — that API needs https or localhost.
+                      Select the command above and copy it by hand; it is not shown again.
+                    </p>
+                  )}
+                </div>
+              ))}
+
+              <p style={{ margin: 0, fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>
+                The raw token appears here once. Leaving this page discards it and you will need
+                a new one.
+              </p>
             </div>
-            <OneLinerBlock
-              label="Linux (Bash)"
-              color="#10b981"
-              id="linux-new"
-              text={lastToken.install.linux}
-              copied={copied}
-              onCopy={copyToClipboard}
-            />
-            <div style={{ height: 12 }} />
-            <OneLinerBlock
-              label="Windows (PowerShell)"
-              color="#00a4ef"
-              id="win-new"
-              text={lastToken.install.windows}
-              copied={copied}
-              onCopy={copyToClipboard}
-            />
-            <p style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '10px' }}>
-              The raw token is only visible here — copy the command now, it will not be shown again.
-            </p>
-          </div>
-        )}
+          )}
+        </Card>
+
+        <Card title="Tokens issued">{list()}</Card>
       </div>
 
-      {/* Enrollments list */}
-      <div
-        style={{
-          backgroundColor: 'var(--card-bg)',
-          borderRadius: '16px',
-          padding: '24px',
-          border: '1px solid var(--border-color)',
-          marginBottom: '24px',
-        }}
-      >
-        <div
-          style={{
-            display: 'flex',
-            justifyContent: 'space-between',
-            alignItems: 'center',
-            marginBottom: '16px',
-          }}
+      {confirmRevoke && (
+        <Modal
+          title="Revoke this token?"
+          subtitle={`${confirmRevoke.token_preview} can no longer be used to enrol.`}
+          onClose={() => setConfirmRevoke(null)}
+          footer={
+            <>
+              <DialogButton onClick={() => setConfirmRevoke(null)}>Cancel</DialogButton>
+              <DialogButton
+                variant="solid"
+                tone="critical"
+                onClick={() => revokeToken(confirmRevoke)}
+              >
+                Revoke
+              </DialogButton>
+            </>
+          }
         >
-          <h3 style={{ fontSize: '1.125rem', fontWeight: 700 }}>Recent Enrollments</h3>
-          <button
-            onClick={loadEnrollments}
-            disabled={loadingList}
-            style={{
-              color: 'var(--accent-secondary)',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '6px',
-              fontSize: '0.8125rem',
-              fontWeight: 600,
-              background: 'rgba(96, 165, 250, 0.1)',
-              padding: '6px 12px',
-              borderRadius: '6px',
-            }}
-          >
-            <RefreshCw size={14} /> Refresh
-          </button>
-        </div>
-        {enrollments.length === 0 ? (
-          <p style={{ color: 'var(--text-secondary)', fontSize: '0.875rem' }}>
-            No enrollment tokens yet.
+          <p style={{ margin: 0, fontSize: 'var(--text-sm)', color: 'var(--text-secondary)' }}>
+            <ShieldCheck size={14} style={{ verticalAlign: 'text-bottom' }} /> Agents already
+            enrolled keep working — they hold their own keys, not this token.
           </p>
-        ) : (
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', fontSize: '0.875rem', borderCollapse: 'collapse' }}>
-              <thead>
-                <tr style={{ textAlign: 'left', color: 'var(--text-secondary)' }}>
-                  <th style={thStyle}>Token</th>
-                  <th style={thStyle}>Hint</th>
-                  <th style={thStyle}>Created</th>
-                  <th style={thStyle}>Expires</th>
-                  <th style={thStyle}>Status</th>
-                  <th style={thStyle}></th>
-                </tr>
-              </thead>
-              <tbody>
-                {enrollments.map((e) => {
-                  const used = !!e.used_at;
-                  const expired =
-                    !used && e.expires_at && new Date(e.expires_at) < new Date();
-                  return (
-                    <tr key={e.id} style={{ borderTop: '1px solid var(--border-color)' }}>
-                      <td style={tdStyle}>
-                        <code style={{ fontSize: '0.8em' }}>{e.token_preview}</code>
-                      </td>
-                      <td style={tdStyle}>{e.hostname_hint || '—'}</td>
-                      <td style={tdStyle}>{e.created_at}</td>
-                      <td style={tdStyle}>{e.expires_at}</td>
-                      <td style={tdStyle}>
-                        {used ? (
-                          <span style={{ color: '#10b981' }}>
-                            Used → {e.used_by_agent}
-                          </span>
-                        ) : expired ? (
-                          <span style={{ color: '#f59e0b' }}>Expired</span>
-                        ) : (
-                          <span style={{ color: 'var(--accent-secondary)' }}>Pending</span>
-                        )}
-                      </td>
-                      <td style={tdStyle}>
-                        {!used && (
-                          <button
-                            onClick={() => revokeToken(e.id)}
-                            title="Revoke"
-                            style={{
-                              color: '#ef4444',
-                              display: 'inline-flex',
-                              alignItems: 'center',
-                              gap: '4px',
-                              fontSize: '0.8125rem',
-                              background: 'rgba(239, 68, 68, 0.1)',
-                              padding: '4px 10px',
-                              borderRadius: '6px',
-                            }}
-                          >
-                            <Trash2 size={14} /> Revoke
-                          </button>
-                        )}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
-
-      <div
-        style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
-          gap: '16px',
-        }}
-      >
-        <FeatureCard
-          icon={<ShieldCheck size={20} color="var(--accent-secondary)" />}
-          title="Per-Agent Keys"
-          text="Each endpoint enrolls with a unique key — revoke a single agent without affecting others."
-        />
-        <FeatureCard
-          icon={<KeyRound size={20} color="var(--accent-secondary)" />}
-          title="One-Time Tokens"
-          text="Enrollment tokens burn on first use and expire automatically."
-        />
-        <FeatureCard
-          icon={<AlertCircle size={20} color="var(--accent-secondary)" />}
-          title="Audit Trail"
-          text="Every token issuance and agent registration is logged to audit_logs."
-        />
-      </div>
+        </Modal>
+      )}
     </div>
   );
-};
-
-const OneLinerBlock: React.FC<{
-  label: string;
-  color: string;
-  id: string;
-  text: string;
-  copied: string | null;
-  onCopy: (text: string, id: string) => void;
-}> = ({ label, color, id, text, copied, onCopy }) => (
-  <div>
-    <div
-      style={{
-        display: 'flex',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-        marginBottom: '8px',
-      }}
-    >
-      <span
-        style={{
-          fontSize: '0.75rem',
-          fontWeight: 700,
-          color: 'var(--text-secondary)',
-          textTransform: 'uppercase',
-          letterSpacing: '0.05em',
-        }}
-      >
-        {label}
-      </span>
-      <button
-        onClick={() => onCopy(text, id)}
-        style={{
-          color: 'var(--accent-secondary)',
-          display: 'flex',
-          alignItems: 'center',
-          gap: '6px',
-          fontSize: '0.75rem',
-          fontWeight: 700,
-          background: 'rgba(96, 165, 250, 0.1)',
-          padding: '4px 10px',
-          borderRadius: '6px',
-        }}
-      >
-        {copied === id ? <Check size={14} /> : <Copy size={14} />}
-        {copied === id ? 'Copied' : 'Copy'}
-      </button>
-    </div>
-    <code
-      style={{
-        display: 'block',
-        backgroundColor: '#000',
-        color,
-        padding: '14px',
-        borderRadius: '8px',
-        fontSize: '0.8125rem',
-        overflowX: 'auto',
-        whiteSpace: 'pre',
-        fontFamily: 'Fira Code, monospace',
-      }}
-    >
-      {text}
-    </code>
-  </div>
-);
-
-const FeatureCard: React.FC<{ icon: React.ReactNode; title: string; text: string }> = ({
-  icon,
-  title,
-  text,
-}) => (
-  <div
-    style={{
-      backgroundColor: 'var(--card-bg)',
-      padding: '20px',
-      borderRadius: '12px',
-      border: '1px solid var(--border-color)',
-      display: 'flex',
-      flexDirection: 'column',
-      gap: '10px',
-    }}
-  >
-    <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-      {icon}
-      <h4 style={{ fontSize: '1rem', fontWeight: 600 }}>{title}</h4>
-    </div>
-    <p style={{ fontSize: '0.875rem', color: 'var(--text-secondary)', lineHeight: 1.5 }}>{text}</p>
-  </div>
-);
-
-const inputStyle: React.CSSProperties = {
-  padding: '10px 12px',
-  borderRadius: '8px',
-  border: '1px solid var(--border-color)',
-  backgroundColor: 'var(--bg-color)',
-  color: 'var(--text-primary)',
-  fontSize: '0.875rem',
-};
-
-const thStyle: React.CSSProperties = {
-  padding: '8px 10px',
-  fontSize: '0.75rem',
-  textTransform: 'uppercase',
-  letterSpacing: '0.05em',
-  fontWeight: 700,
-};
-
-const tdStyle: React.CSSProperties = {
-  padding: '10px',
-  verticalAlign: 'middle',
 };
 
 export default Deployment;

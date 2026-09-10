@@ -17,6 +17,7 @@
  * out cannot be made responsive twenty times.
  */
 import React from 'react';
+import { createPortal } from 'react-dom';
 import { AlertTriangle, Inbox, Loader2 } from 'lucide-react';
 
 /* ── Page shell ─────────────────────────────────────────────────────────── */
@@ -318,5 +319,154 @@ export function Cell({
     >
       {children}
     </td>
+  );
+}
+
+/* ── Dialogs ────────────────────────────────────────────────────────────── */
+
+/**
+ * One dialog, not eight.
+ *
+ * The overlay-plus-panel markup was written out eight separate times across
+ * six pages, and had drifted the way independently made decisions do: three
+ * different corner radii, two different overlay opacities, two different
+ * widths, and `zIndex: 100` everywhere except where it was 1000. AdminUsers
+ * alone carried three copies of it, differing only in the fields inside.
+ *
+ * Escape closes it and a click on the backdrop closes it. Neither was true
+ * anywhere before, so the only way out of a dialog was to find the Cancel
+ * button - and the delete confirmations did not have one.
+ *
+ * Rendered through a portal, which is not decoration. `position: fixed` is
+ * resolved against the nearest ancestor that establishes a containing block -
+ * any `transform`, `filter`, `backdrop-filter` or `contain` will do it - so a
+ * dialog written inside a card is positioned against the card rather than the
+ * viewport and comes out half off-screen. AgentDetail hit exactly that and
+ * carries a comment about it; putting the portal here means no page has to
+ * know.
+ */
+export function Modal({
+  title, subtitle, onClose, children, footer, width = 400,
+}: {
+  title: React.ReactNode;
+  subtitle?: React.ReactNode;
+  onClose: () => void;
+  children: React.ReactNode;
+  footer?: React.ReactNode;
+  width?: number;
+}) {
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return createPortal(
+    <div
+      role="presentation"
+      onClick={onClose}
+      style={{
+        position: 'fixed', inset: 0, zIndex: 100,
+        background: 'rgba(0,0,0,0.7)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        padding: 'var(--space-4)',
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        // Without this, every click inside the panel reaches the backdrop
+        // handler and closes the dialog - including the click that puts the
+        // cursor in a text field.
+        onClick={(e) => e.stopPropagation()}
+        className="card"
+        style={{
+          width: '100%', maxWidth: width,
+          maxHeight: 'calc(100vh - var(--space-7))',
+          overflowY: 'auto',
+        }}
+      >
+        <h2 style={{ fontSize: 'var(--text-lg)', fontWeight: 500, margin: 0 }}>
+          {title}
+        </h2>
+        {subtitle && (
+          <p
+            style={{
+              margin: 'var(--space-2) 0 0', color: 'var(--text-secondary)',
+              fontSize: 'var(--text-sm)',
+            }}
+          >
+            {subtitle}
+          </p>
+        )}
+        <div style={{ marginTop: 'var(--space-5)' }}>{children}</div>
+        {footer && (
+          <div
+            style={{
+              display: 'flex', gap: 'var(--space-2)',
+              marginTop: 'var(--space-5)',
+            }}
+          >
+            {footer}
+          </div>
+        )}
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+/** A label above its control, which is the only arrangement used anywhere. */
+export function Field({
+  label, hint, children,
+}: { label: string; hint?: string; children: React.ReactNode }) {
+  return (
+    <label
+      style={{
+        display: 'flex', flexDirection: 'column', gap: 'var(--space-2)',
+        fontSize: 'var(--text-sm)',
+      }}
+    >
+      <span style={{ color: 'var(--text-secondary)' }}>{label}</span>
+      {children}
+      {hint && (
+        <span style={{ color: 'var(--text-muted)', fontSize: 'var(--text-xs)' }}>
+          {hint}
+        </span>
+      )}
+    </label>
+  );
+}
+
+/** The dialog's own buttons. `tone` picks the confirm colour, so a page never
+ *  has to decide which red means delete. */
+export function DialogButton({
+  children, onClick, type = 'button', variant = 'ghost', tone,
+}: {
+  children: React.ReactNode;
+  onClick?: () => void;
+  type?: 'button' | 'submit';
+  variant?: 'ghost' | 'solid';
+  tone?: Tone;
+}) {
+  const accent = tone ? toneColor(tone) : 'var(--accent-secondary)';
+  return (
+    <button
+      type={type}
+      onClick={onClick}
+      style={{
+        flex: 1,
+        padding: 'var(--space-3)',
+        borderRadius: 'var(--radius-md)',
+        fontWeight: 500,
+        fontSize: 'var(--text-sm)',
+        cursor: 'pointer',
+        border: variant === 'solid' ? `1px solid ${accent}` : '1px solid var(--border-color)',
+        background: variant === 'solid' ? accent : 'transparent',
+        color: variant === 'solid' ? '#fff' : 'var(--text-primary)',
+      }}
+    >
+      {children}
+    </button>
   );
 }

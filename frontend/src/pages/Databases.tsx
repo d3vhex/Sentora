@@ -1,42 +1,75 @@
-import React, { useState, useEffect } from 'react';
+/**
+ * Read the databases directly, when the pages built on top of them disagree.
+ *
+ * Both loaders here dropped their errors on the floor - `getDatabases()` had a
+ * `.finally` and no `.catch`, so a failed request left an empty sidebar and an
+ * unhandled rejection in the browser console. On a page whose whole purpose is
+ * "what is actually in there", a list that is empty because the request failed
+ * is worse than no page at all: it answers the question wrongly.
+ *
+ * The two destructive actions were `window.confirm`. They are dialogs now,
+ * which lets them say what is about to happen and to what.
+ */
+import React, { useCallback, useEffect, useState } from 'react';
 import { Database, Table, RefreshCw, AlertTriangle, List, Grid, Trash2 } from 'lucide-react';
 import { adminService } from '../services/api';
+import {
+  PageHeader, Card, DataTable, Row, Cell,
+  EmptyState, ErrorState, LoadingState, Modal, DialogButton,
+} from '../components/ui';
+
+type Column = {
+  name: string; type: string; null: string;
+  key?: string; default?: string; extra?: string;
+};
 
 const Databases: React.FC = () => {
   const [databases, setDatabases] = useState<string[]>([]);
   const [selectedDb, setSelectedDb] = useState('');
   const [tables, setTables] = useState<string[]>([]);
   const [selectedTable, setSelectedTable] = useState('');
-  const [columns, setColumns] = useState<any[]>([]);
-  const [tableData, setTableData] = useState<any[]>([]);
+  const [columns, setColumns] = useState<Column[]>([]);
+  const [tableData, setTableData] = useState<Record<string, unknown>[]>([]);
   const [viewMode, setViewMode] = useState<'tables' | 'columns' | 'data'>('tables');
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [confirmDrop, setConfirmDrop] = useState(false);
+  const [confirmClear, setConfirmClear] = useState<string | null>(null);
 
-  useEffect(() => {
-    fetchDbs();
+  const say = (err: any, fallback: string) =>
+    err?.response?.data?.message || err?.message || fallback;
+
+  const fetchDbs = useCallback(async () => {
+    setLoading(true);
+    try {
+      const list = await adminService.getDatabases();
+      setDatabases(list);
+      setError(null);
+      setSelectedDb((current) => current || list[0] || '');
+    } catch (err) {
+      setError(say(err, 'Could not list databases'));
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
-  const fetchDbs = () => {
-    setLoading(true);
-    adminService.getDatabases()
-      .then(list => {
-        setDatabases(list);
-        if (list.length > 0 && !selectedDb) setSelectedDb(list[0]);
-      })
-      .finally(() => setLoading(false));
-  };
+  useEffect(() => { fetchDbs(); }, [fetchDbs]);
 
   useEffect(() => {
-    if (selectedDb) {
-      setLoading(true);
-      adminService.getDatabaseTables(selectedDb)
-        .then(list => {
-          setTables(list);
-          setSelectedTable('');
-          setViewMode('tables');
-        })
-        .finally(() => setLoading(false));
-    }
+    if (!selectedDb) return;
+    let cancelled = false;
+    setLoading(true);
+    adminService.getDatabaseTables(selectedDb)
+      .then((list) => {
+        if (cancelled) return;
+        setTables(list);
+        setSelectedTable('');
+        setViewMode('tables');
+        setError(null);
+      })
+      .catch((err) => { if (!cancelled) setError(say(err, `Could not list tables in ${selectedDb}`)); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
   }, [selectedDb]);
 
   const handleInspectTable = async (table: string) => {
@@ -45,225 +78,308 @@ const Databases: React.FC = () => {
     try {
       const [cols, data] = await Promise.all([
         adminService.getTableColumns(selectedDb, table),
-        adminService.getTableData(selectedDb, table)
+        adminService.getTableData(selectedDb, table),
       ]);
       setColumns(cols);
       setTableData(data);
       setViewMode('data');
+      setError(null);
     } catch (err) {
-      console.error("Failed to inspect table", err);
+      // Cleared rather than left stale. Showing the previous table's rows under
+      // this table's name is the one outcome worse than showing nothing.
+      setColumns([]);
+      setTableData([]);
+      setError(say(err, `Could not read ${table}`));
     } finally {
       setLoading(false);
     }
   };
 
   const handleDropDb = async () => {
-    if (window.confirm(`Are you absolutely sure you want to DROP the database ${selectedDb}? This cannot be undone.`)) {
-      try {
-        await adminService.dropDatabase(selectedDb);
-        setSelectedDb('');
-        fetchDbs();
-      } catch (err) {
-        alert("Failed to drop database");
-      }
+    setConfirmDrop(false);
+    try {
+      await adminService.dropDatabase(selectedDb);
+      setSelectedDb('');
+      setTables([]);
+      setSelectedTable('');
+      fetchDbs();
+    } catch (err) {
+      setError(say(err, `Could not drop ${selectedDb}`));
     }
   };
 
   const handleClearTable = async (table: string) => {
-    if (window.confirm(`Clear all data from table ${table}?`)) {
-      try {
-        const agent = selectedDb.replace('_db', '');
-        await adminService.clearTable(agent, table);
-        if (selectedTable === table) handleInspectTable(table);
-      } catch (err) {
-        alert("Failed to clear table. Note: Only agent databases support clear currently.");
-      }
+    setConfirmClear(null);
+    try {
+      await adminService.clearTable(selectedDb.replace('_db', ''), table);
+      if (selectedTable === table) handleInspectTable(table);
+    } catch (err) {
+      setError(say(err, `Could not clear ${table}. Only agent databases support clear.`));
     }
+  };
+
+  const sideList = (
+    items: string[],
+    active: string,
+    onPick: (v: string) => void,
+    Icon: typeof Database,
+    emptyText: string,
+  ) => (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+      {items.length === 0 && (
+        <span style={{ color: 'var(--text-muted)', fontSize: 'var(--text-xs)' }}>
+          {emptyText}
+        </span>
+      )}
+      {items.map((item) => {
+        const on = active === item;
+        return (
+          <button
+            key={item}
+            onClick={() => onPick(item)}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 'var(--space-2)',
+              padding: 'var(--space-2)', textAlign: 'left',
+              border: '1px solid transparent',
+              borderRadius: 'var(--radius-md)',
+              fontSize: 'var(--text-sm)',
+              cursor: 'pointer',
+              background: on ? 'var(--bg-color)' : 'transparent',
+              borderColor: on ? 'var(--border-color)' : 'transparent',
+              color: on ? 'var(--text-primary)' : 'var(--text-secondary)',
+            }}
+          >
+            <Icon size={15} />
+            <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {item}
+            </span>
+          </button>
+        );
+      })}
+    </div>
+  );
+
+  const tablesPanel = () => (
+    <div>
+      <EmptyState
+        title={selectedDb}
+        detail={`${tables.length} table${tables.length === 1 ? '' : 's'}. Select one on the left to read its structure and rows.`}
+        icon={<Table size={18} style={{ color: 'var(--text-muted)' }} />}
+      />
+      {selectedDb !== 'userdb' && (
+        <button
+          className="btn-secondary"
+          onClick={() => setConfirmDrop(true)}
+          style={{ marginTop: 'var(--space-4)', color: 'var(--accent-color)' }}
+        >
+          <Trash2 size={15} /> Drop database
+        </button>
+      )}
+    </div>
+  );
+
+  const columnsPanel = () => {
+    if (columns.length === 0) {
+      return <EmptyState title="No columns" detail={`${selectedTable} reported no schema.`} />;
+    }
+    return (
+      <DataTable columns={['Column', 'Type', 'Null', 'Key', 'Default', 'Extra']}>
+        {columns.map((col) => (
+          <Row key={col.name}>
+            <Cell>{col.name}</Cell>
+            <Cell mono>{col.type}</Cell>
+            <Cell>{col.null}</Cell>
+            <Cell>{col.key || '—'}</Cell>
+            <Cell mono>{col.default ?? 'NULL'}</Cell>
+            <Cell>{col.extra || '—'}</Cell>
+          </Row>
+        ))}
+      </DataTable>
+    );
+  };
+
+  const rowsPanel = () => (
+    <div>
+      <div
+        style={{
+          display: 'flex', alignItems: 'center',
+          justifyContent: 'space-between', gap: 'var(--space-3)',
+          marginBottom: 'var(--space-4)',
+        }}
+      >
+        <span style={{ fontSize: 'var(--text-sm)', color: 'var(--text-secondary)' }}>
+          {selectedTable} — first 100 rows
+        </span>
+        <button
+          className="btn-secondary"
+          onClick={() => setConfirmClear(selectedTable)}
+          style={{ color: 'var(--accent-color)' }}
+        >
+          <Trash2 size={14} /> Clear table
+        </button>
+      </div>
+      {tableData.length === 0 ? (
+        <EmptyState
+          title="No rows"
+          detail={`${selectedTable} exists and is empty. If you expected rows, the telemetry health page says where they stopped.`}
+        />
+      ) : (
+        <DataTable columns={columns.map((c) => c.name)}>
+          {tableData.map((row, i) => (
+            <Row key={`row-${i}`}>
+              {columns.map((col) => {
+                const text = row[col.name]?.toString() ?? 'NULL';
+                return (
+                  <Cell key={col.name} mono>
+                    <span
+                      style={{
+                        display: 'inline-block', maxWidth: 300,
+                        overflow: 'hidden', textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap', verticalAlign: 'bottom',
+                      }}
+                      title={text}
+                    >
+                      {text}
+                    </span>
+                  </Cell>
+                );
+              })}
+            </Row>
+          ))}
+        </DataTable>
+      )}
+    </div>
+  );
+
+  /** The main panel, by view mode. It was a four-way nested ternary inside the
+   *  JSX, which is how `viewMode === 'columns'` came to hide a second ternary
+   *  inside itself. */
+  const panel = () => {
+    if (loading) return <LoadingState />;
+    if (!selectedDb) {
+      return (
+        <EmptyState
+          title="No database selected"
+          detail="Pick one on the left to see its tables."
+          icon={<Database size={18} style={{ color: 'var(--text-muted)' }} />}
+        />
+      );
+    }
+    if (viewMode === 'tables') return tablesPanel();
+    if (viewMode === 'columns') return columnsPanel();
+    return rowsPanel();
   };
 
   return (
     <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '32px' }}>
-        <div>
-          <h2 style={{ fontSize: '1.875rem', marginBottom: '8px' }}>Database Explorer</h2>
-          <p style={{ color: 'var(--text-secondary)' }}>Inspect schema, columns, and data across all system databases.</p>
-        </div>
-        <div style={{ display: 'flex', gap: '12px' }}>
-          {selectedTable && (
-            <div style={{ display: 'flex', backgroundColor: 'var(--card-bg)', borderRadius: '8px', border: '1px solid var(--border-color)', padding: '4px' }}>
-              <button 
-                onClick={() => setViewMode('columns')}
-                style={{ padding: '8px 12px', borderRadius: '6px', backgroundColor: viewMode === 'columns' ? 'var(--bg-color)' : 'transparent', color: viewMode === 'columns' ? 'var(--accent-secondary)' : 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.875rem' }}
-              >
-                <List size={16} /> Columns
-              </button>
-              <button 
-                onClick={() => setViewMode('data')}
-                style={{ padding: '8px 12px', borderRadius: '6px', backgroundColor: viewMode === 'data' ? 'var(--bg-color)' : 'transparent', color: viewMode === 'data' ? 'var(--accent-secondary)' : 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.875rem' }}
-              >
-                <Grid size={16} /> Data
-              </button>
-            </div>
-          )}
-          <button onClick={fetchDbs} style={{ backgroundColor: 'rgba(59, 130, 246, 0.1)', color: 'var(--accent-secondary)', padding: '10px 20px', borderRadius: '8px', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px', border: '1px solid rgba(59, 130, 246, 0.2)' }}>
-            <RefreshCw size={18} /> Refresh
-          </button>
-        </div>
-      </div>
-
-      <div style={{ display: 'grid', gridTemplateColumns: '260px 1fr', gap: '32px' }}>
-        {/* Sidebar: DB and Table List */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
-          <div style={{ backgroundColor: 'var(--card-bg)', border: '1px solid var(--border-color)', borderRadius: '12px', padding: '20px' }}>
-            <h3 style={{ fontSize: '0.75rem', fontWeight: 700, color: 'var(--text-secondary)', textTransform: 'uppercase', marginBottom: '16px' }}>Databases</h3>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-              {databases.map(db => (
-                <button 
-                  key={db}
-                  onClick={() => setSelectedDb(db)}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '10px',
-                    padding: '10px',
-                    borderRadius: '8px',
-                    fontSize: '0.875rem',
-                    color: selectedDb === db ? 'var(--text-primary)' : 'var(--text-secondary)',
-                    backgroundColor: selectedDb === db ? 'rgba(255,255,255,0.05)' : 'transparent',
-                    textAlign: 'left'
-                  }}
+      <PageHeader
+        title="Database Explorer"
+        subtitle="Schema, columns and rows as they actually are, for when a page and its data disagree."
+        icon={<Database size={22} />}
+        actions={
+          <>
+            {selectedTable && (
+              <>
+                <button
+                  className={viewMode === 'columns' ? 'btn-primary' : 'btn-secondary'}
+                  onClick={() => setViewMode('columns')}
                 >
-                  <Database size={16} color={selectedDb === db ? 'var(--accent-secondary)' : 'var(--text-secondary)'} />
-                  <span style={{ flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{db}</span>
+                  <List size={15} /> Columns
                 </button>
-              ))}
-            </div>
-          </div>
-
-          <div style={{ backgroundColor: 'var(--card-bg)', border: '1px solid var(--border-color)', borderRadius: '12px', padding: '20px' }}>
-            <h3 style={{ fontSize: '0.75rem', fontWeight: 700, color: 'var(--text-secondary)', textTransform: 'uppercase', marginBottom: '16px' }}>Tables in {selectedDb}</h3>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-              {tables.map(table => (
-                <button 
-                  key={table}
-                  onClick={() => handleInspectTable(table)}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '10px',
-                    padding: '10px',
-                    borderRadius: '8px',
-                    fontSize: '0.875rem',
-                    color: selectedTable === table ? 'var(--text-primary)' : 'var(--text-secondary)',
-                    backgroundColor: selectedTable === table ? 'rgba(255,255,255,0.05)' : 'transparent',
-                    textAlign: 'left'
-                  }}
+                <button
+                  className={viewMode === 'data' ? 'btn-primary' : 'btn-secondary'}
+                  onClick={() => setViewMode('data')}
                 >
-                  <Table size={16} color={selectedTable === table ? 'var(--accent-secondary)' : 'var(--text-secondary)'} />
-                  <span style={{ flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{table}</span>
+                  <Grid size={15} /> Rows
                 </button>
-              ))}
-            </div>
+              </>
+            )}
+            <button className="btn-secondary" onClick={fetchDbs}>
+              <RefreshCw size={15} /> Refresh
+            </button>
+          </>
+        }
+      />
+
+      {error && <ErrorState title="Database request failed" detail={error} />}
+
+      <div
+        style={{
+          display: 'grid', gap: 'var(--space-5)',
+          gridTemplateColumns: 'minmax(200px, 260px) 1fr',
+          alignItems: 'start', marginTop: error ? 'var(--space-5)' : 0,
+        }}
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
+          <Card title="Databases">
+            {loading && databases.length === 0
+              ? <LoadingState label="Listing…" />
+              : sideList(databases, selectedDb, setSelectedDb, Database, 'None returned.')}
+          </Card>
+          <Card title={selectedDb ? `Tables in ${selectedDb}` : 'Tables'}>
+            {sideList(tables, selectedTable, handleInspectTable, Table,
+              selectedDb ? 'This database has no tables.' : 'Pick a database first.')}
+          </Card>
+        </div>
+
+        <Card>{panel()}</Card>
+      </div>
+
+      <div style={{ marginTop: 'var(--space-5)' }}>
+        <ErrorState
+          title="This is live data"
+          detail="Clear and Drop take effect immediately and cannot be undone. Nothing here is a copy."
+        />
+      </div>
+
+      {confirmDrop && (
+        <Modal
+          title={`Drop ${selectedDb}?`}
+          subtitle="Every table in it and everything they hold. This cannot be undone and there is no copy."
+          onClose={() => setConfirmDrop(false)}
+          footer={
+            <>
+              <DialogButton onClick={() => setConfirmDrop(false)}>Cancel</DialogButton>
+              <DialogButton variant="solid" tone="critical" onClick={handleDropDb}>
+                Drop database
+              </DialogButton>
+            </>
+          }
+        >
+          <div style={{ display: 'flex', gap: 'var(--space-3)', alignItems: 'flex-start' }}>
+            <AlertTriangle size={18} style={{ color: 'var(--accent-color)', flexShrink: 0 }} />
+            <p style={{ margin: 0, fontSize: 'var(--text-sm)', color: 'var(--text-secondary)' }}>
+              If this is an agent's database, the agent still believes the server holds
+              what it has already sent, and will not offer those rows again until it
+              notices the reset.
+            </p>
           </div>
-        </div>
+        </Modal>
+      )}
 
-        {/* Main Content Area */}
-        <div style={{ backgroundColor: 'var(--card-bg)', border: '1px solid var(--border-color)', borderRadius: '12px', overflow: 'hidden', minHeight: '600px' }}>
-          {loading ? (
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
-              <RefreshCw size={32} className="animate-spin" style={{ opacity: 0.2 }} />
-            </div>
-          ) : !selectedDb ? (
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-secondary)' }}>
-              <Database size={64} style={{ opacity: 0.1, marginBottom: '24px' }} />
-              <p>Select a database to begin exploration.</p>
-            </div>
-          ) : viewMode === 'tables' ? (
-            <div style={{ padding: '40px', textAlign: 'center' }}>
-              <Table size={48} style={{ opacity: 0.1, marginBottom: '20px', margin: '0 auto' }} />
-              <h3 style={{ fontSize: '1.25rem', marginBottom: '8px' }}>{selectedDb}</h3>
-              <p style={{ color: 'var(--text-secondary)', marginBottom: '32px' }}>This database contains {tables.length} tables. Select a table from the sidebar to view its structure and content.</p>
-              
-              {selectedDb !== 'userdb' && (
-                <button onClick={handleDropDb} style={{ padding: '10px 20px', borderRadius: '8px', border: '1px solid var(--accent-color)', color: 'var(--accent-color)', display: 'flex', alignItems: 'center', gap: '8px', margin: '0 auto', fontSize: '0.875rem', fontWeight: 600 }}>
-                  <Trash2 size={16} /> Drop Database
-                </button>
-              )}
-            </div>
-          ) : viewMode === 'columns' ? (
-            <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.875rem' }}>
-                <thead>
-                  <tr style={{ backgroundColor: 'rgba(255,255,255,0.02)', borderBottom: '1px solid var(--border-color)' }}>
-                    <th style={{ padding: '16px 20px', fontWeight: 600, color: 'var(--text-secondary)' }}>Column Name</th>
-                    <th style={{ padding: '16px 20px', fontWeight: 600, color: 'var(--text-secondary)' }}>Type</th>
-                    <th style={{ padding: '16px 20px', fontWeight: 600, color: 'var(--text-secondary)' }}>Nullable</th>
-                    <th style={{ padding: '16px 20px', fontWeight: 600, color: 'var(--text-secondary)' }}>Key</th>
-                    <th style={{ padding: '16px 20px', fontWeight: 600, color: 'var(--text-secondary)' }}>Default</th>
-                    <th style={{ padding: '16px 20px', fontWeight: 600, color: 'var(--text-secondary)' }}>Extra</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {columns.map((col, i) => (
-                    <tr key={i} style={{ borderBottom: '1px solid var(--border-color)' }}>
-                      <td style={{ padding: '16px 20px', fontWeight: 600 }}>{col.name}</td>
-                      <td style={{ padding: '16px 20px', fontFamily: 'monospace', color: 'var(--accent-secondary)' }}>{col.type}</td>
-                      <td style={{ padding: '16px 20px' }}>{col.null}</td>
-                      <td style={{ padding: '16px 20px' }}>{col.key || '-'}</td>
-                      <td style={{ padding: '16px 20px' }}>{col.default || 'NULL'}</td>
-                      <td style={{ padding: '16px 20px', fontSize: '0.75rem' }}>{col.extra || '-'}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <div>
-              <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border-color)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.01)' }}>
-                <span style={{ fontSize: '0.875rem', fontWeight: 600 }}>Data Preview (Top 100 rows)</span>
-                <button onClick={() => handleClearTable(selectedTable)} style={{ color: 'var(--accent-color)', fontSize: '0.75rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '6px' }}>
-                  <Trash2 size={14} /> Clear Table
-                </button>
-              </div>
-              <div style={{ overflowX: 'auto' }}>
-                <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.8125rem' }}>
-                  <thead>
-                    <tr style={{ backgroundColor: 'rgba(255,255,255,0.02)', borderBottom: '1px solid var(--border-color)' }}>
-                      {columns.map(col => (
-                        <th key={col.name} style={{ padding: '12px 16px', fontWeight: 600, color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>{col.name}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {tableData.map((row, i) => (
-                      <tr key={i} style={{ borderBottom: '1px solid var(--border-color)', transition: 'background-color 0.2s ease' }} onMouseOver={e => e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.01)'} onMouseOut={e => e.currentTarget.style.backgroundColor = 'transparent'}>
-                        {columns.map(col => (
-                          <td key={col.name} style={{ padding: '12px 16px', maxWidth: '300px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                            {row[col.name]?.toString() || 'NULL'}
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
-                    {tableData.length === 0 && (
-                      <tr>
-                        <td colSpan={columns.length} style={{ padding: '60px', textAlign: 'center', color: 'var(--text-secondary)' }}>No data available in this table.</td>
-                      </tr>
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
-
-      <div style={{ marginTop: '32px', padding: '20px', backgroundColor: 'rgba(239, 68, 68, 0.05)', border: '1px solid rgba(239, 68, 68, 0.1)', borderRadius: '12px', display: 'flex', gap: '16px', alignItems: 'center' }}>
-        <AlertTriangle color="var(--accent-color)" />
-        <div>
-          <h4 style={{ fontSize: '0.875rem', fontWeight: 700, color: 'var(--accent-color)' }}>Database Inspector Mode</h4>
-          <p style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>You are viewing live system data. Destructive actions like Clear and Drop are permanent. Use with caution.</p>
-        </div>
-      </div>
+      {confirmClear && (
+        <Modal
+          title={`Clear ${confirmClear}?`}
+          subtitle="Deletes every row. The table itself stays."
+          onClose={() => setConfirmClear(null)}
+          footer={
+            <>
+              <DialogButton onClick={() => setConfirmClear(null)}>Cancel</DialogButton>
+              <DialogButton
+                variant="solid"
+                tone="critical"
+                onClick={() => handleClearTable(confirmClear)}
+              >
+                Clear table
+              </DialogButton>
+            </>
+          }
+        >
+          <p style={{ margin: 0, fontSize: 'var(--text-sm)', color: 'var(--text-secondary)' }}>
+            Only agent databases support this.
+          </p>
+        </Modal>
+      )}
     </div>
   );
 };
