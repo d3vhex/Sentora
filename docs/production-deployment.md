@@ -519,7 +519,100 @@ Agents pin nothing: they verify against the system trust store plus
 `server_ca` if one is set. With a certificate from a public CA, renewal needs
 nothing on the endpoints at all.
 
-### 3.8 Verifying it, rather than assuming it
+### 3.8 Giving the deployment a name
+
+Everything above works with the default `TLS_CN=localhost`, and for a single
+machine that is the whole story. Two things need a real hostname, and both are
+decisions rather than defaults:
+
+- **Operators reaching the console from another machine.** At
+  `https://10.0.0.5:8000` the browser reports a name mismatch *on top of* the
+  untrusted-CA warning — two errors that look like one, and the second is the
+  one people learn to click through.
+- **Security keys.** WebAuthn's relying-party ID must be a domain. Browsers
+  reject an IP address outright, so a console reached at an address is one
+  where a key can never be registered. One-time codes are unaffected. See §6.2.
+
+Nothing else in the platform requires it. Agents are happy with an address.
+
+#### What to change
+
+**1. Pick a name and make it resolve.** It does not have to be public or have
+a public certificate — `sentora.corp.local`, an internal A record, or a
+`hosts` entry on each operator's machine are all fine. It does have to be the
+name people actually type, because that is what the browser signs over.
+
+**2. Set both values in `.env`:**
+
+```ini
+TLS_ENABLED=1
+TLS_CN=sentora.corp.local
+TLS_SAN=sentora.corp.local,10.0.0.5
+```
+
+`TLS_SAN` is comma separated and takes hostnames and addresses alike. An entry
+that parses as an address becomes an **IP SAN**, because a bare address listed
+as a DNS name matches nothing. `localhost`, `127.0.0.1` and `::1` are always
+included, so the machine itself keeps working.
+
+Keep the address in the list. Dropping it breaks the console for anyone still
+using it, and agents enrolled against `https://10.0.0.5` keep verifying that
+name until they are re-enrolled.
+
+**3. Regenerate the material.** This is the step that is easy to miss:
+
+```bash
+docker compose exec app python certs/generate_certs.py --force \
+    --cn sentora.corp.local --san sentora.corp.local,10.0.0.5 \
+    --out /app/data/certs
+docker compose restart app ingest
+```
+
+Generation is idempotent on purpose — a new identity on every restart would
+break every agent that pinned the CA — so **editing `.env` alone changes
+nothing**. The server says so at startup rather than leaving you to find it:
+
+```
+[tls] The certificate at /app/data/certs/server.crt does not cover
+sentora.corp.local - it was generated before those names were configured, and
+TLS material is never regenerated on top of itself. ... run
+`python certs/generate_certs.py --force --cn sentora.corp.local --san ...`
+```
+
+**4. `--force` issues a new CA as well.** Every agent holding the old
+`rootCA.crt` will refuse the new server and stop sending — see §3.7. Either
+distribute the new CA to the endpoints first, or re-enrol them, which does it
+for you. On a small fleet, re-enrolling is less error-prone.
+
+**5. Point the agents at the name**, so the certificate they verify matches
+the host they dialled:
+
+```json
+{ "server_url": "https://sentora.corp.local:8000" }
+```
+
+A re-enrolled agent gets this from the installer. An existing one needs its
+config edited and a restart.
+
+**6. Check it, rather than assume it** (§3.9 has the rest):
+
+```bash
+openssl s_client -connect sentora.corp.local:8000 -servername sentora.corp.local \
+  </dev/null 2>/dev/null | openssl x509 -noout -subject -ext subjectAltName
+```
+
+The SAN must list the name you typed. Then open the console at that name and
+check **My Security** — it reports whether a security key can be registered
+from where the browser is standing, and why not when it cannot.
+
+#### If you skip all of this
+
+Nothing breaks. The console stays on `localhost`, agents keep reporting,
+two-factor keeps working with one-time codes, and the browser keeps warning
+about the CA. The only thing you do not get is a security key, and the console
+says so in place of offering one.
+
+### 3.9 Verifying it, rather than assuming it
 
 Run these after enabling TLS. Every one of them found something the first time.
 
@@ -572,7 +665,7 @@ docker compose logs ingest | grep "in the clear on port"
 the failure this section keeps warning about. Check it there rather than
 inferring health from row counts.
 
-### 3.9 Why not mTLS, and what it would take
+### 3.10 Why not mTLS, and what it would take
 
 Client certificates were considered for agent authentication and deliberately
 not implemented. The reasoning, so it does not have to be reconstructed later:
@@ -734,6 +827,33 @@ at risk.
 | `GET /threat-intel` | Indicator counts and per-feed freshness |
 | `GET /api/ai-insights/all` | AI worker output |
 | `:15672` | RabbitMQ queue depth, throughput, dead letters |
+
+#### Posture findings
+
+`security_audit` carries how each host is *configured*, as opposed to what
+happened on it: UAC off, SMBv1 on, a firewall profile disabled, an unquoted
+service path, SSH permitting root. Read-only — the agent reports, SOAR acts.
+
+These are states, not events, so the table behaves differently from the rest:
+
+- **A finding appears once and stays.** It is deduplicated on the finding
+  itself, not on the row, so a cycle that finds nothing new writes nothing. A
+  row that stops being true is not removed automatically; clear it from the
+  Databases view once the underlying setting is fixed, or the finding
+  reappears only if it recurs.
+- **An empty table is a real answer here.** Unlike the telemetry tables, where
+  empty usually means something is broken, a host with nothing misconfigured
+  produces no rows. The collector logs `[security_audit] N finding(s), M new`
+  every cycle, which is how you tell "nothing wrong" from "not running".
+- **Severity is what an attacker could do with it.** An unquoted service path
+  under `C:\Program Files` is MEDIUM, not HIGH: exploiting it needs write
+  access to a directory only administrators have. Findings that overstate are
+  findings operators stop reading.
+
+The table existed empty for the life of every earlier install — the schema had
+it, ingest accepted it, and no collector was ever written — so a deployment
+upgraded from that state will start seeing rows for the first time. They are
+not new problems; they are the first look.
 
 ### 5.2 Boot-time assertions worth alerting on
 

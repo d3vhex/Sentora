@@ -283,7 +283,7 @@ const AccountSecurity: React.FC = () => {
                   padding: 'var(--space-3)', borderRadius: 'var(--radius-md)',
                   background: 'var(--bg-color)', border: '1px solid var(--border-color)',
                   color: 'var(--text-primary)', fontFamily: 'monospace',
-                  letterSpacing: '0.25em', width: '160px',
+                  letterSpacing: '0.25em', width: '100%', maxWidth: '160px',
                 }}
               />
               <button type="submit" disabled={busy || !code} style={{
@@ -320,7 +320,7 @@ const AccountSecurity: React.FC = () => {
                 style={{
                   padding: 'var(--space-3)', borderRadius: 'var(--radius-md)',
                   background: 'var(--bg-color)', border: '1px solid var(--border-color)',
-                  color: 'var(--text-primary)', width: '220px',
+                  color: 'var(--text-primary)', width: '100%', maxWidth: '220px',
                 }}
               />
               <button type="submit" disabled={busy || !password} style={{
@@ -427,7 +427,7 @@ const AccountSecurity: React.FC = () => {
                 onChange={(e) => setKeyName(e.target.value)}
                 placeholder="Name this key (optional)"
                 maxLength={64}
-                style={{ width: 240 }}
+                style={{ width: '100%', maxWidth: 240 }}
               />
               <button className="btn-primary" onClick={addKey} disabled={keyBusy}>
                 <Usb size={15} /> {keyBusy ? 'Waiting for the key…' : 'Add a security key'}

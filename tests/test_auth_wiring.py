@@ -414,3 +414,103 @@ def test_every_guard_names_a_permission_that_exists():
         f"these guards name permissions that db/init_userdb.sql never "
         f"creates, so the routes behind them are unreachable: {invented}"
     )
+
+
+# --------------------------------------------------------------------------
+# Two lists that look like the same decision and are not
+# --------------------------------------------------------------------------
+
+def _route_paths(fn: ast.AST) -> list[str]:
+    """The URL(s) a handler is mounted at, from its decorators."""
+    paths = []
+    for dec in getattr(fn, "decorator_list", []):
+        if not isinstance(dec, ast.Call):
+            continue
+        target = dec.func
+        name = getattr(target, "attr", None)
+        if name not in ROUTE_DECORATORS:
+            continue
+        for arg in dec.args:
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                paths.append(arg.value)
+    return paths
+
+
+def test_every_login_ceremony_route_is_reachable_without_a_session(tree):
+    """A route that authenticates with a pending token must be public.
+
+    The rule is derivable rather than a list to maintain: a handler that looks
+    up `totp_pending` and never asks for a user id is, by construction, the
+    second half of a login. There is no session yet — that is the point — so
+    the session middleware must not reject it before the handler runs.
+
+    `webauthn_login_begin` and `webauthn_login_finish` were added to
+    `_SESSION_ONLY` in this file and not to `_PUBLIC_EXACT_PATHS` in app.py.
+    The two read as the same decision and are not: this file's list says "no
+    permission check is expected here", app.py's says "the middleware must let
+    it through". So both handlers answered 401 without running, and the
+    console showed "Authentication required" on the login page — where the
+    operator is, necessarily, not authenticated yet.
+
+    Every test written for those routes passed. None of them made a request.
+
+    The first version of this check read `_PUBLIC_EXACT_PATHS` and went green
+    while the routes still 401ed, because that is not the gate either: it is a
+    path-shaped mirror consulted only when the router cannot resolve a
+    handler. `authenticate` matches on handler *name* against
+    `_PUBLIC_HANDLERS`. So the check is on the primary list, and the mirror is
+    verified separately below.
+    """
+    public = _literal_set(tree, "_PUBLIC_HANDLERS")
+
+    unreachable = sorted(
+        name for name, (_names, fn) in _route_functions(tree).items()
+        if "hash_pending" in ast.unparse(fn)
+        and "current_user_id" not in ast.unparse(fn)
+        and name not in public
+    )
+    assert not unreachable, (
+        "these finish a login with a pending token and are not in "
+        "_PUBLIC_HANDLERS, so `authenticate` answers 401 before the handler "
+        f"runs: {unreachable}"
+    )
+
+
+def test_the_backstop_mirrors_the_handler_list_for_the_login_ceremony(tree):
+    """`_PUBLIC_EXACT_PATHS` calls itself a mirror of `_PUBLIC_HANDLERS`.
+
+    A mirror that has drifted is worse than no mirror: it is consulted exactly
+    when the primary list could not be used, which is the moment nobody is
+    watching. Checked for the login routes specifically, since the path list is
+    deliberately narrower than the handler list everywhere else.
+    """
+    paths = _literal_set(tree, "_PUBLIC_EXACT_PATHS")
+    handlers = _literal_set(tree, "_PUBLIC_HANDLERS")
+
+    missing = []
+    for name, (_names, fn) in _route_functions(tree).items():
+        if "hash_pending" not in ast.unparse(fn):
+            continue
+        if "current_user_id" in ast.unparse(fn):
+            continue
+        if name not in handlers:
+            continue                      # the check above owns that failure
+        for path in _route_paths(fn):
+            if path not in paths:
+                missing.append(f"{name} at {path}")
+
+    assert not missing, (
+        f"public by handler name and absent from the path backstop: {missing}. "
+        f"If the router ever fails to resolve one of these, the login page "
+        f"stops working with no way to see why."
+    )
+
+
+def test_the_pending_token_scan_matches_something(tree):
+    """Guard against the check above passing because it found no routes."""
+    matched = [name for name, (_n, fn) in _route_functions(tree).items()
+               if "hash_pending" in ast.unparse(fn)
+               and "current_user_id" not in ast.unparse(fn)]
+    assert len(matched) >= 3, (
+        f"only {matched} look like login-ceremony routes; the scan is broken"
+    )

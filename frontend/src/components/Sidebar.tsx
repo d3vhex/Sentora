@@ -1,10 +1,20 @@
 import React, { useState } from 'react';
 import { NavLink, Link } from 'react-router-dom';
-import { Activity, BrainCircuit, ChevronRight, ClipboardList, Database, Download, Grid3x3, Key, LayoutDashboard, LogOut, Monitor, PlaySquare, Radar, Save, Search, Settings, ShieldAlert, ShieldCheck, Users, X, Zap } from 'lucide-react';
+import { Activity, BrainCircuit, ChevronRight, ClipboardList, Database, Download, Grid3x3, Key, LayoutDashboard, LogOut, Monitor, PlaySquare, Radar, Search, Settings, ShieldAlert, ShieldCheck, Users, Zap } from 'lucide-react';
 import { authService } from '../services/api';
+import { Modal, Field, DialogButton } from './ui';
 
 interface SidebarProps {
   isOpen: boolean;
+  /** Passed down rather than measured here.
+   *
+   * These styles used to call `window.innerWidth` directly, which is read once
+   * while React renders - so the sidebar only changed shape when something
+   * else happened to re-render it. It worked by accident, because `Layout`
+   * owns the resize listener and re-renders this on every change; the moment
+   * that stopped being true the sidebar would have been fixed-positioned on a
+   * desktop with nothing to explain it. Layout already knows, so it says. */
+  isMobile: boolean;
 }
 
 const SidebarLink: React.FC<{ to: string, icon: React.ReactNode, label: string }> = ({ to, icon, label }) => {
@@ -34,7 +44,7 @@ const SidebarLink: React.FC<{ to: string, icon: React.ReactNode, label: string }
   );
 };
 
-const Sidebar: React.FC<SidebarProps> = ({ isOpen }) => {
+const Sidebar: React.FC<SidebarProps> = ({ isOpen, isMobile }) => {
   const user = authService.getUser();
   const [showPasswordModal, setShowPasswordModal] = useState(false);
 
@@ -93,7 +103,7 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen }) => {
       display: 'flex',
       flexDirection: 'column',
       height: '100vh',
-      position: window.innerWidth <= 1024 ? 'fixed' : 'sticky',
+      position: isMobile ? 'fixed' : 'sticky',
       top: 0,
       left: 0,
       flexShrink: 0,
@@ -101,7 +111,7 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen }) => {
       overflow: 'hidden',
       zIndex: 999,
       boxShadow: isOpen ? '4px 0 24px rgba(0,0,0,0.2)' : 'none',
-      visibility: isOpen || window.innerWidth > 1024 ? 'visible' : 'hidden'
+      visibility: isOpen || !isMobile ? 'visible' : 'hidden'
     }}>
       <div style={{ 
         padding: '24px', 
@@ -253,54 +263,48 @@ const Sidebar: React.FC<SidebarProps> = ({ isOpen }) => {
     </aside>
 
     {showPasswordModal && (
-      <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.85)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 2000, padding: '20px' }}>
-        <div style={{ backgroundColor: 'var(--card-bg)', width: '100%', maxWidth: '400px', borderRadius: '16px', border: '1px solid var(--border-color)', padding: '32px' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' }}>
-            <h3 style={{ fontSize: '1.25rem' }}>Change Password</h3>
-            <button onClick={() => setShowPasswordModal(false)} style={{ color: 'var(--text-secondary)' }}><X size={24} /></button>
+      <Modal
+        title="Change password"
+        onClose={() => setShowPasswordModal(false)}
+      >
+        <form
+          onSubmit={handleChangePassword}
+          style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}
+        >
+          <Field label="Current password">
+            <input
+              type="password"
+              autoComplete="current-password"
+              value={passwordData.current_password}
+              onChange={e => setPasswordData({ ...passwordData, current_password: e.target.value })}
+              required
+              autoFocus
+            />
+          </Field>
+          <Field label="New password">
+            <input
+              type="password"
+              autoComplete="new-password"
+              value={passwordData.new_password}
+              onChange={e => setPasswordData({ ...passwordData, new_password: e.target.value })}
+              required
+            />
+          </Field>
+          <Field label="Confirm new password">
+            <input
+              type="password"
+              autoComplete="new-password"
+              value={passwordData.confirm_password}
+              onChange={e => setPasswordData({ ...passwordData, confirm_password: e.target.value })}
+              required
+            />
+          </Field>
+          <div style={{ display: 'flex', gap: 'var(--space-2)' }}>
+            <DialogButton onClick={() => setShowPasswordModal(false)}>Cancel</DialogButton>
+            <DialogButton type="submit" variant="solid">Update</DialogButton>
           </div>
-          
-          <form onSubmit={handleChangePassword} style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-              <label style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>Current Password</label>
-              <input 
-                type="password" 
-                value={passwordData.current_password} 
-                onChange={e => setPasswordData({...passwordData, current_password: e.target.value})} 
-                required 
-                style={{ backgroundColor: 'var(--bg-color)', border: '1px solid var(--border-color)', padding: '12px', borderRadius: '8px', color: 'white' }} 
-              />
-            </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-              <label style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>New Password</label>
-              <input 
-                type="password" 
-                value={passwordData.new_password} 
-                onChange={e => setPasswordData({...passwordData, new_password: e.target.value})} 
-                required 
-                style={{ backgroundColor: 'var(--bg-color)', border: '1px solid var(--border-color)', padding: '12px', borderRadius: '8px', color: 'white' }} 
-              />
-            </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-              <label style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>Confirm New Password</label>
-              <input 
-                type="password" 
-                value={passwordData.confirm_password} 
-                onChange={e => setPasswordData({...passwordData, confirm_password: e.target.value})} 
-                required 
-                style={{ backgroundColor: 'var(--bg-color)', border: '1px solid var(--border-color)', padding: '12px', borderRadius: '8px', color: 'white' }} 
-              />
-            </div>
-
-            <div style={{ display: 'flex', gap: '12px', marginTop: '12px' }}>
-              <button type="button" onClick={() => setShowPasswordModal(false)} style={{ flex: 1, padding: '14px', borderRadius: '8px', border: '1px solid var(--border-color)', color: 'white' }}>Cancel</button>
-              <button type="submit" style={{ flex: 1, padding: '14px', borderRadius: '8px', backgroundColor: 'var(--accent-secondary)', color: 'white', fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}>
-                <Save size={18} /> Update
-              </button>
-            </div>
-          </form>
-        </div>
-      </div>
+        </form>
+      </Modal>
     )}
     </>
   );

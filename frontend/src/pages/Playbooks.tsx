@@ -491,12 +491,7 @@ const Playbooks: React.FC = () => {
         </p>
       )}
 
-      <div
-        style={{
-          display: 'grid', gap: 'var(--space-5)', alignItems: 'start',
-          gridTemplateColumns: 'minmax(0, 1.6fr) minmax(280px, 1fr)',
-        }}
-      >
+      <div className="split-grid">
         <Card title="Playbooks">{playbookList()}</Card>
         <Card title="Recent runs">{runList()}</Card>
       </div>

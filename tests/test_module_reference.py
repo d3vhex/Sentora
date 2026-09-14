@@ -168,11 +168,32 @@ def test_the_document_is_text():
     assert bytes([0]) not in raw, "MODULES.md contains a NUL byte; grep will treat it as binary"
 
 
-def test_security_audit_is_not_claimed_as_an_output():
-    """Three modules were documented as writing it and none ever did. The
-    table exists so a collector can be added without a schema change; until
-    one is, claiming it is what made an empty tab read as a broken sensor."""
-    assert "security_audit" not in _documented_tables(), (
-        "a module claims security_audit as an output again — check that "
-        "something actually writes it, and add it back to TABLES in main.py"
-    )
+def test_a_claimed_output_has_a_writer_and_is_shipped():
+    """The rule the `security_audit` history produced, generalised.
+
+    That table was claimed as an output by three modules for the life of the
+    product and written by none of them, so it shipped empty and the console
+    showed it as NOT COLLECTED — a sensor that reads as broken rather than as
+    absent. It has a collector now, so "never claim it" is the wrong
+    invariant; this is the right one.
+
+    Both halves, because either alone is satisfiable while the table stays
+    empty: a writer that is never scheduled produces nothing, and a table
+    absent from `TABLES` never leaves the host.
+    """
+    import re
+
+    claimed = _documented_tables()
+    if "security_audit" not in claimed:
+        pytest.skip("security_audit is no longer documented as an output")
+
+    module = (AGENT / "modules" / "security_audit.py")
+    assert module.exists(), "documented as an output with no module behind it"
+
+    main = (AGENT / "main.py").read_text(encoding="utf-8")
+    assert re.search(r"args=\(security_audit_main,\s*\d+", main), \
+        "the collector exists and nothing runs it"
+
+    block = re.search(r"^TABLES = \[(.*?)^\]", main, re.S | re.M)
+    assert block and "'security_audit'" in block.group(1), \
+        "written locally and never shipped"

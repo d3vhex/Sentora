@@ -139,7 +139,8 @@ const Assets: React.FC = () => {
                                 padding: '12px 16px 12px 48px', 
                                 borderRadius: '12px', 
                                 color: 'white',
-                                width: '300px',
+                                width: '100%',
+                                maxWidth: '300px',
                                 fontSize: '0.9rem',
                                 transition: 'all 0.3s ease',
                                 outline: 'none'
@@ -155,7 +156,7 @@ const Assets: React.FC = () => {
                 </div>
             </div>
 
-            <div style={{ display: 'grid', gridTemplateColumns: '300px 1fr', gap: '32px' }}>
+            <div className="split-grid split-grid--aside-first">
                 {/* Agents Sidebar */}
                 <div style={{ background: 'var(--card-bg)', borderRadius: '20px', border: '1px solid var(--border-color)', overflow: 'hidden', height: 'fit-content' }}>
                     <div style={{ padding: '20px', borderBottom: '1px solid var(--border-color)', backgroundColor: 'rgba(255,255,255,0.02)' }}>

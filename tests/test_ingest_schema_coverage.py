@@ -128,11 +128,13 @@ AGENT_LOCAL_ONLY = {
     "automations":
         "A work queue the server pushes down and the agent updates in place. "
         "It travels the other way, through /automations/report.",
-    "security_audit":
-        "No collector was ever written for it. The table is kept so one can "
-        "be added without a schema change; the claim that this agent reports "
-        "it is not - see the note on TABLES in main.py.",
 }
+
+# `security_audit` was here, excused because nothing wrote to it. It has a
+# collector now (`modules/security_audit.py`) and is on `TABLES`, so the
+# excuse is gone - and `test_an_excuse_is_not_kept_for_a_table_that_ships`
+# below is what makes leaving it behind a failure rather than a contradiction
+# nobody notices.
 
 
 def test_the_agent_ships_every_table_it_collects():
@@ -169,6 +171,27 @@ def test_nothing_is_excused_from_shipping_that_no_longer_exists():
     """The excuse list rots the same way any list does."""
     stale = sorted(AGENT_LOCAL_ONLY.keys() - _schema_tables(AGENT_SCHEMA))
     assert not stale, f"AGENT_LOCAL_ONLY names tables the schema dropped: {stale}"
+
+
+def test_an_excuse_is_not_kept_for_a_table_that_ships():
+    """The other way the list rots, and the way that hides a contradiction.
+
+    `security_audit` sat on both lists for a while: excused here as "nothing
+    writes to it", and named in `TABLES` as something the agent reports. The
+    coverage test subtracts this list before checking, so neither side
+    complained - the excuse simply suppressed the check for a table that was
+    being shipped.
+    """
+    main = (ROOT / "Sentora" / "main.py").read_text(encoding="utf-8")
+    block = re.search(r"^TABLES = \[(.*?)^\]", main, re.S | re.M)
+    assert block, "TABLES is no longer a list literal"
+    shipped = set(re.findall(r"['\"]([a-z_]+)['\"]", block.group(1)))
+
+    both = sorted(shipped & AGENT_LOCAL_ONLY.keys())
+    assert not both, (
+        f"{both} are on TABLES and also excused as local-only. Remove the "
+        f"excuse - it silences the coverage check for a table that ships."
+    )
 
 
 def test_an_unshipped_table_cannot_grow_for_ever():

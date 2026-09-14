@@ -102,10 +102,19 @@ map.
 - Behavior:
   - `info_collector` produces the package list (same logic as
     `inventory` but emitting the OSV input format) into `packages`.
-  - `find_vuln` queries `https://api.osv.dev` (or the server-proxied
-    air-gap mirror) for known vulnerabilities and writes
-    `vulnerabilities_report` rows.
-- Output tables: `packages`, `vulnerabilities_report`
+    This is the only half that runs.
+  - `find_vuln` queries OSV directly and writes `vulnerabilities_report`.
+    **It is not scheduled and has not been for some time** — the lookup
+    moved to the server (`app.periodic_vuln_scan` → `scanners/vuln.py`),
+    so endpoints do not each spend five minutes of CPU on it and do not
+    each make outbound calls to a third party. The module is kept for
+    standalone use; nothing in `main.py` calls it.
+- Output table: `packages`. `vulnerabilities_report` is written by the
+  server against the packages this agent ships, not by the agent.
+- On Windows the server reports that scan as **skipped**, not as clean:
+  the package list is registry `Uninstall` display names and OSV has no
+  ecosystem for those. See `scan_agent` — it used to query them as NuGet
+  package names, which could never match.
 
 ---
 
@@ -139,12 +148,47 @@ map.
   `lateral_movement` above.
 
 > All three modules in this section, plus `edr_enforcer` above, were
-> documented as writing `security_audit`. None of them ever did — nothing in
-> this agent has written a row to that table. The schema created it, `TABLES`
-> shipped it empty every cycle, and the console showed it as NOT COLLECTED for
-> the life of every install, which reads as a sensor that broke rather than one
-> that was never built. It is off the shipping list; the table stays so a
-> collector can be added later without a schema change.
+> documented as writing `security_audit` and none of them ever did — nothing
+> in the agent had written a row to that table. The schema created it,
+> `TABLES` shipped it empty every cycle, and the console showed it as NOT
+> COLLECTED for the life of every install, which reads as a sensor that broke
+> rather than one that was never built. `security_audit` below is the
+> collector that now fills it.
+
+### `security_audit`
+- Path: `modules/security_audit.py`
+- Platforms: Windows (registry, services, local accounts, firewall profiles)
+  / Linux (`sshd_config`, sudoers, `/etc/passwd`, file modes)
+- Behavior: Hourly posture read. Reports **states**, not events — "the Guest
+  account is enabled" is true until somebody changes it, not something that
+  happened at 14:03. Read-only throughout; this module reports and `soar`
+  acts.
+- Output table: `security_audit` (enc) for `finding` and `details`
+- Three things decide the design, and each one was a bug before it was a rule:
+  - **Deduplication is on the finding, not the row.** `dup_fp` covers
+    `category` and `finding` and deliberately not `details`, because details
+    drift ("2 members: Administrator, pc") and a fingerprint over them
+    re-inserts the same finding whenever one changes. Without it, one
+    misconfiguration becomes one row per cycle for ever — the same failure
+    `send_alert` met, where a normal loopback SMB connection produced the
+    identical alert 288 times a day.
+  - **An absent registry value is the default, not an unknown.**
+    `DisableRealtimeMonitoring`, `AutoAdminLogon`, `UseLogonCredential` and
+    `SMB1` do not exist on a correctly configured machine. Reporting "could
+    not determine" for each gives four findings on a host with nothing wrong
+    with it.
+  - **Severity is what an attacker could do, not how alarming it sounds.** An
+    unquoted service path under `C:\Program Files` is MEDIUM, because
+    exploiting it needs write access to a directory that is admin-only on a
+    default install. The first run of the writable-directory check reported
+    `WinDefend` and `MDCoreSvc` as CRITICAL persistence — Defender's own
+    services, which live under `C:\ProgramData` — and a finding that accuses
+    the anti-malware service is enough for an operator to stop reading the
+    category.
+- The group membership check queries by SID (`S-1-5-32-544`), not by name:
+  the group is `Administrators` in English and `Yöneticiler` on a Turkish
+  install, and matching the name is a check that silently finds nothing on a
+  localised Windows.
 
 ### `check_permissions`
 - Path: `modules/check_permissions/check_permissions.py`
