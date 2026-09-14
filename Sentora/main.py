@@ -464,6 +464,22 @@ if _HOSTNAME:
 if _MAC_ADDRESS:
     OS_INFO = f"{OS_INFO}|MAC={_MAC_ADDRESS}"
 
+def _os_info_for_log() -> str:
+    """`OS_INFO` without the MAC address.
+
+    The full string is `platform.platform()` with `|HOST=` and `|MAC=`
+    appended, and the server needs all of it - that is how a reinstalled agent
+    is recognised as the same machine. The log does not.
+
+    The hostname is unremarkable in a file that lives on that host. The MAC is
+    the part with a life outside it: a stable hardware identifier that follows
+    the machine across networks and reinstalls, sitting in a plain-text file
+    that support bundles and screenshots routinely include.
+    """
+    return OS_INFO.split("|MAC=")[0]
+
+
+
 TABLES = [
     'critical_files',
     'portscan_result',
@@ -687,6 +703,13 @@ def _ingest_socket():
         if not INGEST_TLS:
             return raw
         context = ssl.create_default_context(cafile=INGEST_CA or None)
+        # Stated rather than inherited. `create_default_context` has set this
+        # floor since Python 3.10, so on the interpreter this agent is frozen
+        # against it changes nothing today - and that is exactly why it is
+        # worth writing down: the guarantee currently depends on which Python
+        # the build machine had, and the connection it protects is every byte
+        # of telemetry this endpoint produces.
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         return context.wrap_socket(raw, server_hostname=SERVER_HOSTNAME or SERVER_IP)
     except Exception:
         raw.close()
@@ -2546,7 +2569,7 @@ def main():
 
     # Once, here, rather than on every table send. This is the banner that
     # used to be repeated thousands of times a day in agent.log.
-    print(f"[*] Host: {OS_INFO}")
+    print(f"[*] Host: {_os_info_for_log()}")
 
     args = _parse_args()
 
@@ -2620,7 +2643,7 @@ def main():
     print(f"[*] Automations Mode: {AUTOMATIONS_MODE} "
           f"({'server' if (AUTOMATIONS_MODE == 'server' or (AUTOMATIONS_MODE == 'auto' and AUTOMATIONS_API_URL)) else 'db'})")
     print(f"[*] Public IP (auto-detected): {get_public_ip()}")
-    print(f"[*] OS Info: {OS_INFO}")
+    print(f"[*] OS Info: {_os_info_for_log()}")
     print("[*] Starting agent...")
 
     time.sleep(2)

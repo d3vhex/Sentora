@@ -17,9 +17,13 @@ Order of operations, and why:
   3. reconnect from scratch with the new one  (proves the change took)
   4. only then write .env
 
-If step 3 or 4 fails after the ALTER has landed, the new password is printed
-so the deployment is recoverable by hand. That is the one case where printing
-a secret to the terminal beats losing access to the database.
+If step 3 or 4 fails after the ALTER has landed, the new password is written to
+`.db_password_rescue` beside `.env`, owner-readable only, and the path is
+printed. The account has already changed at that point, so a password nobody
+has is a database nobody can reach - but the recovery does not need the secret
+in terminal scrollback, a CI job log or the screenshot somebody takes of the
+failure. Printing it is kept for the one case left: the rescue file itself
+cannot be written.
 
 Connects to the *published* port, not DB_HOST: `db` only resolves inside the
 compose network, while the host sees 127.0.0.1:3307.
@@ -28,6 +32,7 @@ compose network, while the host sees 127.0.0.1:3307.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import secrets
 import sys
@@ -53,6 +58,20 @@ def read_env(path: Path) -> dict[str, str]:
     return values
 
 
+def _owner_only(path: Path) -> None:
+    """Restrict a file to its owner where the platform supports it.
+
+    Best effort. On Windows the POSIX mode is largely cosmetic and the real
+    control is the ACL, so a failure here must not stop a rotation that has
+    already altered the account - the same reasoning as `certs/generate_certs`
+    applies to its private keys.
+    """
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def write_env_value(path: Path, key: str, value: str) -> None:
     lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
@@ -68,6 +87,12 @@ def write_env_value(path: Path, key: str, value: str) -> None:
         lines.append(f"{key}={value}\n")
 
     path.write_text("".join(lines), encoding="utf-8")
+    # `.env` holds this password in clear text by design - it is how every
+    # service in the stack is configured, and there is no version of this
+    # product where it does not. What is not by design is the file being
+    # world-readable, which is the half of "clear-text storage" that can
+    # actually be addressed.
+    _owner_only(path)
 
 
 def main() -> int:
@@ -139,11 +164,36 @@ def main() -> int:
 
     except Exception as e:
         if altered:
+            # Written to a file, not printed.
+            #
+            # The recovery has to exist: the account has already been altered,
+            # so a password nobody has is a database nobody can reach. What
+            # does not have to happen is the secret landing in terminal
+            # scrollback, a CI job log, a `script` capture or the screenshot
+            # somebody takes of the failure to ask about it. A file the owner
+            # alone can read gives the same recovery with none of that.
+            rescue = ENV_PATH.with_name(".db_password_rescue")
+            try:
+                rescue.write_text(f"DB_PASSWORD={new_password}\n", encoding="utf-8")
+                _owner_only(rescue)
+                where = str(rescue)
+            except OSError as write_error:
+                # If it cannot be written, printing beats losing the database -
+                # which is the trade the original made unconditionally.
+                print("\n" + "=" * 68)
+                print("[!] The password WAS changed, the step after it failed, "
+                      f"and the rescue file could not be written ({write_error}).")
+                print(f"    {e}")
+                print("\n    This is the only copy. Save it now:")
+                print(f"      DB_PASSWORD={new_password}")  # nosec - see above
+                print("=" * 68)
+                return 1
+
             print("\n" + "=" * 68)
             print("[!] The password WAS changed, but the step after it failed:")
             print(f"    {e}")
-            print("\n    Save this now — .env may not have been updated:")
-            print(f"      DB_PASSWORD={new_password}")
+            print(f"\n    The new password is in {where} (owner-readable only).")
+            print("    Put it in .env under DB_PASSWORD, then delete that file.")
             print("=" * 68)
         else:
             print(f"[!] Failed before altering anything, password unchanged: {e}")

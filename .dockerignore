@@ -49,3 +49,4 @@ SECURITY.md
 .idea/
 .vscode/
 *.exe
+.db_password_rescue

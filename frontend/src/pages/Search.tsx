@@ -20,6 +20,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Search as SearchIcon, Plus, X, ChevronLeft, ChevronRight } from 'lucide-react';
 import api from '../services/api';
+import { toQuery, type Filter } from '../lib/luceneQuery';
 import {
   PageHeader, Card, Badge, DataTable, Row, Cell,
   EmptyState, ErrorState, LoadingState, Tone,
@@ -27,7 +28,6 @@ import {
 
 type Tab = 'logs' | 'events';
 
-type Filter = { field: string; op: ':' | '!='; value: string };
 
 const RANGES = [
   { label: '1h', from: 'now-1h' },
@@ -41,17 +41,14 @@ const SEVERITY_TONE: Record<string, Tone> = {
   low: 'low', info: 'info',
 };
 
-/** Filters -> the Lucene the server runs. The one place the two agree. */
-function toQuery(filters: Filter[]): string {
-  return filters
-    .filter((f) => f.field && f.value)
-    .map((f) => {
-      const value = /[\s"]/.test(f.value) ? `"${f.value.replace(/"/g, '\\"')}"`
-                                          : f.value;
-      return f.op === ':' ? `${f.field}:${value}` : `NOT ${f.field}:${value}`;
-    })
-    .join(' AND ');
-}
+/* `toQuery` now lives in `lib/luceneQuery.ts`, with tests.
+ *
+ * It was wrong in two ways that only show up on real values: it escaped the
+ * quote but not the backslash, so a Windows path ran off the end of its own
+ * phrase, and it only quoted when the value held whitespace or a quote, so
+ * `a)OR(b` went in bare and changed the structure of the query rather than
+ * the term. Both are fidelity bugs — the box beside the builder is editable
+ * by design, so there was never a boundary here to cross. */
 
 export default function Search() {
   const [tab, setTab] = useState<Tab>('logs');

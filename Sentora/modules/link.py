@@ -239,6 +239,14 @@ class AgentLinkClient:
                 context = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
                 context.check_hostname = False
                 context.verify_mode = _ssl.CERT_NONE
+                # Not to protect this handshake - nothing is sent over it, and
+                # verification is off two lines above. It bounds what the
+                # message below is allowed to claim: a server that only speaks
+                # TLS 1.0 should not produce "this is serving TLS, switch to
+                # https://", because switching would be to something worse than
+                # what the agent has now. The probe answering "no" there is the
+                # right answer.
+                context.minimum_version = _ssl.TLSVersion.TLSv1_2
                 with context.wrap_socket(raw, server_hostname=host):
                     pass
         except Exception:

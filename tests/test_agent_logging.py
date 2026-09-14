@@ -62,7 +62,31 @@ def test_the_host_banner_is_not_repeated_per_send():
     """4376 copies of the same constant string in thirteen hours."""
     text = MAIN.read_text(encoding="utf-8")
     assert 'sent (IP: {public_ip}, OS: {OS_INFO})' not in text
-    assert '[*] Host: {OS_INFO}' in text, "the banner is no longer logged at all"
+    # Matched on the banner rather than on the exact interpolation. The MAC
+    # address was later dropped from what is printed - it is still in
+    # `OS_INFO` because the server handshake needs it - and pinning the old
+    # expression made that edit look like the banner had been removed.
+    assert '[*] Host: ' in text, "the banner is no longer logged at all"
+    assert text.count('[*] Host: ') == 1, "the banner is logged more than once"
+
+
+def test_the_banner_does_not_carry_the_mac_address():
+    """`OS_INFO` is `platform.platform()` plus `|HOST=` and `|MAC=`.
+
+    The server needs all of it — that is how a reinstalled agent is recognised
+    as the same machine. The log does not. The hostname is unremarkable in a
+    file that lives on that host; the MAC is a stable hardware identifier that
+    follows the machine across networks and reinstalls, sitting in a plain-text
+    file that support bundles and screenshots routinely include.
+    """
+    text = MAIN.read_text(encoding="utf-8")
+    assert "_os_info_for_log" in text
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("print(") and "OS_INFO" in stripped:
+            assert "_os_info_for_log" in stripped, (
+                f"prints the full OS_INFO, including the MAC: {stripped}"
+            )
 
 
 def test_soar_does_not_draw_rules_around_every_cycle():
