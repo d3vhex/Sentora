@@ -562,7 +562,28 @@ async def scan_agent(agent: str, fernet_key: str | bytes, connect_db_for_agent: 
     if not ecosystem or ecosystem == "ARCH":
         return {"agent": agent, "ecosystem": ecosystem, "packages": len(pkgs), "hits": 0, "inserted": 0, "skipped_reason": "unsupported_ecosystem"}
 
-    query_eco = ecosystem if ecosystem != "Windows" else "NuGet"
+    if ecosystem == "Windows":
+        # Skipped, and said so, rather than queried against an ecosystem it
+        # cannot match.
+        #
+        # This used to map Windows to `NuGet`. The package list for a Windows
+        # agent comes from walking the registry's `Uninstall` keys, so the
+        # names are display names - "Google Chrome", "Microsoft Visual C++
+        # 2015-2022 Redistributable (x64)". NuGet is .NET libraries:
+        # `Newtonsoft.Json`, `System.Text.Json`. The two name spaces do not
+        # overlap, and OSV has no ecosystem for "programs installed on
+        # Windows" at all.
+        #
+        # So the query could never match, and every cycle reported
+        # `new_findings=0` - which on a security console reads as "this host
+        # has no known vulnerabilities". It is not a clean result; it is no
+        # result, and the difference is the whole point. A coincidental match
+        # against a real NuGet package would have been worse than none.
+        return {"agent": agent, "ecosystem": ecosystem, "packages": len(pkgs),
+                "hits": 0, "inserted": 0,
+                "skipped_reason": "windows_inventory_has_no_osv_ecosystem"}
+
+    query_eco = ecosystem
 
     triples = _build_triplets(pkgs, ecosystem)
     if not triples:

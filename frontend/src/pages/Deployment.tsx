@@ -246,14 +246,19 @@ const Deployment: React.FC = () => {
             </p>
           </div>
 
-          <div className="responsive-grid" style={{ alignItems: 'end' }}>
+          {/* The button was a fourth grid cell with `alignItems: 'end'`, which
+              lines every item up by its bottom edge — and two of these fields
+              carry a hint under the input while the third does not, so the
+              three inputs sat at three different heights and the button at a
+              fourth. It is an action, not a field; it belongs after them. */}
+          <div className="responsive-grid">
             <Field label="Hostname hint" hint="Optional. Which machine you mean this for.">
               <input value={hostnameHint} onChange={(e) => setHostnameHint(e.target.value)} />
             </Field>
             <Field label="Note" hint="Optional. Why it was issued.">
               <input value={note} onChange={(e) => setNote(e.target.value)} />
             </Field>
-            <Field label="Valid for (hours)">
+            <Field label="Valid for (hours)" hint="Between 1 and 720.">
               <input
                 type="number"
                 min={1}
@@ -262,10 +267,15 @@ const Deployment: React.FC = () => {
                 onChange={(e) => setTtlHours(parseInt(e.target.value || '24', 10))}
               />
             </Field>
-            <button className="btn-primary" onClick={generateToken} disabled={generating}>
-              <KeyRound size={15} /> {generating ? 'Generating…' : 'Generate token'}
-            </button>
           </div>
+          <button
+            className="btn-primary"
+            onClick={generateToken}
+            disabled={generating}
+            style={{ marginTop: 'var(--space-4)' }}
+          >
+            <KeyRound size={15} /> {generating ? 'Generating…' : 'Generate token'}
+          </button>
 
           {lastToken && (
             <div

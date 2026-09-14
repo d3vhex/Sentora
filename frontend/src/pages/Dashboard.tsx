@@ -375,7 +375,13 @@ const Dashboard: React.FC = () => {
               </p>
             ) : (
               <>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginBottom: '16px' }}>
+                <div style={{
+                  display: 'grid', gap: '16px', marginBottom: '16px',
+                  // Two side by side while they fit, one when they do not.
+                  // `1fr 1fr` kept two columns at any width, which on a
+                  // phone is two numbers too narrow to read.
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
+                }}>
                   <ExposureStat
                     label="Vulnerabilities"
                     value={summary.totals?.vulnerabilities ?? 0}

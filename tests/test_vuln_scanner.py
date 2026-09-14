@@ -124,3 +124,45 @@ def test_osv_query_batch_returns_empty_when_endpoint_unresolved(monkeypatch):
     queries = [{"package": {"name": "x", "ecosystem": "Debian"}, "version": "1.0"}]
     out = vuln._osv_query_batch(queries)
     assert out == [{"vulns": []}]
+
+
+# --------------------------------------------------------------------------
+# What the scan cannot do, said out loud
+# --------------------------------------------------------------------------
+
+def test_windows_is_skipped_with_a_reason_not_queried_as_nuget():
+    """`new_findings=0` every cycle is not a clean result here; it is no
+    result.
+
+    A Windows agent's `packages` rows come from walking the registry's
+    `Uninstall` keys, so they are display names - "Google Chrome", "Microsoft
+    Visual C++ 2015-2022 Redistributable (x64)". This mapped them to OSV's
+    `NuGet` ecosystem, which holds .NET library identifiers like
+    `Newtonsoft.Json`. The two name spaces do not overlap and OSV has no
+    ecosystem for programs installed on Windows, so the query was structurally
+    incapable of matching - while the console showed a host with no known
+    vulnerabilities.
+
+    A coincidental hit against a real NuGet package would have been worse than
+    none, which is the other half of why this is a skip rather than a
+    best-effort lookup.
+    """
+    import inspect
+
+    from scanners import vuln
+
+    source = inspect.getsource(vuln.scan_agent)
+    assert "windows_inventory_has_no_osv_ecosystem" in source, \
+        "a Windows agent must be reported as unscanned, not as clean"
+    assert '"NuGet"' not in source, \
+        "Windows display names are being queried as NuGet package names again"
+
+
+def test_the_skip_reason_reaches_the_console():
+    """A reason nobody sees is the same as no reason. `AgentDetail` already
+    renders `skipped_reason` beside the scan counts."""
+    import pathlib
+
+    page = (pathlib.Path(__file__).resolve().parent.parent
+            / "frontend" / "src" / "pages" / "AgentDetail.tsx").read_text(encoding="utf-8")
+    assert "skipped_reason" in page

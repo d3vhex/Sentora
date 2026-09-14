@@ -1246,8 +1246,20 @@ _PUBLIC_HANDLERS = {
     # before the agent polled them, so they never ran and the UI showed them
     # green. They authenticate now — see _require_agent.
     "download_agent", "register_agent", "agent_bootstrap",
-    # See the path list above: the pending token is the credential.
+    # See the path list below: the pending token is the credential.
     "complete_second_factor",
+    # The same login finished with a security key. Public in exactly the sense
+    # `complete_second_factor` is: no browser session exists yet, and the
+    # credential is the pending token minted moments earlier by a correct
+    # password — single use, five minutes, able to do one thing.
+    #
+    # These two were added to `_PUBLIC_EXACT_PATHS` first, which is the wrong
+    # list and says so in its own comment: it is a path-shaped *mirror* used
+    # only as a backstop when the router cannot resolve a handler. `authenticate`
+    # checks this set, matches on handler name, and returns 401 long before the
+    # backstop is consulted — so both routes answered "Authentication required"
+    # on the login page, in half a millisecond, without running.
+    "webauthn_login_begin", "webauthn_login_finish",
     # The CA certificate, and only the certificate. It is the half of the pair
     # whose purpose is to be handed out, an installer needs it before it holds
     # any credential, and publishing it grants nothing - it lets a client check
@@ -1294,6 +1306,19 @@ _PUBLIC_EXACT_PATHS = {
     # password, single-use, five-minute lifetime, and able to do exactly one
     # thing. Gating it on a session would make the second factor unreachable.
     "/login/2fa",
+    # The same login, finished with a security key instead of a code, and
+    # public for exactly the same reason: the pending token is the credential
+    # and there is no session to require.
+    #
+    # These were added to the auth-wiring test's list of session-only routes
+    # and not here, which reads as the same decision and is not: that list
+    # says "no permission check is expected", this one says "the session
+    # middleware must not reject it first". So the middleware answered 401
+    # before either handler ran, and the console showed "Authentication
+    # required" on a login page - where the whole point is that the operator
+    # is not authenticated yet.
+    "/login/2fa/webauthn/begin",
+    "/login/2fa/webauthn/finish",
     # The CA *certificate*, so an agent can verify a self-signed server.
     # Public on purpose: a certificate is the half of the pair meant to be
     # handed out, and an installer needs it before it has any credential.
@@ -3180,6 +3205,30 @@ async def get_packages(request, agent):
         "packages", agent, connect_db_for_agent,
                 encrypted_fields=ENCRYPTED_FIELDS_MAP["packages"]
     )
+
+@require_permission("read_telemetry")
+@app.route("/<agent>/security_audit")
+async def get_security_audit(request, agent):
+    """Posture findings: how the host is configured, not what happened on it.
+
+    The last link in a chain that was broken at every point. The table existed
+    in both schemas and in the ingest lists with nothing writing to it; the
+    collector was added and the rows arrived; and there was still no route, so
+    the data reached the server, stored correctly, decryptable, and could not
+    be looked at. Each of those is the same failure one step further along.
+
+    `finding` and `details` are encrypted at rest - they name the
+    misconfiguration and where it is, which is a map for anyone who reads the
+    database - so this goes through the decrypting reader. `category` and
+    `severity` are plaintext on purpose: the console filters and sorts on them,
+    and neither says anything a reader did not already know from the table's
+    name.
+    """
+    return await stream_from_db_dec(
+        "security_audit", agent, connect_db_for_agent,
+        encrypted_fields=ENCRYPTED_FIELDS_MAP["security_audit"],
+    )
+
 
 @require_permission("read_telemetry")
 @app.route("/<agent>/ai_logs")
@@ -8141,7 +8190,7 @@ async def webauthn_register_begin(request):
         ),
     )
     return sanic_json({"status": "success",
-                       "options": json.loads(lib["lib"].options_to_json(options))})
+                       "options": pyjson.loads(lib["lib"].options_to_json(options))})
 
 
 @app.post("/api/2fa/webauthn/register/finish")
@@ -8328,7 +8377,7 @@ async def webauthn_login_begin(request):
         user_verification=lib["UserVerification"].PREFERRED,
     )
     return sanic_json({"status": "success",
-                       "options": json.loads(lib["lib"].options_to_json(options))})
+                       "options": pyjson.loads(lib["lib"].options_to_json(options))})
 
 
 @app.post("/login/2fa/webauthn/finish")

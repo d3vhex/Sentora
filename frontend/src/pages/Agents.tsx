@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Card } from '../components/ui';
+import { Card, Modal, DialogButton, ErrorState } from '../components/ui';
 import { CategoryBars } from '../components/ui/charts';
 
 const chartNote: React.CSSProperties = {
@@ -21,8 +21,7 @@ import {
   RefreshCw,
   FileDown,
   ChevronRight,
-  Trash2,
-  AlertTriangle
+  Trash2
 } from 'lucide-react';
 import { agentService } from '../services/api';
 import { saveBlobResponse } from '../utils/downloadBlob';
@@ -265,57 +264,30 @@ const Agents: React.FC = () => {
       </div>
 
       {pendingDelete && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="delete-agent-title"
-          onClick={() => !deleting && setPendingDelete(null)}
-          style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: '20px' }}
+        <Modal
+          title={`Delete ${pendingDelete}?`}
+          subtitle="This drops the agent's telemetry database and removes its enrolment identity. Every event, alert and AI verdict it produced is deleted, and it cannot be undone."
+          onClose={() => !deleting && setPendingDelete(null)}
+          width={480}
+          footer={
+            <>
+              <DialogButton onClick={() => setPendingDelete(null)}>Cancel</DialogButton>
+              <DialogButton variant="solid" tone="critical" onClick={confirmDelete}>
+                {deleting ? 'Deleting…' : 'Delete permanently'}
+              </DialogButton>
+            </>
+          }
         >
-          <div className="card" onClick={e => e.stopPropagation()} style={{ maxWidth: '480px', width: '100%', padding: '24px' }}>
-            <div style={{ display: 'flex', alignItems: 'flex-start', gap: '14px', marginBottom: '16px' }}>
-              <AlertTriangle size={22} color="var(--accent-color)" style={{ flexShrink: 0, marginTop: '2px' }} />
-              <div>
-                <h3 id="delete-agent-title" style={{ fontSize: '1.125rem', fontWeight: 700, marginBottom: '8px' }}>
-                  Delete {pendingDelete}?
-                </h3>
-                <p style={{ color: 'var(--text-secondary)', fontSize: '0.875rem', lineHeight: 1.6 }}>
-                  This drops the agent's telemetry database and removes its
-                  enrolment identity. Every event, alert and AI verdict it
-                  produced is deleted. This cannot be undone.
-                </p>
-                <p style={{ color: 'var(--text-secondary)', fontSize: '0.8125rem', lineHeight: 1.6, marginTop: '10px' }}>
-                  A running agent will re-enrol under a new name. Uninstall it
-                  first, or use Self-Destruct from its detail page.
-                </p>
-              </div>
+          <p style={{ margin: 0, fontSize: 'var(--text-sm)', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+            A running agent will re-enrol under a new name. Uninstall it first,
+            or use Self-Destruct from its detail page.
+          </p>
+          {deleteError && (
+            <div style={{ marginTop: 'var(--space-3)' }}>
+              <ErrorState title="The agent was not deleted" detail={deleteError} />
             </div>
-
-            {deleteError && (
-              <div style={{ padding: '10px 12px', borderRadius: '4px', border: '1px solid var(--accent-color)', color: 'var(--accent-color)', fontSize: '0.8125rem', marginBottom: '16px' }}>
-                {deleteError}
-              </div>
-            )}
-
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '12px' }}>
-              <button
-                className="btn-secondary"
-                disabled={deleting}
-                onClick={() => setPendingDelete(null)}
-                style={{ padding: '8px 16px', borderRadius: '6px', cursor: deleting ? 'not-allowed' : 'pointer' }}
-              >
-                Cancel
-              </button>
-              <button
-                disabled={deleting}
-                onClick={confirmDelete}
-                style={{ padding: '8px 16px', borderRadius: '6px', border: 'none', backgroundColor: 'var(--accent-color)', color: 'white', fontWeight: 600, cursor: deleting ? 'not-allowed' : 'pointer', opacity: deleting ? 0.7 : 1 }}
-              >
-                {deleting ? 'Deleting...' : 'Delete permanently'}
-              </button>
-            </div>
-          </div>
-        </div>
+          )}
+        </Modal>
       )}
     </div>
   );

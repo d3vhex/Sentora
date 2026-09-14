@@ -1,8 +1,8 @@
 import React, { useEffect, useState, useMemo } from 'react';
-import { createPortal } from 'react-dom';
 import { useParams, Link } from 'react-router-dom';
 import { 
-  ShieldAlert, 
+  ShieldAlert,
+  ShieldCheck, 
   Cpu, 
   AlertTriangle,
   Activity,
@@ -33,7 +33,9 @@ import AgentConsole from '../components/AgentConsole';
 import Fuse from 'fuse.js';
 import { isUnanswered, countUnanswered } from '../lib/insightTriage';
 import { summariseEventMessage } from '../lib/windowsEvent';
-import { Card } from '../components/ui';
+import {
+  Card, Modal, EmptyState, Badge, DataTable, Row, Cell, Tone,
+} from '../components/ui';
 import { CategoryBars } from '../components/ui/charts';
 
 const chartNote: React.CSSProperties = {
@@ -152,17 +154,23 @@ const AgentDetail: React.FC = () => {
         agentService.getCriticalFiles(agentName),
         agentService.getPackages(agentName),
         agentService.getDockerContainers(agentName),
-        agentService.getAiInsights(agentName)
+        agentService.getAiInsights(agentName),
+        // Tolerated separately: a server that predates this route answers
+        // 404, and a rejected promise inside Promise.all empties the whole
+        // page - every tab, not just this one.
+        agentService.getSecurityAudit(agentName).catch(() => []),
       ]);
       const [info, listEntry, resources, siem, alerts, vulnerabilities, soar,
-             disks, portscans, files, pkgs, containers, aiInsightsData] = results;
+             disks, portscans, files, pkgs, containers, aiInsightsData,
+             posture] = results;
       // Only overwrite while not editing, so a background refresh does
       // not wipe what is being typed.
       if (!editingName) setDisplayName(listEntry?.display_name || '');
       setData({ 
         info, resources, siem, alerts, vulnerabilities, soar, disks, 
         portscans, criticalFiles: files, packages: pkgs, containers,
-        aiInsights: aiInsightsData || []
+        aiInsights: aiInsightsData || [],
+        posture: posture || [],
       });
     } catch (err) {
       console.error("Failed to fetch agent data", err);
@@ -366,6 +374,7 @@ const AgentDetail: React.FC = () => {
     { id: 'config', label: 'Config', icon: <Settings size={18} /> },
     { id: 'ai', label: 'AI Analysis', icon: <BrainCircuit size={18} /> },
     { id: 'soar', label: 'SOAR', icon: <Zap size={18} /> },
+    { id: 'posture', label: 'Posture', icon: <ShieldCheck size={18} /> },
     { id: 'system', label: 'System', icon: <Cpu size={18} /> },
   ];
 
@@ -622,8 +631,14 @@ const AgentDetail: React.FC = () => {
             {agentName && <VncViewer agentName={agentName} />}
           </div>
         )}
+        {/* `.card` already carries the background, border, radius and padding
+            this used to set inline, including a media query that drops the
+            padding to 16px under 768px - which is what the inline
+            `window.innerWidth > 768` was reimplementing, and getting wrong:
+            that value is read once per render, so it never followed a
+            resize. */}
         {activeTab === 'config' && (
-          <div style={{ backgroundColor: 'var(--card-bg)', border: '1px solid var(--border-color)', borderRadius: '12px', padding: window.innerWidth > 768 ? '32px' : '16px' }}>
+          <div className="card">
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px', flexWrap: 'wrap', gap: '16px' }}>
               <div style={{ display: 'flex', gap: '8px', overflowX: 'auto' }}>
                 <ConfigTypeButton label="Rules" active={configType === 'rules'} onClick={() => setConfigType('rules')} />
@@ -752,6 +767,7 @@ const AgentDetail: React.FC = () => {
         )}
         {activeTab === 'ai' && <AIAnalysisTab insights={data.aiInsights || []} agentName={agentName!} />}
         {activeTab === 'soar' && <SoarTab data={data} agentName={agentName!} onRefresh={fetchAgentData} />}
+        {activeTab === 'posture' && <PostureTab findings={data.posture} />}
         {activeTab === 'system' && <SystemTab data={data} />}
       </div>
     </div>
@@ -830,7 +846,7 @@ const OverviewTab: React.FC<{ data: any }> = ({ data }) => {
                   onMouseOver={e => e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.03)'}
                   onMouseOut={e => e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.015)'}
                 >
-                  <div style={{ color: 'var(--text-secondary)', fontSize: '0.75rem', width: '140px', flexShrink: 0 }}>{p.timestamp || event.timestamp}</div>
+                  <div style={{ color: 'var(--text-secondary)', fontSize: '0.75rem', minWidth: '140px' }}>{p.timestamp || event.timestamp}</div>
                   <div style={{ fontSize: '0.875rem' }}>
                     <span style={{ fontWeight: 700, color: 'var(--accent-secondary)', marginRight: '8px' }}>[{p.source || 'LOG'}]</span>
                     {p.message}
@@ -1107,7 +1123,7 @@ const TableTab: React.FC<{
               placeholder="Search data..." 
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
-              style={{ backgroundColor: 'var(--bg-color)', border: '1px solid var(--border-color)', borderRadius: '6px', padding: '6px 12px 6px 32px', fontSize: '0.75rem', color: 'white', width: '250px' }} 
+              style={{ backgroundColor: 'var(--bg-color)', border: '1px solid var(--border-color)', borderRadius: '6px', padding: '6px 12px 6px 32px', fontSize: '0.75rem', color: 'var(--text-primary)', width: '100%', maxWidth: '250px' }} 
             />
           </div>
         </div>
@@ -1927,80 +1943,43 @@ const SourceLogModal: React.FC<{ source?: string | null, loading?: boolean, sour
     }
   }
 
-  // Render to document.body via portal. The InsightCard host uses `.card`
-  // which sets `backdrop-filter` — and any ancestor with backdrop-filter,
+  // `Modal` portals to document.body itself, which is what this needed: the
+  // InsightCard host is a `.card`, and any ancestor with backdrop-filter,
   // filter, transform or perspective becomes a new containing block for
-  // `position: fixed`, which previously trapped the modal inside the card
-  // (it looked half-cut / off-screen). Portaling outside the card fixes it.
-  const modal = (
-    <div
-      onClick={onClose}
-      style={{
-        position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.85)',
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        zIndex: 9999, padding: '24px',
-        overflowY: 'auto',
-        backdropFilter: 'blur(4px)',
-        WebkitBackdropFilter: 'blur(4px)',
-      }}
+  // `position: fixed` - which trapped this dialog inside the card and rendered
+  // it half off-screen. The hand-rolled version fixed that here; the kit fixes
+  // it for every dialog, so nothing else has to know.
+  return (
+    <Modal
+      title="Source log analysed by the model"
+      subtitle={`${sourceLabel(sourceFile)} · ${timestamp || '—'}`}
+      onClose={onClose}
+      width={1100}
     >
-      <div
-        onClick={e => e.stopPropagation()}
-        style={{
-          width: 'min(1100px, 96vw)',
-          height: 'min(88vh, 800px)',
-          display: 'flex',
-          flexDirection: 'column',
-          padding: 0,
-          overflow: 'hidden',
-          backgroundColor: 'var(--card-bg, #0f172a)',
-          border: '1px solid var(--border-color, #334155)',
-          borderRadius: '12px',
-          boxShadow: '0 25px 60px rgba(0,0,0,0.6)',
-        }}
-      >
-        <div style={{ padding: '18px 24px', borderBottom: '1px solid var(--border-color)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', flexShrink: 0 }}>
-          <div>
-            <div style={{ fontSize: '1rem', fontWeight: 700 }}>Source Log Analyzed by AI</div>
-            <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '2px' }}>
-              {sourceLabel(sourceFile)} · {timestamp || '-'}
-            </div>
-          </div>
-          <button
-            onClick={onClose}
-            aria-label="Close"
-            style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)', fontSize: '1.75rem', cursor: 'pointer', lineHeight: 1, padding: '4px 10px' }}
-          >
-            ×
-          </button>
-        </div>
-        <div
-          style={{
-            padding: '20px 24px',
-            overflowY: 'auto',
-            overflowX: 'auto',
-            flex: '1 1 auto',
-            minHeight: 0,
-          }}
+      {pretty ? (
+        <pre
           className="custom-scrollbar"
+          style={{
+            margin: 0, padding: 'var(--space-4)',
+            maxHeight: '60vh', overflow: 'auto',
+            background: 'var(--bg-color)',
+            border: '1px solid var(--border-color)',
+            borderRadius: 'var(--radius-md)',
+            fontSize: 'var(--text-xs)', lineHeight: 1.5,
+            whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+            color: 'var(--text-primary)',
+          }}
         >
-          {pretty ? (
-            <pre style={{ fontSize: '0.85rem', backgroundColor: 'rgba(0,0,0,0.35)', padding: '16px', borderRadius: '8px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: 'var(--text-primary)', margin: 0, lineHeight: 1.5 }}>
-              {pretty}
-            </pre>
-          ) : (
-            <div style={{ padding: '60px 12px', textAlign: 'center', color: 'var(--text-secondary)', fontSize: '0.875rem' }}>
-              Raw log was not stored when this insight was saved. <br />
-              <span style={{ fontSize: '0.75rem', opacity: 0.7 }}>(The "View Source" feature is active for new insights only.)</span>
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
+          {pretty}
+        </pre>
+      ) : (
+        <EmptyState
+          title="The raw log was not stored with this insight"
+          detail="Source capture is kept for insights produced since that was added; older rows have the verdict but not the text it was formed from."
+        />
+      )}
+    </Modal>
   );
-
-  if (typeof document === 'undefined') return modal;
-  return createPortal(modal, document.body);
 };
 
 const InsightSection: React.FC<{ label: string, children: React.ReactNode }> = ({ label, children }) => (
@@ -2152,8 +2131,84 @@ const SoarTab: React.FC<{ data: any, agentName: string, onRefresh: () => void }>
   </div>
 );
 
+/* `window.innerWidth > 768 ? '1fr 1fr' : '1fr'` was here, and it is the one
+   kind of responsive that is worse than none: the width is read once, while
+   React renders. Resizing the window changes nothing, because nothing tells
+   this component to render again - so the layout is decided by whatever the
+   window happened to be when the tab was opened, and stays there. It looks
+   responsive to anyone who tests by reloading at each size.
+
+   CSS re-evaluates on every resize by definition. `responsive-grid` is the
+   class the rest of the console uses. */
+const POSTURE_TONE: Record<string, Tone> = {
+  CRITICAL: 'critical', HIGH: 'high', MEDIUM: 'medium',
+  LOW: 'low', INFO: 'info',
+};
+
+const POSTURE_RANK: Record<string, number> = {
+  CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3, INFO: 4,
+};
+
+/** How this host is configured, as opposed to what happened on it.
+ *
+ *  These are states, not events: "the Guest account is enabled" is true until
+ *  somebody changes it, not something that occurred at 14:03. The agent
+ *  deduplicates on the finding itself, so a row appears once and stays until
+ *  it is cleared - a cycle that finds nothing new writes nothing.
+ */
+const PostureTab: React.FC<{ findings: any[] }> = ({ findings }) => {
+  const rows = [...(findings || [])].sort((a, b) =>
+    (POSTURE_RANK[(a.severity || '').toUpperCase()] ?? 9)
+    - (POSTURE_RANK[(b.severity || '').toUpperCase()] ?? 9));
+
+  if (rows.length === 0) {
+    return (
+      <Card title="Posture">
+        {/* Unlike the telemetry tabs, empty here is a real answer - a host
+            with nothing misconfigured produces no rows. Saying which is the
+            whole point; an empty table that might mean "not running" is the
+            state this table was in for the life of the product. */}
+        <EmptyState
+          title="No posture findings"
+          detail="Nothing this check looks at is misconfigured on this host. The agent logs `[security_audit] N finding(s)` every hour, which is how you tell this from a collector that is not running."
+        />
+      </Card>
+    );
+  }
+
+  return (
+    <Card title={`Posture — ${rows.length} finding${rows.length === 1 ? '' : 's'}`}>
+      <p style={{
+        margin: '0 0 var(--space-4)', color: 'var(--text-secondary)',
+        fontSize: 'var(--text-sm)', maxWidth: '78ch', lineHeight: 1.6,
+      }}>
+        How this host is configured, not what happened on it. A finding stays
+        until the setting behind it changes; severity is what an attacker could
+        do with it rather than how alarming it sounds.
+      </p>
+      <DataTable columns={['Severity', 'Area', 'Finding', 'Detail', 'First seen']}>
+        {rows.map((row, i) => (
+          <Row key={row.id ?? `posture-${i}`}>
+            <Cell>
+              <Badge tone={POSTURE_TONE[(row.severity || '').toUpperCase()] ?? 'neutral'}>
+                {row.severity || 'unknown'}
+              </Badge>
+            </Cell>
+            <Cell>{row.category || '—'}</Cell>
+            <Cell>{row.finding}</Cell>
+            <Cell>
+              <span style={{ color: 'var(--text-secondary)' }}>{row.details || '—'}</span>
+            </Cell>
+            <Cell mono>{row.timestamp || '—'}</Cell>
+          </Row>
+        ))}
+      </DataTable>
+    </Card>
+  );
+};
+
 const SystemTab: React.FC<{ data: any }> = ({ data }) => (
-  <div style={{ display: 'grid', gridTemplateColumns: window.innerWidth > 768 ? '1fr 1fr' : '1fr', gap: '32px' }}>
+  <div className="responsive-grid">
     <div className="card">
       <h3 style={{ fontSize: '1.125rem', marginBottom: '24px' }}>Hardware Resources</h3>
       <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>

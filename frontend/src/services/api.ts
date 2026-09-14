@@ -196,6 +196,8 @@ export const agentService = {
   getVulnerabilities: (agent: string) => api.get(`/${agent}/vulnerabilities_report`).then(res => res.data),
   getPortscans: (agent: string) => api.get(`/${agent}/portscan_result`).then(res => res.data),
   getCriticalFiles: (agent: string) => api.get(`/${agent}/critical_files`).then(res => res.data),
+  /** Posture findings: how the host is configured, not what happened. */
+  getSecurityAudit: (agent: string) => api.get(`/${agent}/security_audit`).then(res => res.data),
   getPackages: (agent: string) => api.get(`/${agent}/packages`).then(res => res.data),
   getDockerContainers: (agent: string) => api.get(`/${agent}/docker_containers`).then(res => res.data),
   getAgentInfo: (agent: string) => api.get(`/${agent}/agent_info`).then(res => res.data),

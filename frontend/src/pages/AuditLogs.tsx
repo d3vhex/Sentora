@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { User, Activity, Globe, Search, Eye } from 'lucide-react';
 import { adminService, agentService } from '../services/api';
-import { Card, Badge } from '../components/ui';
+import { Card, Badge, Modal } from '../components/ui';
 
 /** Platform events carry a severity, and a severity is a claim - so it takes
  *  the semantic colours rather than a series palette. */
@@ -214,7 +214,7 @@ const AuditLogs: React.FC = () => {
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
               onKeyDown={handleSearch}
-              style={{ backgroundColor: 'var(--bg-color)', border: '1px solid var(--border-color)', borderRadius: '6px', padding: '6px 12px 6px 32px', fontSize: '0.75rem', color: 'var(--text-primary)', width: '300px' }}
+              style={{ backgroundColor: 'var(--bg-color)', border: '1px solid var(--border-color)', borderRadius: '6px', padding: '6px 12px 6px 32px', fontSize: '0.75rem', color: 'var(--text-primary)', width: '100%', maxWidth: '300px' }}
             />
           </div>
         </div>
@@ -329,59 +329,46 @@ const AuditDetailModal: React.FC<{ log: any, onClose: () => void }> = ({ log, on
   const known = new Set(['id', 'timestamp', '@timestamp', 'username', 'user_id', 'action', 'resource', 'ip_address', 'details']);
   const extras = Object.entries(log).filter(([k]) => !known.has(k));
 
+  const row = (label: string, value: unknown, mono = false) => (
+    <tr key={label} style={{ borderBottom: '1px solid var(--border-color)' }}>
+      <td style={{
+        padding: '10px 0', color: 'var(--text-secondary)',
+        minWidth: '140px', verticalAlign: 'top',
+      }}>
+        {label}
+      </td>
+      <td style={{
+        padding: '10px 0', wordBreak: 'break-all',
+        fontFamily: mono ? 'monospace' : 'inherit',
+      }}>
+        {value === '' || value == null
+          ? <span style={{ color: 'var(--text-muted)' }}>—</span>
+          : String(value)}
+      </td>
+    </tr>
+  );
+
   return (
-    <div
-      onClick={onClose}
-      style={{
-        position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.7)',
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        zIndex: 9999, padding: '24px',
-      }}
-    >
-      <div
-        onClick={e => e.stopPropagation()}
-        style={{
-          width: 'min(720px, 100%)', maxHeight: '80vh',
-          display: 'flex', flexDirection: 'column',
-          backgroundColor: 'var(--card-bg)', border: '1px solid var(--border-color)', borderRadius: '12px', overflow: 'hidden',
-        }}
-      >
-        <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border-color)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <div>
-            <div style={{ fontSize: '0.95rem', fontWeight: 700 }}>Audit Log Detail</div>
-            <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '2px' }}>{ts}</div>
-          </div>
-          <button onClick={onClose} style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)', fontSize: '1.5rem', cursor: 'pointer', lineHeight: 1 }}>×</button>
-        </div>
-        <div style={{ padding: '16px 20px', overflowY: 'auto', flex: 1 }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.875rem' }}>
-            <tbody>
-              {fields.map(([label, value]) => (
-                <tr key={label} style={{ borderBottom: '1px solid var(--border-color)' }}>
-                  <td style={{ padding: '10px 0', color: 'var(--text-secondary)', fontWeight: 600, width: '140px', verticalAlign: 'top' }}>{label}</td>
-                  <td style={{ padding: '10px 0', fontFamily: label === 'Resource' ? 'monospace' : 'inherit', wordBreak: 'break-all' }}>
-                    {value === '' || value == null ? <span style={{ color: 'var(--text-secondary)' }}>—</span> : String(value)}
-                  </td>
-                </tr>
-              ))}
-              {extras.length > 0 && (
-                <tr>
-                  <td colSpan={2} style={{ padding: '14px 0 6px', fontSize: '0.7rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 700 }}>Other</td>
-                </tr>
-              )}
-              {extras.map(([k, v]) => (
-                <tr key={k} style={{ borderBottom: '1px solid var(--border-color)' }}>
-                  <td style={{ padding: '10px 0', color: 'var(--text-secondary)', fontWeight: 600, width: '140px', verticalAlign: 'top' }}>{k}</td>
-                  <td style={{ padding: '10px 0', fontFamily: 'monospace', wordBreak: 'break-all' }}>
-                    {typeof v === 'object' ? JSON.stringify(v, null, 2) : String(v)}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
+    <Modal title="Audit log detail" subtitle={ts} onClose={onClose} width={720}>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 'var(--text-sm)' }}>
+        <tbody>
+          {fields.map(([label, value]) => row(label, value, label === 'Resource'))}
+          {extras.length > 0 && (
+            <tr>
+              <td colSpan={2} style={{
+                padding: '14px 0 6px', fontSize: 'var(--text-xs)',
+                color: 'var(--text-muted)', textTransform: 'uppercase',
+                letterSpacing: '0.05em',
+              }}>
+                Other
+              </td>
+            </tr>
+          )}
+          {extras.map(([k, v]) => row(
+            k, typeof v === 'object' ? JSON.stringify(v, null, 2) : v, true))}
+        </tbody>
+      </table>
+    </Modal>
   );
 };
 

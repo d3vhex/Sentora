@@ -92,6 +92,7 @@ from modules.resource_checker.resource_checker import main as resource_checker_m
 from modules.find_vulns import info_collector
 from modules.alert.alert import main as alert_main
 from modules.portscanner.portscanner import main as portscanner_main
+from modules.security_audit import main as security_audit_main
 from modules.resource_checker.disks import get_and_save_disk_info as disks
 from modules.edr_enforcer import main as edr_enforcer_main
 from modules.docker_monitor.docker_monitor import start_docker_monitor_thread
@@ -495,15 +496,26 @@ TABLES = [
     # receive and deduplicate two tables nothing ever sent it.
     'software_inventory',
     'network_inventory',
-    # `security_audit` was here and is not any more. Nothing in this agent
-    # ever wrote a row to it - no collector, not a broken one - so it was
-    # shipped empty every cycle and the console showed it permanently as
-    # NOT COLLECTED, which reads as a sensor that failed rather than one that
-    # was never built.
+    # `security_audit` is back, and this time something writes to it.
     #
-    # The server keeps the table and its ALLOWED_TABLES entry, so a collector
-    # can be added later without touching the server. What is not kept is the
-    # claim that this agent reports it.
+    # It was removed because nothing did: the table existed in both schemas,
+    # in the server's ingest lists and in its encrypted-field map, three
+    # modules were documented as producing it, and not one row was ever
+    # written. Shipped empty every cycle, it showed in the console as
+    # permanently NOT COLLECTED - a sensor that reads as broken rather than as
+    # never built, which is worse than an absent tab.
+    #
+    # `modules/security_audit.py` is the collector. It reports posture rather
+    # than events, so it deduplicates on the finding itself and not on the
+    # row: the same misconfiguration is re-found every cycle, and without that
+    # one finding becomes one row per cycle for ever.
+    'security_audit',
+    # The rule the removal established, kept because it holds for the next
+    # table somebody adds: a name on this list is a claim that this agent
+    # reports it. An empty table here and an empty table on the server look
+    # identical in the console, so a table shipped with no collector behind it
+    # is a sensor that reads as failed rather than as absent.
+    # `tests/test_ingest_schema_coverage.py` now fails either way round.
 ]
 
 MAX_WORKERS = 6
@@ -1006,23 +1018,83 @@ def kill_old_agent_if_exists():
 
 
 
+_warned: set[str] = set()
+
+
+def _warn_once(key: str, message: str) -> None:
+    """Say a thing the first time it happens, then stop.
+
+    A poll that runs every few seconds turns any per-failure line into four a
+    second, and a log nobody can read is a log nobody reads - which is how the
+    401s below sat in plain sight for the life of every install. Once is
+    enough to be findable; the rest is noise that hides the next problem.
+    """
+    if key in _warned:
+        return
+    _warned.add(key)
+    print(message, flush=True)
+
+
 class AutomationsClient:
-    def __init__(self, base_url: str, timeout: int = 8):
+    """The poll-for-queued-work fallback, and it has to authenticate.
+
+    These two calls carried no headers at all, so every request was anonymous
+    and the server answered 401 - four times every few seconds, for the life of
+    every install, filling the server log with them.
+
+    The 401 is correct and the route should stay locked: unauthenticated, it
+    let anyone who could reach the API read the response actions queued for a
+    host, and POST `{"task_id": N, "status": "SUCCESS"}` against every id in
+    turn to mark them done. The real agent polls `WHERE status='pending'`, so
+    those actions then never ran while the console showed them green - a way to
+    switch off every autonomous response while it reports success.
+
+    What was missed is that this is not a dead path. `call_agent_soar` queues a
+    pending row precisely "so an agent that missed the push can still poll for
+    it": this is the fallback for when the channel push does not land. Broken,
+    the fallback did not exist - a queued action sat `pending` for ever and
+    nothing ever ran it, which is exactly the state the fallback was written to
+    prevent.
+    """
+
+    def __init__(self, base_url: str, timeout: int = 8, agent_key: str = ""):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        # Falls back to the module-level key so the two existing call sites
+        # keep working; passing it explicitly is better where the caller has it.
+        self.agent_key = agent_key or (AGENT_SHARED_SECRET or "")
+
+    def _headers(self) -> dict:
+        return {"X-Agent-Key": self.agent_key} if self.agent_key else {}
 
     def _get_json(self, path: str, params=None):
         url = f"{self.base_url}{path}"
-        r = requests.get(url, params=params, timeout=self.timeout)
+        r = requests.get(url, params=params, headers=self._headers(),
+                         timeout=self.timeout)
         if r.status_code == 404:
+            return None
+        if r.status_code in (401, 403):
+            # Said once, not per poll. Silent, this is a fallback that is not
+            # there; four lines a second, nobody reads the log at all.
+            _warn_once("automations-auth",
+                       f"[!] The server rejected this agent's key on {path} "
+                       f"({r.status_code}). Queued response actions that miss "
+                       f"the live channel will not be collected.")
             return None
         r.raise_for_status()
         return r.json()
 
     def _post_json(self, path: str, payload: dict):
         url = f"{self.base_url}{path}"
-        r = requests.post(url, json=payload, timeout=self.timeout)
+        r = requests.post(url, json=payload, headers=self._headers(),
+                          timeout=self.timeout)
         if r.status_code == 404:
+            return None
+        if r.status_code in (401, 403):
+            _warn_once("automations-auth-report",
+                       f"[!] The server rejected this agent's key reporting to "
+                       f"{path} ({r.status_code}). Results of queued actions "
+                       f"will not reach the console.")
             return None
         r.raise_for_status()
         try:
@@ -1694,6 +1766,17 @@ def start_threads():
     threading.Thread(
         target=periodic_wrapped,
         args=(portscanner_main, 3600, "portscanner"),
+        daemon=True
+    ).start()
+
+    # Hourly, and that is already often for a posture check: these are states,
+    # not events, so re-reading them faster finds the same answers. It has to
+    # run more than once because the answers do change - somebody turns the
+    # firewall off, a new service is installed - and the deduplication means a
+    # cycle that finds nothing new writes nothing.
+    threading.Thread(
+        target=periodic_wrapped,
+        args=(security_audit_main, 3600, "security_audit"),
         daemon=True
     ).start()
 

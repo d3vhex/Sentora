@@ -266,12 +266,7 @@ const AIAnalysis: React.FC = () => {
         }
       />
 
-      <div
-        style={{
-          display: 'grid', gap: 'var(--space-5)', alignItems: 'start',
-          gridTemplateColumns: 'minmax(0, 3fr) minmax(240px, 1fr)',
-        }}
-      >
+      <div className="split-grid">
         <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
           <div style={{ display: 'flex', gap: 'var(--space-2)', flexWrap: 'wrap' }}>
             <div style={{ position: 'relative', flex: '1 1 260px' }}>

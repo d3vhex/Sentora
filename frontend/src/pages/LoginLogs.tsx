@@ -77,7 +77,7 @@ const LoginLogs: React.FC = () => {
           <h3 style={{ fontSize: '1.125rem' }}>Login History</h3>
           <div style={{ position: 'relative' }}>
             <Search size={16} style={{ position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-secondary)' }} />
-            <input type="text" placeholder="Filter by user or IP..." style={{ backgroundColor: 'var(--bg-color)', border: '1px solid var(--border-color)', borderRadius: '6px', padding: '6px 12px 6px 32px', fontSize: '0.75rem', color: 'var(--text-primary)', width: '250px' }} />
+            <input type="text" placeholder="Filter by user or IP..." style={{ backgroundColor: 'var(--bg-color)', border: '1px solid var(--border-color)', borderRadius: '6px', padding: '6px 12px 6px 32px', fontSize: '0.75rem', color: 'var(--text-primary)', width: '100%', maxWidth: '250px' }} />
           </div>
         </div>
         <div style={{ overflowX: 'auto' }}>

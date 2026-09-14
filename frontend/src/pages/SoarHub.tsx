@@ -422,7 +422,7 @@ const SoarHub: React.FC = () => {
                   placeholder="Filter events..." 
                   value={searchTerm}
                   onChange={(e) => setSearchTerm(e.target.value)}
-                  style={{ backgroundColor: 'var(--bg-color)', border: '1px solid var(--border-color)', borderRadius: '6px', padding: '6px 12px 6px 32px', fontSize: '0.875rem', color: 'white', width: '200px' }} 
+                  style={{ backgroundColor: 'var(--bg-color)', border: '1px solid var(--border-color)', borderRadius: '6px', padding: '6px 12px 6px 32px', fontSize: '0.875rem', color: 'white', width: '100%', maxWidth: '200px' }} 
                 />
               </div>
               <Activity size={18} color="var(--accent-secondary)" />

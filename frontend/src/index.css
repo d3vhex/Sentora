@@ -145,6 +145,43 @@ body {
   gap: 24px;
 }
 
+/* A main column and a narrower one beside it.
+ *
+ * Six pages wrote this by hand as `gridTemplateColumns: '300px 1fr'` or
+ * similar, and an inline style cannot carry a media query - so every one of
+ * them kept two columns at 400px wide, where the sidebar and the table are
+ * each too narrow to read and the body scrolls sideways.
+ *
+ * `auto-fit` does not solve this the way it solves `.responsive-grid`: these
+ * layouts are deliberately asymmetric, and auto-fit makes both columns the
+ * same width. Hence a class with an actual breakpoint, which is the thing an
+ * inline style cannot express.
+ *
+ * `minmax(0, …)` on the main column and not `2.4fr` alone: a grid item
+ * defaults to `min-width: auto`, so a wide table or a long unbroken string
+ * pushes the column past its share instead of scrolling inside it. That is
+ * the "the sidebar drifts" bug, and it is always this.
+ */
+.split-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 2.4fr) minmax(260px, 1fr);
+  gap: 24px;
+  align-items: start;
+}
+
+/* Sidebar first, main second - Assets, FileIntegrity, Databases. */
+.split-grid--aside-first {
+  grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
+}
+
+@media (max-width: 1100px) {
+  .split-grid,
+  .split-grid--aside-first {
+    grid-template-columns: 1fr;
+    gap: 16px;
+  }
+}
+
 @media (max-width: 1280px) {
   .responsive-grid {
     grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));

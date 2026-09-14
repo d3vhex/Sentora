@@ -304,11 +304,8 @@ const Databases: React.FC = () => {
       {error && <ErrorState title="Database request failed" detail={error} />}
 
       <div
-        style={{
-          display: 'grid', gap: 'var(--space-5)',
-          gridTemplateColumns: 'minmax(200px, 260px) 1fr',
-          alignItems: 'start', marginTop: error ? 'var(--space-5)' : 0,
-        }}
+        className="split-grid split-grid--aside-first"
+        style={{ marginTop: error ? 'var(--space-5)' : 0 }}
       >
         <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
           <Card title="Databases">
