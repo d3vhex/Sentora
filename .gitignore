@@ -84,3 +84,8 @@ certs/*.pem
 certs/*.csr
 evals/cache/
 backups/
+
+# Written by scripts/rotate_db_password.py when the rotation lands on the
+# account but cannot finish. It holds the new password in clear text and is
+# meant to be read once and deleted.
+.db_password_rescue

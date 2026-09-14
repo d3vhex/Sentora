@@ -231,7 +231,11 @@ def test_the_filters_and_the_text_are_the_same_thing():
     """A builder that hides the query teaches nothing, and a bare text box
     helps nobody on their first day."""
     page = PAGE.read_text(encoding="utf-8")
-    assert "function toQuery" in page
+    # `toQuery` moved to `lib/luceneQuery.ts` so it could be tested: it was
+    # escaping the quote but not the backslash, so a Windows path ran off the
+    # end of its own phrase. What this test is about is unchanged - clicking a
+    # filter writes the query box, rather than the two being separate things.
+    assert "from '../lib/luceneQuery'" in page
     assert "setQuery(toQuery(next))" in page
 
 

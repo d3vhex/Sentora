@@ -43,15 +43,26 @@ LOCKOUT_WINDOW_MIN = int(os.getenv("LOGIN_LOCKOUT_WINDOW_MIN", "15"))
 
 
 def _trusted_networks():
+    """Parse TRUSTED_PROXIES, naming the position of anything that fails.
+
+    The position, not the value. `TRUSTED_PROXIES` is a list of proxy
+    addresses and is not a secret - but this branch runs precisely when
+    somebody has put something in it that is *not* an address, and the most
+    common way that happens is a value pasted into the wrong variable. Echoing
+    it into the container log turns a typo into a disclosure, and the entry
+    number is what an operator needs to find it anyway.
+    """
     nets = []
-    for raw in TRUSTED_PROXIES.split(","):
+    for position, raw in enumerate(TRUSTED_PROXIES.split(","), start=1):
         raw = raw.strip()
         if not raw:
             continue
         try:
             nets.append(ipaddress.ip_network(raw, strict=False))
         except ValueError:
-            print(f"[!] TRUSTED_PROXIES: {raw!r} is not an address or CIDR, ignored",
+            print(f"[!] TRUSTED_PROXIES: entry {position} is not an address or "
+                  f"CIDR and is ignored ({len(raw)} characters). Nothing "
+                  f"behind it is treated as a trusted proxy.",
                   flush=True)
     return nets
 
