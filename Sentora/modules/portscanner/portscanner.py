@@ -1,4 +1,5 @@
 from modules.db import insert_record, delete_all, fetch_where
+from modules.enc_db import identity_fingerprint
 import socket
 import sys
 import re
@@ -659,6 +660,21 @@ async def main_async():
                             # get to write a megabyte per port per hour.
                             'banner': (banner or '')[:2048] or None,
                             'scanned_at': datetime.now(timezone.utc).replace(tzinfo=None),
+                            # The same identity `is_duplicate` above uses, so
+                            # the server skips what this host already skipped.
+                            # Without it the server hashed the whole row -
+                            # including `scanned_at`, which is set on the line
+                            # above - so every scan of the same open port was
+                            # a new row at the far end even though it was never
+                            # a new row here.
+                            #
+                            # The banner is out of it deliberately: a service
+                            # that puts a timestamp or a connection id in its
+                            # greeting would otherwise make port 443 a new
+                            # finding every hour.
+                            'dup_fp': identity_fingerprint(
+                                TABLE, target, port, protocol,
+                                service, product, version),
                         },
                     )
                     total_saved += 1

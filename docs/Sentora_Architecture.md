@@ -137,6 +137,23 @@ unit-testing without a running stack.
 - Identity Tail Parsing. `_parse_os_info_tail` recovers `hostname` and
   `mac_address` from the `OS_INFO` field without touching the wire
   format.
+- Write Mode. Every table is a snapshot (`SNAPSHOT_TABLES`: emptied and
+  rewritten per batch) or deduplicated (`DEDUP_TABLES`: a row whose
+  fingerprint is already in `ingest_fingerprint` is skipped). Never both
+  — the two cancel out and leave the table permanently empty, which
+  `_assert_ingest_modes_are_exclusive` turns into a startup failure.
+- **The agent decides what "the same row" means.** `compute_fingerprint`
+  uses the `dup_fp` the agent computed over plaintext, before Fernet;
+  the server cannot compute an equivalent, because encrypted columns
+  arrive with a random IV and the same plaintext hashes differently
+  every send. It fell back to hashing the whole received row for a long
+  time, which also swept in the per-cycle `timestamp` — so every
+  fingerprint was unique by construction and nothing was ever recognised
+  as already held. One host held 249,980 `packages` rows for 167
+  packages. A collector added to `DEDUP_TABLES` must therefore set
+  `dup_fp`, either itself or by being listed in
+  `enc_db.FINGERPRINTED_TABLES`; `tests/test_ingest_dedup.py` enforces
+  this against the writers rather than against the list.
 
 ### 2.3 Server-Side Vulnerability Scanner (`scanners/vuln.py`)
 

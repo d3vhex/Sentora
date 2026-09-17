@@ -5,7 +5,7 @@ import os
 import subprocess
 from datetime import datetime
 from .db import insert_record
-from .enc_db import insert_record_enc
+from .enc_db import insert_record_enc, identity_fingerprint
 
 def get_cpu_info():
     cpu_name = platform.processor()
@@ -222,13 +222,27 @@ def scan_inventory():
 
     software_list = get_installed_software()
     for sw in software_list:
+        name = sw["name"][:255]
+        version = sw["version"][:100]
+        vendor = (sw.get("vendor") or "Unknown")[:255]
         insert_record("software_inventory", {
-            "name": sw["name"][:255],
-            "version": sw["version"][:100],
-            "vendor": (sw.get("vendor") or "Unknown")[:255],
+            "name": name,
+            "version": version,
+            "vendor": vendor,
             "install_date": sw.get("install_date") or "N/A",
             "timestamp": timestamp,
-            "sent": False
+            "sent": False,
+            # What makes two rows the same program, and it is not the
+            # timestamp. Without this the server had nothing stable to
+            # deduplicate on and stored the whole list again on every cycle:
+            # 161,157 rows for 313 distinct programs on one host, around 515
+            # copies of each, and the console showed every one of them.
+            #
+            # `install_date` is left out because it is derived rather than
+            # read on Linux - the mtime of the dpkg .list file - and a package
+            # reinstall would otherwise list the program twice.
+            "dup_fp": identity_fingerprint(
+                "software_inventory", name, version, vendor),
         })
 
     ports = get_open_ports()
@@ -242,7 +256,14 @@ def scan_inventory():
             "process_name": p["process"],
             "pid": p["pid"],
             "timestamp": timestamp,
-            "sent": False
+            "sent": False,
+            # The PID is deliberately not in here. It changes every time the
+            # service restarts, so including it would make the same listener
+            # a new row after every reboot - which is the timestamp problem
+            # again, wearing a different hat.
+            "dup_fp": identity_fingerprint(
+                "network_inventory", "TCP",
+                p["address"], p["port"], p["process"]),
         })
 
     print(f"[*] Inventory: Scanned {len(software_list)} apps and {len(ports)} open ports.")

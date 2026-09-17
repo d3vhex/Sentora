@@ -187,8 +187,26 @@ FINGERPRINT_IGNORE = {
     "PID", "ProcessID", "process_id",
 }
 
-# Tables the server deduplicates before spending an inference on them.
-FINGERPRINTED_TABLES = ("siem_events", "events_alert")
+# Tables the server deduplicates, and which therefore need a fingerprint
+# computed here - see `content_fingerprint` for why the server cannot.
+#
+# This held only the two AI-triaged tables, and the other members of
+# `DEDUP_TABLES` went without. The server then fell back to hashing the row as
+# it arrived, which includes the timestamp the agent had just stamped on it, so
+# every send produced a fresh value and nothing was ever recognised as already
+# held: `fim_data` had 7,663 stored fingerprints on one host and matched none
+# of them, re-reporting the same unchanged files for the life of the install.
+#
+# `FINGERPRINT_IGNORE` above is what makes this safe to widen: it already drops
+# `timestamp`, `created_at` and the PID, so what is hashed is the thing the row
+# describes rather than the moment it was noticed.
+#
+# `portscan_result` is absent because it writes through `insert_record`, not
+# this function, and sets its own. `soar_actions` is absent on purpose: an
+# action taken is a one-off event, every row genuinely differs, and hashing the
+# row works there.
+FINGERPRINTED_TABLES = ("siem_events", "events_alert",
+                        "fim_data", "registry_logs", "process_events")
 
 
 def content_fingerprint(table: str, data: dict) -> str:
@@ -216,6 +234,29 @@ def content_fingerprint(table: str, data: dict) -> str:
     payload = {k: v for k, v in data.items() if k not in FINGERPRINT_IGNORE}
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(f"{table}|{blob}".encode("utf-8")).hexdigest()
+
+
+def identity_fingerprint(table: str, *parts: Any) -> str:
+    """A `dup_fp` over the fields that say what a row *is*.
+
+    `content_fingerprint` above hashes the whole row minus a denylist. That
+    suits event tables, where almost every field is part of the event. Rows
+    that describe a *thing* are the other shape: a few fields identify it and
+    the rest report its present state, so here the identity is named and
+    everything else is free to move.
+
+    What must stay out is anything that changes on its own - a timestamp, a
+    PID, a banner with the time in it. One of those in the identity turns the
+    same program or the same listener into a new row every cycle, which is
+    precisely the bug this mechanism exists to prevent.
+
+    `None` becomes an empty string rather than the word "None", so a field
+    going from absent to empty does not invent a second identity.
+    """
+    import hashlib
+
+    raw = "|".join([table, *("" if p is None else str(p) for p in parts)])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def insert_record_enc(table: str, data: dict):
