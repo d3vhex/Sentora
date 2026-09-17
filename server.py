@@ -564,6 +564,134 @@ def correlate_across_hosts(agent, table, item, cursor):
     return written
 
 
+#: Tables whose collector re-reports its whole list every cycle, so a row
+#: removed here comes back within one interval - ten minutes for the inventory
+#: pair, one package scan for `packages`.
+#:
+#: This is the entire reason the repair below is allowed to delete anything.
+#: The change-log tables - `fim_data`, `critical_files`, `registry_logs`,
+#: `soar_actions` - look superficially similar and must not be touched: the
+#: agent marks a row sent exactly once and never offers it again, so a row
+#: deleted there is gone for good.
+_RE_REPORTED_TABLES = ("packages", "software_inventory", "network_inventory")
+
+#: Named rather than dated, so it is obvious what it undoes.
+_DEDUP_REPAIR = "collapse-rows-stored-without-a-usable-fingerprint"
+
+#: Rows removed per table per ingest. Small enough that a pass is never the
+#: reason a send times out - see the note in the repair about why that matters
+#: more than finishing quickly.
+_REPAIR_CHUNK = 5000
+
+
+def _repair_rows_stored_without_a_fingerprint(cursor, db_name: str) -> None:
+    """Clear out what accumulated while deduplication could not match anything.
+
+    `compute_fingerprint` hashed the row as it arrived, which made every
+    fingerprint unique by construction - see its docstring. Fixing it stops the
+    pile growing; it does not shrink the pile, and nothing else ever will. On
+    one host that pile was 249,980 `packages` rows for 167 packages and 161,157
+    `software_inventory` rows for 313 programs, and the console faithfully
+    listed all of them. That is what the user sees, so the fix is not finished
+    without this.
+
+    Two different situations, because two different things are wrong with the
+    stored rows:
+
+      - rows that carry a `dup_fp` (`packages` always did; the server was
+        throwing it away) collapse onto it, keeping the lowest id so the
+        earliest `created_at` survives - that is the "first seen" date, and it
+        is worth more than the newest copy;
+
+      - rows that carry none cannot be told apart at all. `software_inventory`
+        and `network_inventory` had no fingerprint until this change, so there
+        is nothing to group on and they are deleted outright. They are back,
+        correctly, one row per program, at the next inventory cycle.
+
+    Then `ingest_fingerprint` is rebuilt from the survivors. Its existing
+    contents are row hashes that can never be produced again - a quarter of a
+    million dead entries that would also let every surviving row be stored a
+    second time on the next send.
+
+    **A few thousand rows per call, not all of them.** `create_tables_if_not_exist`
+    runs on the ingest path, so a DELETE across 400,000 rows holds up the send
+    that triggered it. The agent would time out, retry, and start the repair
+    again from the beginning - and if one pass can never finish inside one
+    timeout, that is not a slow repair, it is a repair that never happens while
+    every ingest pays for it. So each call removes a bounded chunk, the
+    fingerprints are rebuilt only once a table has nothing left to remove, and
+    the marker is written only when every table has converged. Ingest is
+    frequent; 400,000 rows are gone within the hour.
+
+    The guard is therefore a primary-key lookup, and the marker is written
+    after the work rather than before: an interrupted repair resumes instead of
+    recording itself as done.
+    """
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ingest_migration (
+            name       VARCHAR(64) NOT NULL PRIMARY KEY,
+            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB
+    """)
+    cursor.execute("SELECT 1 FROM ingest_migration WHERE name = %s", (_DEDUP_REPAIR,))
+    if cursor.fetchone():
+        return
+
+    cursor.execute(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = %s",
+        (db_name,),
+    )
+    present = {str(r[0]).lower() for r in cursor.fetchall()}
+
+    outstanding = 0
+
+    for table in _RE_REPORTED_TABLES:
+        if table not in present:
+            continue
+
+        # Keep the lowest id per fingerprint. The derived table is not
+        # decoration: MySQL refuses a subquery that reads the table being
+        # deleted from unless it is materialised through one.
+        cursor.execute(
+            f"DELETE FROM `{table}` "
+            f"WHERE dup_fp IS NOT NULL AND id NOT IN ("
+            f"    SELECT keep_id FROM ("
+            f"        SELECT MIN(id) AS keep_id FROM `{table}` "
+            f"        WHERE dup_fp IS NOT NULL GROUP BY dup_fp"
+            f"    ) AS keep"
+            f") LIMIT {_REPAIR_CHUNK}"
+        )
+        collapsed = cursor.rowcount
+
+        cursor.execute(
+            f"DELETE FROM `{table}` WHERE dup_fp IS NULL LIMIT {_REPAIR_CHUNK}")
+        dropped = cursor.rowcount
+
+        if collapsed or dropped:
+            outstanding += collapsed + dropped
+            print(f"[+] {db_name}: {table} - {collapsed} duplicate rows "
+                  f"collapsed, {dropped} without a fingerprint removed "
+                  f"(the collector re-reports those)", flush=True)
+            continue
+
+        # Nothing left to remove here, so what remains is the final set and
+        # its fingerprints can be rebuilt. Doing this while rows were still
+        # being deleted would record fingerprints for rows about to go.
+        cursor.execute(
+            "DELETE FROM ingest_fingerprint WHERE table_name = %s", (table,))
+        cursor.execute(
+            "INSERT IGNORE INTO ingest_fingerprint (table_name, fp) "
+            f"SELECT %s, dup_fp FROM `{table}` WHERE dup_fp IS NOT NULL",
+            (table,),
+        )
+
+    if outstanding:
+        return                      # more to do; the next ingest continues it
+
+    cursor.execute(
+        "INSERT IGNORE INTO ingest_migration (name) VALUES (%s)", (_DEDUP_REPAIR,))
+
+
 def create_tables_if_not_exist(db_name):
     conn = connect_db(db_name)
     cursor = conn.cursor()
@@ -662,6 +790,12 @@ def create_tables_if_not_exist(db_name):
         except mysql.connector.Error as e:
             print(f"[!] Fingerprint table creation error: {e}")
 
+        try:
+            # After the CREATE above, which it writes into.
+            _repair_rows_stored_without_a_fingerprint(cursor, db_name)
+        except mysql.connector.Error as e:
+            print(f"[!] duplicate-row repair skipped: {e}")
+
         conn.commit()
     finally:
         cursor.close()
@@ -673,6 +807,36 @@ def _json_default(o):
     return str(o)
 
 def compute_fingerprint(table: str, item: dict) -> str:
+    """What "the same row" means, for deduplication.
+
+    The agent's `dup_fp` first, and this is the whole fix. Hashing the row as
+    it arrives cannot work and never could:
+
+      - encrypted columns arrive as `enc::gAAAA...`, and Fernet uses a random
+        IV, so the same plaintext encrypts differently every time;
+      - `timestamp` and `created_at` are set per collection cycle, so even a
+        plaintext table changes on every send.
+
+    Either one makes the hash unique by construction, so nothing was ever
+    recognised as already held. Measured on one host: `packages` had 167
+    distinct agent fingerprints and 249,980 rows stored, with an
+    `ingest_fingerprint` entry for every single one. `software_inventory` was
+    161,157 rows for 313 distinct programs — around 515 copies each, all
+    faithfully recorded as new.
+
+    `Sentora/modules/enc_db.content_fingerprint` exists precisely because of
+    this and says so in its own docstring: the agent computes the value over
+    plaintext, before encryption, because the server cannot. It just was not
+    being used at this end.
+
+    The row hash remains as the fallback for a table whose producer sets no
+    `dup_fp`. It still cannot deduplicate anything with a timestamp — that is
+    what `test_a_dedup_table_carries_a_fingerprint_from_the_agent` is for.
+    """
+    supplied = item.get("dup_fp")
+    if isinstance(supplied, str) and supplied.strip():
+        return supplied.strip()
+
     clean = {k: v for k, v in item.items() if k not in ("id", "sent")}
     blob = json.dumps(clean, sort_keys=True, separators=(",", ":"), default=_json_default).encode("utf-8")
     return hashlib.sha256(table.encode() + b"|" + blob).hexdigest()

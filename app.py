@@ -2762,8 +2762,23 @@ async def get_hardware_inventory(request, agent):
 @require_permission("read_telemetry")
 @app.route("/api/agent/<agent>/inventory/software")
 async def get_software_inventory(request, agent):
-    fields = ENCRYPTED_FIELDS_MAP.get("packages")
-    return await stream_from_db_dec("packages", agent, connect_db_for_agent,                                    encrypted_fields=fields, rename_map={"package": "name"})
+    # `software_inventory`, not `packages`. The tab renders Package Name,
+    # Version, Vendor and Installed Date; `packages` holds a name and a
+    # version and nothing else, so two of the four columns were blank on
+    # every row and had been since the tab was written. A column that is
+    # always empty reads as "this host has no vendor information", which is
+    # not what was happening - the agent collects vendor and install date,
+    # ships them, and they land in a table nothing read.
+    #
+    # It is also the better inventory on Windows: `packages` comes from the
+    # MSI product list, `software_inventory` from the Uninstall registry -
+    # 313 programs against 167 on the host this was found on.
+    #
+    # `packages` stays exactly where it is. It is the vulnerability scanner's
+    # input, encrypted for that reason, and its shape belongs to OSV rather
+    # than to this page.
+    return await stream_from_db_dec("software_inventory", agent,
+                                    connect_db_for_agent)
 
 @require_permission("read_telemetry")
 @app.route("/api/agent/<agent>/inventory/network")
