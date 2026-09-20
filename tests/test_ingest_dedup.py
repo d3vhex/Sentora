@@ -386,30 +386,46 @@ DEDUP_REPAIR = _literal(SERVER, "_DEDUP_REPAIR")
 REPAIR_CHUNK = _literal(SERVER, "_REPAIR_CHUNK")
 
 
+HIGH_WATER = 163984          # what software_inventory actually held
+
+
 class _FakeCursor:
     """Enough of a MySQL cursor to watch what the repair does, in order.
 
     `deleted` is what a DELETE reports back: 0 for a database with nothing left
     to clean, a positive number for one still working through the pile.
+    `recorded_mark` stands for a second pass - the high-water mark is already
+    stored and must be reused rather than taken again.
     """
 
-    def __init__(self, *, marker_present=False, tables=(), deleted=0):
+    def __init__(self, *, marker_present=False, tables=(), deleted=0,
+                 recorded_mark=None):
         self.sql: list = []
+        self.params: list = []
         self._marker = marker_present
         self._tables = tables
         self._deleted = deleted
+        self._recorded = recorded_mark
         self._rows: list = []
         self.rowcount = 0
 
     def execute(self, sql, params=()):
         flat = " ".join(sql.split())
         self.sql.append(flat)
+        self.params.append(params)
         low = flat.lower()
         self.rowcount = self._deleted if low.startswith("delete from `") else 0
-        if "from ingest_migration" in low:
+
+        if low.startswith("select 1 from ingest_migration"):
             self._rows = [(1,)] if self._marker else []
+        elif low.startswith("select value from ingest_migration"):
+            self._rows = [(self._recorded,)] if self._recorded is not None else []
+        elif "information_schema.columns" in low:
+            self._rows = [("value",)]            # already migrated
         elif "information_schema.tables" in low:
             self._rows = [(t,) for t in self._tables]
+        elif "coalesce(max(id)" in low:
+            self._rows = [(HIGH_WATER,)]
         else:
             self._rows = []
 
@@ -436,13 +452,17 @@ def test_the_repair_does_nothing_once_it_has_run():
     assert not any("DELETE" in s for s in cursor.sql)
 
 
+#: The final marker, as distinct from the per-table high-water rows, which are
+#: also written into `ingest_migration`.
+DONE_MARKER = "INSERT IGNORE INTO ingest_migration (name) VALUES"
+
+
 def test_the_repair_marks_itself_done_only_at_the_end():
     """Claiming the marker first would turn a half-finished repair into a
     permanent one - the rows stay, and nothing ever comes back to them."""
     cursor = _FakeCursor(tables=RE_REPORTED_TABLES)
     _repair()(cursor, "agent_db")
-    written = [i for i, s in enumerate(cursor.sql)
-               if s.startswith("INSERT IGNORE INTO ingest_migration")]
+    written = [i for i, s in enumerate(cursor.sql) if s.startswith(DONE_MARKER)]
     assert written, "the repair never records that it ran"
     assert written[0] == len(cursor.sql) - 1
 
@@ -458,11 +478,58 @@ def test_the_repair_handles_both_kinds_of_stored_row(table):
 
     assert any("GROUP BY dup_fp" in s and "NOT IN" in s for s in mine), \
         "duplicates sharing a fingerprint are not collapsed"
-    assert any(f"DELETE FROM `{table}` WHERE dup_fp IS NULL" in s for s in mine), \
+    assert any(s.startswith(f"DELETE FROM `{table}`") and "dup_fp IS NULL" in s
+               for s in mine), \
         "rows stored before the agent set a fingerprint are left behind"
     assert any(s.startswith("INSERT IGNORE INTO ingest_fingerprint") for s in mine), \
         "the survivors' fingerprints are never recorded, so the next send " \
         "stores every one of them again"
+
+
+# --------------------------------------------------------------------------
+# The repair must not delete what arrives while it is running
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("table", RE_REPORTED_TABLES)
+def test_no_delete_reaches_past_the_high_water_mark(table):
+    """An agent that has not been rebuilt still sends these tables with no
+    `dup_fp`. Unbounded, "delete what has no fingerprint" deletes each fresh
+    batch as it lands: the table stays permanently empty, the console reads
+    "this host has no software", and the repair never converges so it never
+    stops. Measured here first - `network_inventory` went to 0 rows and stayed
+    there while the old agent kept filling it.
+    """
+    cursor = _FakeCursor(tables=RE_REPORTED_TABLES)
+    _repair()(cursor, "agent_db")
+    deletes = [s for s in cursor.sql if s.startswith(f"DELETE FROM `{table}`")]
+    assert deletes, f"nothing deletes from {table}"
+    for statement in deletes:
+        assert "id <= %s" in statement, (
+            f"unbounded delete on {table}: {statement}. It will take rows that "
+            f"arrived after the repair started."
+        )
+
+
+def test_the_high_water_mark_is_taken_before_anything_is_deleted():
+    cursor = _FakeCursor(tables=("packages",))
+    _repair()(cursor, "agent_db")
+    took = next(i for i, s in enumerate(cursor.sql) if "COALESCE(MAX(id)" in s)
+    first_delete = next(i for i, s in enumerate(cursor.sql)
+                        if s.startswith("DELETE FROM `packages`"))
+    assert took < first_delete
+
+
+def test_a_later_pass_reuses_the_stored_mark_rather_than_taking_a_new_one():
+    """Recomputing it each pass would sweep in everything that arrived in
+    between, which is the whole failure the bound exists to prevent - so a
+    second pass must read the stored value and not look at MAX(id) again."""
+    cursor = _FakeCursor(tables=("packages",), recorded_mark=500)
+    _repair()(cursor, "agent_db")
+    assert not any("COALESCE(MAX(id)" in s for s in cursor.sql), \
+        "the high-water mark is taken again on every pass"
+    delete = next(i for i, s in enumerate(cursor.sql)
+                  if s.startswith("DELETE FROM `packages`"))
+    assert cursor.params[delete] == (500,)
 
 
 def test_the_repair_rebuilds_fingerprints_only_once_a_table_is_clean():
@@ -481,8 +548,7 @@ def test_a_pass_with_rows_left_does_not_mark_itself_done():
     started with and never looks at them again."""
     cursor = _FakeCursor(tables=RE_REPORTED_TABLES, deleted=REPAIR_CHUNK)
     _repair()(cursor, "agent_db")
-    assert not any(s.startswith("INSERT IGNORE INTO ingest_migration")
-                   for s in cursor.sql)
+    assert not any(s.startswith(DONE_MARKER) for s in cursor.sql)
 
 
 @pytest.mark.parametrize("table", RE_REPORTED_TABLES)

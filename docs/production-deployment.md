@@ -139,6 +139,30 @@ authenticate in the default configuration: OpenSearch runs with
 log the platform has collected. Publish through the same reverse proxy and
 auth as `app` instead.
 
+**OpenSearch holds plaintext telemetry, and MySQL does not.** This is the one
+place in the stack where that is true, so it changes what a compromise of the
+volume yields:
+
+| Store | Volume | What a copy of it gives an attacker |
+| :--- | :--- | :--- |
+| MySQL | `mysql_data` | Ciphertext for the encrypted columns. Needs `data/fernet.key` as well to be readable. |
+| RabbitMQ | — | Ciphertext. A queued message is data at rest for as long as it is queued, so it is left encrypted. |
+| **OpenSearch** | `opensearch_data` | **Readable log lines, process command lines, registry values and file paths** — for the event tables it indexes. |
+
+That is a deliberate trade, not an oversight. The index used to hold
+`enc::gAAAA...` in the field operators search on, which meant
+`message:powershell` matched none of the events that contained it while
+`source:PowerShell` matched 52 — a hunting surface that reports success and
+finds nothing is not a security control. `core/opensearch.INDEXED_TABLES`
+limits the plaintext to the tables a search is actually for; the inventory and
+snapshot tables are excluded and answered by their own views.
+
+So: treat `opensearch_data` and port 9200 as you would the database, keep
+`data/fernet.key` on a different trust boundary from the index if you can, and
+run `scripts/prune_search_indices.py` once after upgrading — the indices
+written before the allowlist existed are still on disk, roughly 1.1 million
+documents of stale inventory copies.
+
 The "Open Dashboards" button in Log Explorer links to port 5601 on the
 server's hostname, so it works from the host itself; remote operators need
 that proxy.
