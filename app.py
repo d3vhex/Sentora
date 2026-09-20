@@ -2793,6 +2793,26 @@ async def get_network_inventory(request, agent):
                                     connect_db_for_agent, encrypted_fields=fields)
 
 @require_permission("read_telemetry")
+@app.route("/api/agent/<agent>/inventory/ports")
+async def get_listening_ports(request, agent):
+    # `network_inventory` was collected every ten minutes, shipped,
+    # deduplicated, stored - and read by nothing at all. It was the last table
+    # in `ALLOWED_TABLES` in that state, after `security_audit` (which had no
+    # collector) and `software_inventory` (which had no reader).
+    #
+    # It is not the same data as the Network tab above. `network_connections`
+    # is conversations already underway; this is what the host is listening
+    # on, which is the question "what can be reached from outside" - and it is
+    # a better answer than `portscan_result` gives, because a scan infers the
+    # surface from outside while this is the kernel's own list, with the owning
+    # process named.
+    #
+    # Plaintext, so no fields: nothing in it is sensitive on its own and the
+    # port has to be indexable.
+    return await stream_from_db_dec("network_inventory", agent,
+                                    connect_db_for_agent)
+
+@require_permission("read_telemetry")
 @app.route("/api/agent/<agent>/fim")
 async def get_fim_data(request, agent):
     fields = ENCRYPTED_FIELDS_MAP.get("fim_data")

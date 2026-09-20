@@ -3,8 +3,9 @@ import {
   Database, 
   Search, 
   Cpu, 
-  Package, 
-  Globe, 
+  Package,
+  Globe,
+  EthernetPort,
   Server,
   RefreshCw,
   ChevronRight,
@@ -31,7 +32,7 @@ const STATE_TONE: Record<string, string> = {
 const Assets: React.FC = () => {
     const [agents, setAgents] = useState<any[]>([]);
     const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
-    const [activeTab, setActiveTab] = useState<'hardware' | 'software' | 'network'>('hardware');
+    const [activeTab, setActiveTab] = useState<'hardware' | 'software' | 'network' | 'ports'>('hardware');
     const [data, setData] = useState<any[]>([]);
     const [loading, setLoading] = useState(false);
     const [searchTerm, setSearchTerm] = useState('');
@@ -86,6 +87,10 @@ const Assets: React.FC = () => {
         const field =
             activeTab === 'hardware' ? (i: any) => i.type
             : activeTab === 'software' ? (i: any) => i.vendor
+            // Every listening socket is in state LISTEN, so grouping ports by
+            // state draws one bar. The useful question is which process owns
+            // the surface.
+            : activeTab === 'ports' ? (i: any) => i.process_name
             : (i: any) => i.state;
 
         const counts = new Map<string, number>();
@@ -106,8 +111,11 @@ const Assets: React.FC = () => {
         ? { title: 'Hardware by type',
             note: 'What the inventory is made of. A category that is missing entirely usually means the collector for it failed rather than the host has none.' }
         : activeTab === 'software'
-        ? { title: 'Packages by vendor',
+        ? { title: 'Software by vendor',
             note: 'Who wrote the software on this host. A long tail of one-off vendors is where unmanaged software lives.' }
+        : activeTab === 'ports'
+        ? { title: 'Listening ports by process',
+            note: 'The host’s own account of what can be reached from outside, with the process that owns each socket. A listener you cannot name is the one to look at first.' }
         : { title: 'Connections by state',
             note: 'Listening sockets are attack surface; established ones are traffic already flowing. The mix is the shape of what this host is doing.' };
 
@@ -202,10 +210,15 @@ const Assets: React.FC = () => {
                 {/* Main Content */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
                     {/* Tabs */}
-                    <div style={{ display: 'flex', background: 'var(--card-bg)', padding: '6px', borderRadius: '14px', border: '1px solid var(--border-color)', width: 'fit-content' }}>
+                    {/* flexWrap, because a fourth tab is what takes this row
+                        past a narrow viewport. `width: fit-content` does not
+                        shrink below its content, so without wrapping the last
+                        tab is simply unreachable on a phone. */}
+                    <div style={{ display: 'flex', flexWrap: 'wrap', background: 'var(--card-bg)', padding: '6px', borderRadius: '14px', border: '1px solid var(--border-color)', width: 'fit-content', maxWidth: '100%' }}>
                         <TabButton active={activeTab === 'hardware'} onClick={() => setActiveTab('hardware')} icon={<Cpu size={16} />} label="Hardware" />
                         <TabButton active={activeTab === 'software'} onClick={() => setActiveTab('software')} icon={<Package size={16} />} label="Software" />
                         <TabButton active={activeTab === 'network'} onClick={() => setActiveTab('network')} icon={<Globe size={16} />} label="Network" />
+                        <TabButton active={activeTab === 'ports'} onClick={() => setActiveTab('ports')} icon={<EthernetPort size={16} />} label="Ports" />
                     </div>
 
                     <div style={{ marginBottom: '24px' }}>
@@ -262,6 +275,18 @@ const Assets: React.FC = () => {
                                             <Th>Remote</Th>
                                             <Th>State</Th>
                                         </>}
+                                        {/* No State column and no Remote:
+                                            every row here is a listener, so
+                                            both are constant. A column with
+                                            the same value on every row spends
+                                            width to say nothing. */}
+                                        {activeTab === 'ports' && <>
+                                            <Th>Port</Th>
+                                            <Th>Protocol</Th>
+                                            <Th>Bound To</Th>
+                                            <Th>Process</Th>
+                                            <Th>PID</Th>
+                                        </>}
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -308,6 +333,13 @@ const Assets: React.FC = () => {
                                                 </Td>
                                                 <Td><StatusBadge status={item.state} /></Td>
                                             </>}
+                                            {activeTab === 'ports' && <>
+                                                <Td className="mono" style={{ fontWeight: 700, color: 'var(--accent-secondary)' }}>{item.local_port}</Td>
+                                                <Td style={{ opacity: 0.7 }}>{item.protocol}</Td>
+                                                <Td><Reach address={item.local_address} /></Td>
+                                                <Td style={{ fontWeight: 600 }}>{item.process_name}</Td>
+                                                <Td style={{ opacity: 0.6 }}>{item.pid}</Td>
+                                            </>}
                                         </tr>
                                     ))}
                                 </tbody>
@@ -341,6 +373,36 @@ const TabButton = ({ active, onClick, icon, label }: any) => (
         {icon} {label}
     </button>
 );
+
+/** What a bind address means for reach, which is the only thing that makes one
+ *  listening port more interesting than another.
+ *
+ *  `0.0.0.0` and `::` accept from any interface; `127.0.0.1` and `::1` cannot
+ *  be reached off the host at all. Rendering both as a bare address leaves the
+ *  operator to make that distinction 80 rows at a time, and it is the whole
+ *  question they came to the tab with. */
+const LOCAL_ONLY = new Set(['127.0.0.1', '::1', 'localhost']);
+const ANY_INTERFACE = new Set(['0.0.0.0', '::', '*', '']);
+
+const Reach = ({ address }: { address: string }) => {
+    const addr = (address ?? '').trim();
+    const exposed = ANY_INTERFACE.has(addr);
+    const local = LOCAL_ONLY.has(addr);
+    return (
+        <span style={{ display: 'inline-flex', alignItems: 'baseline', gap: '8px' }}>
+            <span className="mono">{addr || '0.0.0.0'}</span>
+            <span style={{
+                fontSize: '0.7rem', fontWeight: 700, textTransform: 'uppercase',
+                letterSpacing: '0.04em',
+                color: exposed ? 'var(--sev-high)'
+                    : local ? 'var(--text-muted)'
+                    : 'var(--sev-medium)',
+            }}>
+                {exposed ? 'all interfaces' : local ? 'loopback' : 'one interface'}
+            </span>
+        </span>
+    );
+};
 
 const Th = ({ children }: any) => (
     <th style={{ padding: '16px 20px', fontSize: '0.8rem', fontWeight: 700, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{children}</th>

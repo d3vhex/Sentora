@@ -626,13 +626,32 @@ def _repair_rows_stored_without_a_fingerprint(cursor, db_name: str) -> None:
     The guard is therefore a primary-key lookup, and the marker is written
     after the work rather than before: an interrupted repair resumes instead of
     recording itself as done.
+
+    **Bounded to rows that existed when it started**, which is not a detail.
+    An agent that has not been rebuilt still sends these tables with no
+    `dup_fp`, so an unbounded "delete what has no fingerprint" deletes each
+    fresh batch as it lands: the table stays empty, the console reads "this
+    host has no software", and the repair never converges so it never stops.
+    The high-water mark is taken once, per table, and stored - so old rows go,
+    new ones stay whatever they look like, and upgrading the agent is what
+    fixes the duplicates rather than a condition for seeing any data at all.
     """
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS ingest_migration (
             name       VARCHAR(64) NOT NULL PRIMARY KEY,
+            value      BIGINT NULL,
             applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         ) ENGINE=InnoDB
     """)
+    # An earlier build of this created the table without `value`.
+    cursor.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = %s AND table_name = 'ingest_migration'",
+        (db_name,),
+    )
+    if "value" not in {str(r[0]).lower() for r in cursor.fetchall()}:
+        cursor.execute("ALTER TABLE ingest_migration ADD COLUMN value BIGINT NULL")
+
     cursor.execute("SELECT 1 FROM ingest_migration WHERE name = %s", (_DEDUP_REPAIR,))
     if cursor.fetchone():
         return
@@ -649,22 +668,42 @@ def _repair_rows_stored_without_a_fingerprint(cursor, db_name: str) -> None:
         if table not in present:
             continue
 
+        # The newest row when this table was first looked at. Recorded rather
+        # than recomputed, because recomputing it each pass would sweep in
+        # everything that arrived in between - which is the whole failure this
+        # bound exists to prevent.
+        mark_name = f"{_DEDUP_REPAIR}:{table}"[:64]
+        cursor.execute("SELECT value FROM ingest_migration WHERE name = %s",
+                       (mark_name,))
+        row = cursor.fetchone()
+        if row is None:
+            cursor.execute(f"SELECT COALESCE(MAX(id), 0) FROM `{table}`")
+            high_water = int((cursor.fetchone() or [0])[0] or 0)
+            cursor.execute(
+                "INSERT IGNORE INTO ingest_migration (name, value) VALUES (%s, %s)",
+                (mark_name, high_water))
+        else:
+            high_water = int(row[0] or 0)
+
         # Keep the lowest id per fingerprint. The derived table is not
         # decoration: MySQL refuses a subquery that reads the table being
         # deleted from unless it is materialised through one.
         cursor.execute(
             f"DELETE FROM `{table}` "
-            f"WHERE dup_fp IS NOT NULL AND id NOT IN ("
+            f"WHERE id <= %s AND dup_fp IS NOT NULL AND id NOT IN ("
             f"    SELECT keep_id FROM ("
             f"        SELECT MIN(id) AS keep_id FROM `{table}` "
             f"        WHERE dup_fp IS NOT NULL GROUP BY dup_fp"
             f"    ) AS keep"
-            f") LIMIT {_REPAIR_CHUNK}"
+            f") LIMIT {_REPAIR_CHUNK}",
+            (high_water,)
         )
         collapsed = cursor.rowcount
 
         cursor.execute(
-            f"DELETE FROM `{table}` WHERE dup_fp IS NULL LIMIT {_REPAIR_CHUNK}")
+            f"DELETE FROM `{table}` WHERE id <= %s AND dup_fp IS NULL "
+            f"LIMIT {_REPAIR_CHUNK}",
+            (high_water,))
         dropped = cursor.rowcount
 
         if collapsed or dropped:

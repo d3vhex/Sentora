@@ -31,7 +31,7 @@ ASSETS = ROOT / "frontend" / "src" / "pages" / "Assets.tsx"
 APP = ROOT / "app.py"
 SCHEMA = ROOT / "db" / "init.sql"
 
-TABS = ("hardware", "software", "network")
+TABS = ("hardware", "software", "network", "ports")
 
 #: Keys the API adds or the page derives, which no table is expected to hold.
 NOT_FROM_THE_TABLE: set = set()
